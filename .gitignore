@@ -1,0 +1,2 @@
+# Per-run log archives written by run-paxosbus.sh / run-gcp.sh
+logs/
