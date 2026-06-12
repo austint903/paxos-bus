@@ -1,0 +1,11 @@
+# Builds the Go PaxosBus binaries for the local Docker runs (run-paxosbus.sh).
+FROM golang:1.22 AS build
+WORKDIR /src
+COPY go.mod go.sum ./
+COPY rpc/ rpc/
+COPY paxosbus/ paxosbus/
+RUN CGO_ENABLED=0 go build -o /out/paxosbus-replica ./paxosbus/cmd/paxosbus-replica \
+ && CGO_ENABLED=0 go build -o /out/paxosbus-client ./paxosbus/cmd/paxosbus-client
+
+FROM debian:bookworm-slim
+COPY --from=build /out/paxosbus-replica /out/paxosbus-client /paxosbus/
