@@ -152,7 +152,6 @@ func (c *Client) Run() {
 	Notice("[%s] sync wait done, starting open-loop data phase (interval=%dms)",
 		c.self, c.intervalMs)
 
-	go c.statsLoop()
 	if c.resendMs > 0 {
 		go c.resendLoop()
 	}
@@ -166,7 +165,9 @@ func (c *Client) Run() {
 // 1/interval.
 func (c *Client) sendLoop() {
 	intervalNs := int64(c.intervalMs) * 1e6
-	nextSendNs := nowNs()
+	t0 := nowNs()
+	nextSendNs := t0
+	curEpoch := int64(0)
 	for {
 		now := nowNs()
 		for now >= nextSendNs {
@@ -177,6 +178,17 @@ func (c *Client) sendLoop() {
 			c.mu.Unlock()
 			c.sendData(seq, appReqId, 0, 1)
 			nextSendNs += intervalNs
+
+			// Emit the 1s summary on the send grid itself rather than from a
+			// separate wall-clock ticker. Send deadlines are exactly
+			// t0 + k*interval, so every completed 1-second epoch holds exactly
+			// 1000/interval sends — the reported send count has no sampling
+			// jitter. This only changes when the stats line fires; the send
+			// timing, wire messages, and quorum logic are untouched.
+			if epoch := (nextSendNs - t0) / int64(time.Second); epoch != curEpoch {
+				c.emitStats()
+				curEpoch = epoch
+			}
 			now = nowNs()
 		}
 		time.Sleep(time.Duration(nextSendNs - now))
@@ -334,28 +346,28 @@ func (c *Client) resendLoop() {
 	}
 }
 
-func (c *Client) statsLoop() {
-	ticker := time.NewTicker(time.Second)
-	for range ticker.C {
-		c.mu.Lock()
-		sent, committed, resends := c.winSent, c.winCommitted, c.winResends
-		rttSum := c.winRttSumUs
-		inflight := len(c.inflight)
-		cumCommitted, cumRttSum := c.committedCount, c.totalRttUs
-		c.winSent, c.winCommitted, c.winResends, c.winRttSumUs = 0, 0, 0, 0
-		c.mu.Unlock()
+// emitStats snapshots the 1-second window counters and prints the summary
+// line. It is driven by the send grid (see sendLoop), not a wall-clock ticker,
+// so each completed 1-second window reports an exact send count.
+func (c *Client) emitStats() {
+	c.mu.Lock()
+	sent, committed, resends := c.winSent, c.winCommitted, c.winResends
+	rttSum := c.winRttSumUs
+	inflight := len(c.inflight)
+	cumCommitted, cumRttSum := c.committedCount, c.totalRttUs
+	c.winSent, c.winCommitted, c.winResends, c.winRttSumUs = 0, 0, 0, 0
+	c.mu.Unlock()
 
-		if sent == 0 && committed == 0 && resends == 0 {
-			continue
-		}
-		var winAvgUs, cumAvgUs uint64
-		if committed > 0 {
-			winAvgUs = rttSum / committed
-		}
-		if cumCommitted > 0 {
-			cumAvgUs = cumRttSum / cumCommitted
-		}
-		Notice("[%s] 1s: sent=%d committed=%d resends=%d inflight=%d rtt_avg=%dus  cumulative: committed=%d rtt_avg=%dus",
-			c.self, sent, committed, resends, inflight, winAvgUs, cumCommitted, cumAvgUs)
+	if sent == 0 && committed == 0 && resends == 0 {
+		return
 	}
+	var winAvgUs, cumAvgUs uint64
+	if committed > 0 {
+		winAvgUs = rttSum / committed
+	}
+	if cumCommitted > 0 {
+		cumAvgUs = cumRttSum / cumCommitted
+	}
+	Notice("[%s] 1s: sent=%d committed=%d resends=%d inflight=%d rtt_avg=%dus  cumulative: committed=%d rtt_avg=%dus",
+		c.self, sent, committed, resends, inflight, winAvgUs, cumCommitted, cumAvgUs)
 }
