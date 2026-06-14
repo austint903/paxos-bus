@@ -9,23 +9,27 @@ MSG_INTERVAL_MS=1      # change this: 1000=1s  100=100ms  10=10ms  2=2ms  1=1ms
 NUM_REPLICAS=3
 NUM_CLIENTS=2
 RESEND_MS=0            # client resend-on-no-quorum timeout (ms); 0 = disabled
+DURATION_S="${DURATION_S:-60}"  # seconds of data phase, then auto-stop; 0 = run until Ctrl+C
+SYNC_WARMUP_S=5        # client sync wait before data starts (matches syncStartDelayMs=5000)
 # ────────────────────────────────────────────────────────────────────────────
 
 FORCE_BUILD=0
 
 usage() {
-    echo "Usage: $0 [-b] [-p <interval_ms>] [-t <resend_ms>]"
+    echo "Usage: $0 [-b] [-p <interval_ms>] [-t <resend_ms>] [-d <seconds>]"
     echo "  -b            force rebuild of Docker image"
     echo "  -p <ms>       message interval in ms (default: $MSG_INTERVAL_MS)"
     echo "  -t <ms>       client resend-on-no-quorum timeout (default: $RESEND_MS, 0=off)"
+    echo "  -d <seconds>  auto-stop after this many seconds of data phase (default: run until Ctrl+C)"
     exit 1
 }
 
-while getopts "bp:t:h" opt; do
+while getopts "bp:t:d:h" opt; do
     case $opt in
         b) FORCE_BUILD=1 ;;
         p) MSG_INTERVAL_MS=$OPTARG ;;
         t) RESEND_MS=$OPTARG ;;
+        d) DURATION_S=$OPTARG ;;
         h) usage ;;
         *) usage ;;
     esac
@@ -153,8 +157,12 @@ done
 
 echo ""
 echo "All containers running."
-echo "Clients will sync (5s wait), then stream every ${MSG_INTERVAL_MS}ms."
-echo "Press Ctrl+C to stop."
+echo "Clients will sync (${SYNC_WARMUP_S}s wait), then stream every ${MSG_INTERVAL_MS}ms."
+if [[ "$DURATION_S" -gt 0 ]]; then
+    echo "Auto-stopping after ${DURATION_S}s of data phase (+${SYNC_WARMUP_S}s sync warmup)."
+else
+    echo "Press Ctrl+C to stop."
+fi
 echo "──────────────────────────────────────────────────────────────"
 
 # ── Follow replica logs (tee a durable copy per node into $RUN_LOG_DIR) ──────
@@ -173,4 +181,15 @@ for i in $(seq 1 $NUM_CLIENTS); do
     LOG_PIDS+=($!)
 done
 
-wait
+if [[ "$DURATION_S" -gt 0 ]]; then
+    # Bounded run: wait out the sync warmup + requested data-phase seconds, then
+    # exit so the EXIT trap tears down containers + network. Logs are already
+    # archived live under $RUN_LOG_DIR.
+    sleep $((SYNC_WARMUP_S + DURATION_S))
+    echo ""
+    echo "──────────────────────────────────────────────────────────────"
+    echo "Ran ${DURATION_S}s of data phase — stopping."
+    exit 0
+else
+    wait
+fi

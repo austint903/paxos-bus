@@ -98,6 +98,7 @@ def main():
     merged = []          # (ts, node, text)
     replies = {}         # client -> replica -> [rtt_us]
     quorum = {}          # client -> [rtt_us]
+    commit_span = {}     # client -> [first_committed_ts, last_committed_ts]
     totals = {}          # client -> [total_us] for requests with attempts > 1
     attempts = {}        # client -> count of NO-QUORUM resends
     sent_per_s = {}      # client -> [sent in each 1s window]
@@ -135,6 +136,15 @@ def main():
                         quorum.setdefault(cid, []).append(int(m.group(3)))
                         if int(m.group(5)) > 1:
                             totals.setdefault(cid, []).append(int(m.group(4)))
+                        # Track the actual data-phase span from the first to the
+                        # last committed reply's wall-clock timestamp, so throughput
+                        # uses the real elapsed time (e.g. 60.21s) rather than the
+                        # nominal configured duration.
+                        span = commit_span.setdefault(cid, [ts, ts])
+                        if ts < span[0]:
+                            span[0] = ts
+                        if ts > span[1]:
+                            span[1] = ts
                         continue
                     if RE_NOQUORUM.search(text):
                         attempts[cid] = attempts.get(cid, 0) + 1
@@ -184,7 +194,25 @@ def main():
         rate_txt = (f"  send rate avg={sum(rates) // len(rates)}/s"
                     f" max={max(rates)}/s" if rates else "")
         print(f"    committed={n_commits}  resends={n_resends}{rate_txt}")
+        span = commit_span.get(cid)
+        if span and span[1] > span[0]:
+            elapsed = span[1] - span[0]
+            print(f"    throughput={n_commits / elapsed:.1f} req/s "
+                  f"(committed/elapsed = {n_commits}/{elapsed:.2f}s)")
         print()
+
+    # System-wide throughput: total committed across all clients over the
+    # combined data-phase window (earliest first-commit to latest last-commit).
+    if commit_span:
+        total_commits = sum(len(quorum.get(c, [])) for c in commit_span)
+        first = min(s[0] for s in commit_span.values())
+        last = max(s[1] for s in commit_span.values())
+        if last > first:
+            elapsed = last - first
+            print(f"== Aggregate ==\n"
+                  f"    throughput={total_commits / elapsed:.1f} req/s "
+                  f"(committed/elapsed = {total_commits}/{elapsed:.2f}s, "
+                  f"{len(commit_span)} clients)\n")
 
     if drops or gaps or recoveries or noops:
         print("== Gap agreement ==")
