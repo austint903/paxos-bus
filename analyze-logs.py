@@ -99,6 +99,19 @@ def main():
     replies = {}         # client -> replica -> [rtt_us]
     quorum = {}          # client -> [rtt_us]
     commit_span = {}     # client -> [first_committed_ts, last_committed_ts]
+    # Throughput window is anchored to the SEND phase, not to commit timestamps:
+    #   start = when the client began the open-loop data phase (first send)
+    #   end   = the last successful send, i.e. the moment just before sends
+    #           started failing because the replicas were killed. This is taken
+    #           from the first "send to replica N failed" warning. If a run shut
+    #           down cleanly (no failed sends), fall back to the last 1s window
+    #           that still committed anything.
+    # This keeps the warm-up fill inside the denominator and trims the teardown
+    # tail (client still sending after the replicas were killed), which would
+    # otherwise be counted as dead time.
+    send_start = {}      # client -> ts of "starting open-loop data phase"
+    send_end = {}        # client -> ts of last 1s line with committed > 0 (fallback)
+    send_fail = {}       # client -> ts of first failed send (≈ last successful send)
     totals = {}          # client -> [total_us] for requests with attempts > 1
     attempts = {}        # client -> count of NO-QUORUM resends
     sent_per_s = {}      # client -> [sent in each 1s window]
@@ -149,9 +162,17 @@ def main():
                     if RE_NOQUORUM.search(text):
                         attempts[cid] = attempts.get(cid, 0) + 1
                         continue
+                    if "starting open-loop data phase" in text:
+                        send_start.setdefault(cid, ts)
+                        continue
+                    if "send to replica" in text and "failed" in text:
+                        send_fail.setdefault(cid, ts)  # first failure = last good send
+                        continue
                     m = RE_SENT_1S.search(text)
                     if m:
                         sent_per_s.setdefault(cid, []).append(int(m.group(1)))
+                        if int(m.group(2)) > 0:  # last second with live commits
+                            send_end[cid] = ts
                 elif rm:
                     rid = int(rm.group(1))
                     if rm.group(2).strip():
@@ -194,25 +215,19 @@ def main():
         rate_txt = (f"  send rate avg={sum(rates) // len(rates)}/s"
                     f" max={max(rates)}/s" if rates else "")
         print(f"    committed={n_commits}  resends={n_resends}{rate_txt}")
-        span = commit_span.get(cid)
-        if span and span[1] > span[0]:
-            elapsed = span[1] - span[0]
+        start = send_start.get(cid)
+        end = send_fail.get(cid, send_end.get(cid))  # last good send, else last commit
+        if start is not None and end is not None and end > start:
+            elapsed = end - start
+            t0 = datetime.fromtimestamp(start, timezone.utc).strftime("%H:%M:%S.%f")[:-3]
+            t1 = datetime.fromtimestamp(end, timezone.utc).strftime("%H:%M:%S.%f")[:-3]
+            end_label = ("last successful send" if cid in send_fail
+                         else "last live commit")
+            print(f"    send window    {t0} -> {t1} UTC  ({elapsed:.2f}s, "
+                  f"data-phase start to {end_label})")
             print(f"    throughput={n_commits / elapsed:.1f} req/s "
-                  f"(committed/elapsed = {n_commits}/{elapsed:.2f}s)")
+                  f"(committed/send_window = {n_commits}/{elapsed:.2f}s)")
         print()
-
-    # System-wide throughput: total committed across all clients over the
-    # combined data-phase window (earliest first-commit to latest last-commit).
-    if commit_span:
-        total_commits = sum(len(quorum.get(c, [])) for c in commit_span)
-        first = min(s[0] for s in commit_span.values())
-        last = max(s[1] for s in commit_span.values())
-        if last > first:
-            elapsed = last - first
-            print(f"== Aggregate ==\n"
-                  f"    throughput={total_commits / elapsed:.1f} req/s "
-                  f"(committed/elapsed = {total_commits}/{elapsed:.2f}s, "
-                  f"{len(commit_span)} clients)\n")
 
     if drops or gaps or recoveries or noops:
         print("== Gap agreement ==")
