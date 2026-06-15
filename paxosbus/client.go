@@ -18,7 +18,16 @@ type inflightEntry struct {
 	replyCount      int
 	appReqId        uint64 // stable logical id across resends
 	attempts        uint32 // 1 on first send, +1 per resend
+	committed       bool   // leader-inclusive quorum already reached
 }
+
+// gcCommittedNs bounds how long a committed entry is kept alive waiting for the
+// slower replicas' replies before the janitor reclaims it. A committed entry is
+// retained (not deleted at quorum) so that every replica's reply — including the
+// slowest one, which arrives after quorum — is still measured and logged. The
+// threshold only needs to exceed the worst-case extra latency of the slowest
+// replica beyond the quorum reply (tens of ms on a WAN); 2s is comfortably safe.
+const gcCommittedNs = 2 * int64(time.Second)
 
 // lockedWriter serializes writes to one replica connection: the sender
 // goroutine and the resend scanner both write to the same TCP stream.
@@ -155,6 +164,7 @@ func (c *Client) Run() {
 	if c.resendMs > 0 {
 		go c.resendLoop()
 	}
+	go c.janitorLoop()
 	c.sendLoop()
 }
 
@@ -270,15 +280,21 @@ func (c *Client) handleDataReply(msg *DataReplyMessage) {
 
 	// Commit requires f+1 replies INCLUDING the leader's (as in NOPaxos): the
 	// leader's log is authoritative during gap agreement, so a quorum without
-	// it could later be overwritten by a NoOp commit.
+	// it could later be overwritten by a NoOp commit. We record the commit
+	// exactly once (the first time quorum is reached) but DO NOT delete the
+	// entry — it is kept until every replica has replied (or the janitor
+	// reclaims it) so the slowest replica's reply, which lands after quorum, is
+	// still measured and logged instead of being dropped as "already committed".
 	leaderIdx := c.config.LeaderIndex(msg.ViewId)
-	committed := e.replyCount >= c.config.QuorumSize() &&
+	justCommitted := !e.committed &&
+		e.replyCount >= c.config.QuorumSize() &&
 		e.replicaMask&(uint32(1)<<leaderIdx) != 0
 
 	var rttUs, totalUs int64
 	var appReqId uint64
 	var attempts uint32
-	if committed {
+	if justCommitted {
+		e.committed = true
 		rttUs = (now - e.sendTimeNs) / 1000
 		totalUs = (now - e.firstSendTimeNs) / 1000
 		appReqId, attempts = e.appReqId, e.attempts
@@ -286,15 +302,28 @@ func (c *Client) handleDataReply(msg *DataReplyMessage) {
 		c.totalRttUs += uint64(rttUs)
 		c.winCommitted++
 		c.winRttSumUs += uint64(rttUs)
+	}
+	// post_quorum=1 marks a reply that landed after the request had already
+	// committed (captured under the lock to avoid racing other receivers).
+	postQuorum := 0
+	if e.committed && !justCommitted {
+		postQuorum = 1
+	}
+	// Once all replicas have replied there is nothing left to measure, so the
+	// entry can be reclaimed immediately rather than waiting for the janitor.
+	if e.replyCount >= c.config.N {
 		delete(c.inflight, msg.SeqNum)
 	}
 	c.mu.Unlock()
 
-	// Per-replica RTT measurement line (one per first reply from each
-	// replica; run-gcp.sh's summary and analyze-logs.py both parse this).
-	Notice("[%s] REPLY from replica=%d  rtt=%dus  seq=%d",
-		c.self, msg.ReplicaIdx, replyRttUs, msg.SeqNum)
-	if committed {
+	// Per-replica RTT measurement line — now emitted for EVERY replica's reply,
+	// including replies that arrive after quorum (e.g. the highest-latency
+	// replica). run-gcp.sh's summary and analyze-logs.py both parse this, so
+	// every region now gets a full-size sample instead of only the fraction
+	// that happened to beat the quorum.
+	Notice("[%s] REPLY from replica=%d  rtt=%dus  seq=%d  post_quorum=%d",
+		c.self, msg.ReplicaIdx, replyRttUs, msg.SeqNum, postQuorum)
+	if justCommitted {
 		Notice("[%s] COMMITTED seq=%d app_req=%d rtt=%dus total=%dus attempts=%d",
 			c.self, msg.SeqNum, appReqId, rttUs, totalUs, attempts)
 	}
@@ -322,6 +351,9 @@ func (c *Client) resendLoop() {
 
 		c.mu.Lock()
 		for seq, e := range c.inflight {
+			if e.committed {
+				continue // already committed; the janitor reclaims it
+			}
 			if now-e.sendTimeNs < resendNs {
 				continue
 			}
@@ -343,6 +375,25 @@ func (c *Client) resendLoop() {
 				c.self, rs.oldSeq, rs.appReqId, rs.newSeq, rs.attempts+1, rs.totalResends)
 			c.sendData(rs.newSeq, rs.appReqId, rs.firstSendNs, rs.attempts+1)
 		}
+	}
+}
+
+// janitorLoop reclaims committed entries whose slowest replica reply never
+// arrives (a lost packet at these WAN latencies). Committed entries are kept
+// after quorum so every replica's reply can still be measured (see
+// handleDataReply); without this sweep a dropped post-quorum reply would pin
+// the entry forever. It runs regardless of the resend setting.
+func (c *Client) janitorLoop() {
+	ticker := time.NewTicker(500 * time.Millisecond)
+	for range ticker.C {
+		now := nowNs()
+		c.mu.Lock()
+		for seq, e := range c.inflight {
+			if e.committed && now-e.sendTimeNs >= gcCommittedNs {
+				delete(c.inflight, seq)
+			}
+		}
+		c.mu.Unlock()
 	}
 }
 
