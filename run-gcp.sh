@@ -269,7 +269,7 @@ gcloud compute ssh "$CONTROLLER_VM" --zone="$CONTROLLER_ZONE" --quiet -- "
 "
 
 # Each run is archived in its own directory so results are never overwritten.
-RUN_LOG_DIR="./logs/gcp/gcp-run-$(date +%Y%m%d-%H%M%S)"
+RUN_LOG_DIR="./paxosbus/logs/gcp/gcp-run-$(date +%Y%m%d-%H%M%S)"
 echo "==> Copying logs from $CONTROLLER_VM to $RUN_LOG_DIR/"
 mkdir -p "$RUN_LOG_DIR"
 gcloud compute scp --zone="$CONTROLLER_ZONE" --quiet --recurse \

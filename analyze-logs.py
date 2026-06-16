@@ -5,8 +5,9 @@ are identical to the C++ prevImplementation, so logs from either parse).
 Usage:
     ./analyze-logs.py [logdir]
 
-logdir defaults to the newest run directory (by mtime) under logs/local/ and
-logs/gcp/, where run-paxosbus.sh and run-gcp.sh archive one directory per run.
+logdir defaults to the newest run directory (by mtime) under paxosbus/logs/local/
+and paxosbus/logs/gcp/, where run-paxosbus.sh and run-gcp.sh archive one directory
+per run.
 
 Per-node raw logs are left untouched (each file is one node's view; cross-VM
 wall clocks are only NTP-synced, so a merged ordering is approximate). This
@@ -84,8 +85,8 @@ def main():
     if len(sys.argv) > 1:
         logdir = sys.argv[1]
     else:
-        runs = (glob.glob("logs/local/local-run-*") +
-                glob.glob("logs/gcp/gcp-run-*"))
+        runs = (glob.glob("paxosbus/logs/local/local-run-*") +
+                glob.glob("paxosbus/logs/gcp/gcp-run-*"))
         logdir = max(runs, key=os.path.getmtime) if runs else "logs"
     if not os.path.isdir(logdir):
         sys.exit(f"error: {logdir} is not a directory")
