@@ -18,9 +18,10 @@ func nowNs() int64 {
 
 // clientStream is the replica's per-client arrival model. Expected arrival of
 // seq N is base_recv_ns + (N-1)*interval_ns (the T = m*x + b line: m=interval,
-// b=base). base is provisionally anchored from the sync schedule and then
-// re-anchored on every data arrival (sliding re-anchor) so the model tracks
-// the live stream and delta reflects real jitter, not the sync offset.
+// b=base). base is provisionally anchored from the sync schedule, then pinned
+// ONCE through the first observed data arrival. The line stays fixed after
+// that, so delta measures cumulative drift from a stable baseline. (Valid
+// locally where there are no packet drops to break the seq->time mapping.)
 type clientStream struct {
 	baseRecvNs   int64
 	intervalNs   int64
@@ -183,12 +184,18 @@ func (r *Replica) handleData(msg *DataMessage) bool {
 		s.maxSeqSeen = msg.SeqNum
 	}
 
-	// Sliding re-anchor: compute the delta against the PRIOR anchor first (so
-	// it reflects real jitter), then choose b so expected(this seq) == actual.
-	expectedNs := s.baseRecvNs + int64(msg.SeqNum-1)*s.intervalNs
-	deltaUs := (actualNs - expectedNs) / 1000
-	s.baseRecvNs = actualNs - int64(msg.SeqNum-1)*s.intervalNs
-	s.anchored = true
+	// Anchor once: pin b through the first observed arrival so expected(this
+	// seq) == actual, then leave the line fixed. Subsequent deltas are measured
+	// against that fixed line, so they capture cumulative drift, not per-message
+	// jitter off a sliding anchor.
+	var deltaUs int64
+	if !s.anchored {
+		s.baseRecvNs = actualNs - int64(msg.SeqNum-1)*s.intervalNs
+		s.anchored = true
+	} else {
+		expectedNs := s.baseRecvNs + int64(msg.SeqNum-1)*s.intervalNs
+		deltaUs = (actualNs - expectedNs) / 1000
+	}
 	if msg.SeqNum == s.nextExpected {
 		s.nextExpected++
 	}
