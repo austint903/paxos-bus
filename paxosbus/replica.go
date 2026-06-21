@@ -120,9 +120,9 @@ func (r *Replica) clientListener(conn net.Conn) {
 	writer := bufio.NewWriter(conn)
 
 	var (
-		syncMsg SyncMessage
-		dataMsg DataMessage
-		reply   DataReplyMessage
+		syncMsg BusSyncMessage
+		reqMsg  BusRequestMessage
+		reply   BusReplyMessage
 	)
 
 	for {
@@ -133,33 +133,37 @@ func (r *Replica) clientListener(conn net.Conn) {
 			return
 		}
 		switch msgType {
-		case MsgSync:
+		case MsgBusSync:
 			if err := syncMsg.Unmarshal(reader); err != nil {
 				Warning("[%s] bad sync message: %v", r.self, err)
 				return
 			}
 			r.handleSync(&syncMsg)
 
-		case MsgData:
-			if err := dataMsg.Unmarshal(reader); err != nil {
-				Warning("[%s] bad data message: %v", r.self, err)
+		case MsgBusRequest:
+			if err := reqMsg.Unmarshal(reader); err != nil {
+				Warning("[%s] bad bus request message: %v", r.self, err)
 				return
 			}
-			if !r.handleData(&dataMsg) {
+			if !r.handleRequest(&reqMsg) {
 				continue
 			}
-			reply = DataReplyMessage{
-				ClientId:   dataMsg.ClientId,
-				SeqNum:     dataMsg.SeqNum,
+			// LogSlotNum == RequestId until gap agreement makes them diverge.
+			// Result is nil: there is no execution layer, so the op is logged
+			// but not applied.
+			reply = BusReplyMessage{
+				ClientId:   reqMsg.ClientId,
+				RequestId:  reqMsg.RequestId,
+				LogSlotNum: reqMsg.RequestId,
 				ViewId:     r.viewId,
-				LogSlotNum: dataMsg.SeqNum,
 				ReplicaIdx: uint32(r.idx),
+				Result:     nil,
 			}
-			writer.WriteByte(MsgDataReply)
+			writer.WriteByte(MsgBusReply)
 			reply.Marshal(writer)
 			if err := writer.Flush(); err != nil {
-				Warning("[%s] failed to send reply for seq=%d: %v",
-					r.self, dataMsg.SeqNum, err)
+				Warning("[%s] failed to send reply for req=%d: %v",
+					r.self, reqMsg.RequestId, err)
 				return
 			}
 
@@ -170,12 +174,12 @@ func (r *Replica) clientListener(conn net.Conn) {
 	}
 }
 
-func (r *Replica) handleSync(msg *SyncMessage) {
+func (r *Replica) handleSync(msg *BusSyncMessage) {
 	recvNs := nowNs()
 	r.mu.Lock()
 	// Anchor baseline to when the first data message is expected to arrive:
 	// base = sync_recv + start_delay, so expected(N) = base + (N-1)*interval.
-	// Provisional; re-anchored to observed arrivals in handleData.
+	// Provisional; re-anchored to observed arrivals in handleRequest.
 	r.clients[msg.ClientId] = &clientStream{
 		baseRecvNs:   recvNs + int64(msg.StartDelayMs)*1e6,
 		intervalNs:   int64(msg.IntervalMs) * 1e6,
@@ -188,34 +192,34 @@ func (r *Replica) handleSync(msg *SyncMessage) {
 		r.self, msg.ClientId, msg.IntervalMs)
 }
 
-// handleData updates the arrival model and stats; returns false if the client
-// never synced (no reply is sent then, as in the C++ implementation).
-func (r *Replica) handleData(msg *DataMessage) bool {
+// handleRequest updates the arrival model and stats; returns false if the
+// client never synced (no reply is sent then, as in the C++ implementation).
+func (r *Replica) handleRequest(msg *BusRequestMessage) bool {
 	actualNs := nowNs()
 	r.mu.Lock()
 	s, ok := r.clients[msg.ClientId]
 	if !ok {
 		r.mu.Unlock()
-		Warning("[%s] data from unsynced client %d, ignoring", r.self, msg.ClientId)
+		Warning("[%s] request from unsynced client %d, ignoring", r.self, msg.ClientId)
 		return false
 	}
-	if msg.SeqNum > s.maxSeqSeen {
-		s.maxSeqSeen = msg.SeqNum
+	if msg.RequestId > s.maxSeqSeen {
+		s.maxSeqSeen = msg.RequestId
 	}
 
 	// Anchor once: pin b through the first observed arrival so expected(this
-	// seq) == actual, then leave the line fixed. Subsequent deltas are measured
+	// req) == actual, then leave the line fixed. Subsequent deltas are measured
 	// against that fixed line, so they capture cumulative drift, not per-message
 	// jitter off a sliding anchor.
 	var deltaUs int64
 	if !s.anchored {
-		s.baseRecvNs = actualNs - int64(msg.SeqNum-1)*s.intervalNs
+		s.baseRecvNs = actualNs - int64(msg.RequestId-1)*s.intervalNs
 		s.anchored = true
 	} else {
-		expectedNs := s.baseRecvNs + int64(msg.SeqNum-1)*s.intervalNs
+		expectedNs := s.baseRecvNs + int64(msg.RequestId-1)*s.intervalNs
 		deltaUs = (actualNs - expectedNs) / 1000
 	}
-	if msg.SeqNum == s.nextExpected {
+	if msg.RequestId == s.nextExpected {
 		s.nextExpected++
 	}
 
@@ -231,7 +235,7 @@ func (r *Replica) handleData(msg *DataMessage) bool {
 	}
 	r.winDeltaSumUs += deltaUs
 	r.winRecv++
-	// Lazily open the durable log on the first data op (the sync message itself
+	// Lazily open the durable log on the first request (the sync message itself
 	// is never logged — only client->replica operations get a slot).
 	cl := r.clientLogs[msg.ClientId]
 	if cl == nil && r.logDir != "" {
@@ -245,11 +249,11 @@ func (r *Replica) handleData(msg *DataMessage) bool {
 	}
 	r.mu.Unlock()
 
-	// Durably record the op in this client's per-slot log (slot == seq). The
+	// Durably record the op in this client's per-slot log (slot == req id). The
 	// append only buffers; flushLoop persists it in batches. clientLog has its
 	// own lock, so this stays outside r.mu.
 	if cl != nil {
-		cl.append(msg.SeqNum, msg.SeqNum, len(msg.Payload))
+		cl.append(msg.RequestId, msg.RequestId, len(msg.Op))
 	}
 	return true
 }

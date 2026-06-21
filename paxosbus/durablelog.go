@@ -10,8 +10,8 @@ import (
 
 // clientLog is a replica's durable, append-only operation log for ONE client,
 // kept separate from the existing stderr summary/event logs. Slot number ==
-// the client's DataMessage.SeqNum: slot N holds that client's message seq N, so
-// a dropped message leaves a hole at its slot and the slots line up across
+// the client's BusRequestMessage.RequestId: slot N holds that client's request
+// N, so a dropped message leaves a hole at its slot and the slots line up across
 // replicas (a future gap agreement can copy slot N verbatim from a peer).
 //
 // Appends only touch the in-memory bufio buffer; the buffer is pushed to disk
@@ -40,18 +40,16 @@ func openClientLog(dir string, clientId uint64) (*clientLog, error) {
 	return &clientLog{f: f, w: bufio.NewWriterSize(f, clientLogBufBytes)}, nil
 }
 
-// append writes one slot record as a single JSON line. slot == seq today (the
-// client's per-message counter); both are stored so the record stays
-// self-describing if slot assignment ever diverges from seq (e.g. NoOps).
-// No timestamps (client send time and replica recv time live on different
-// clocks, so they can't yield an RTT) and no app_req yet: with resends off and
-// no execution layer, app_req always equals seq, so it adds nothing. Re-add it
-// when resend dedup / log execution lands.
-func (cl *clientLog) append(slot, seq uint64, payloadLen int) {
+// append writes one slot record as a single JSON line. slot == req id today
+// (the client's bus-message number); both are stored so the record stays
+// self-describing once gap agreement makes slot assignment diverge from the
+// request id (e.g. NoOps). No timestamps (client send time and replica recv
+// time live on different clocks, so they can't yield an RTT).
+func (cl *clientLog) append(slot, reqId uint64, opLen int) {
 	cl.mu.Lock()
 	fmt.Fprintf(cl.w,
-		"{\"slot\":%d,\"seq\":%d,\"len\":%d}\n",
-		slot, seq, payloadLen)
+		"{\"slot\":%d,\"req_id\":%d,\"len\":%d}\n",
+		slot, reqId, opLen)
 	cl.mu.Unlock()
 }
 

@@ -30,8 +30,8 @@ NUMERIC_TS = re.compile(r"^(\d{4})(\d{2})(\d{2})-(\d{2})(\d{2})(\d{2})-(\d{4}) \
 
 RE_CLIENT    = re.compile(r"\[Client (\d+)([^\]]*)\]")
 RE_REPLY     = re.compile(r"REPLY from replica=(\d+)\s+rtt=(\d+)us")
-RE_COMMITTED = re.compile(r"COMMITTED seq=(\d+) app_req=(\d+) rtt=(\d+)us total=(\d+)us attempts=(\d+)")
-RE_NOQUORUM  = re.compile(r"NO-QUORUM seq=(\d+)")
+RE_COMMITTED = re.compile(r"COMMITTED req=(\d+) slot=(\d+) rtt=(\d+)us total=(\d+)us attempts=(\d+)")
+RE_NOQUORUM  = re.compile(r"NO-QUORUM req=(\d+)")
 RE_SENT_1S   = re.compile(r"1s: sent=(\d+) committed=(\d+)")
 RE_DROP      = re.compile(r"DROP seq=(\d+)")
 RE_GAP       = re.compile(r"GAP detected seq=(\d+)")

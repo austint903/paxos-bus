@@ -10,13 +10,13 @@ import (
 
 const syncStartDelayMs = 5000
 
-// inflightEntry tracks one open-loop request: seq -> per-request state.
+// inflightEntry tracks one open-loop request: request id -> per-request state.
 type inflightEntry struct {
 	sendTimeNs      int64  // this attempt's send time
 	firstSendTimeNs int64  // first attempt's send time (stable across resends)
 	replicaMask     uint32 // bit i set => replica i has replied
 	replyCount      int
-	appReqId        uint64 // stable logical id across resends
+	origReqId       uint64 // request id of the first attempt (stable across resends)
 	attempts        uint32 // 1 on first send, +1 per resend
 	committed       bool   // leader-inclusive quorum already reached
 }
@@ -36,7 +36,7 @@ type lockedWriter struct {
 	w  *bufio.Writer
 }
 
-func (lw *lockedWriter) send(code uint8, msg *DataMessage) error {
+func (lw *lockedWriter) send(code uint8, msg *BusRequestMessage) error {
 	lw.mu.Lock()
 	defer lw.mu.Unlock()
 	lw.w.WriteByte(code)
@@ -46,9 +46,9 @@ func (lw *lockedWriter) send(code uint8, msg *DataMessage) error {
 
 // Client runs the PaxosBus open loop with two decoupled sides sharing one
 // mutex-protected inflight map:
-//   - the send goroutine paces DataMessages to all replicas at a fixed
+//   - the send goroutine paces BusRequestMessages to all replicas at a fixed
 //     interval (absolute deadlines, so the rate never exceeds 1/interval);
-//   - per-replica receive goroutines tally DataReplyMessages, check the
+//   - per-replica receive goroutines tally BusReplyMessages, check the
 //     leader-inclusive f+1 quorum, and delete committed entries.
 type Client struct {
 	config     *Config
@@ -61,10 +61,9 @@ type Client struct {
 	readers []*bufio.Reader
 	writers []*lockedWriter
 
-	mu       sync.Mutex
-	inflight map[uint64]*inflightEntry
-	seqNum   uint64
-	appReqId uint64
+	mu        sync.Mutex
+	inflight  map[uint64]*inflightEntry
+	requestId uint64 // monotonic bus-message number assigned per request
 
 	// cumulative latency stats (microseconds)
 	committedCount uint64
@@ -133,7 +132,7 @@ func (c *Client) Connect() error {
 // Run executes the sync phase and then the open-loop data phase. Blocks
 // forever (the send loop never exits).
 func (c *Client) Run() {
-	syncMsg := SyncMessage{
+	syncMsg := BusSyncMessage{
 		ClientId:     c.clientId,
 		SendTimeNs:   uint64(nowNs()),
 		IntervalMs:   c.intervalMs,
@@ -141,7 +140,7 @@ func (c *Client) Run() {
 	}
 	for i, lw := range c.writers {
 		lw.mu.Lock()
-		lw.w.WriteByte(MsgSync)
+		lw.w.WriteByte(MsgBusSync)
 		syncMsg.Marshal(lw.w)
 		err := lw.w.Flush()
 		lw.mu.Unlock()
@@ -182,11 +181,10 @@ func (c *Client) sendLoop() {
 		now := nowNs()
 		for now >= nextSendNs {
 			c.mu.Lock()
-			c.seqNum++
-			c.appReqId++
-			seq, appReqId := c.seqNum, c.appReqId
+			c.requestId++
+			reqId := c.requestId
 			c.mu.Unlock()
-			c.sendData(seq, appReqId, 0, 1)
+			c.sendRequest(reqId, reqId, 0, 1)
 			nextSendNs += intervalNs
 
 			// Emit the 1s summary on the send grid itself rather than from a
@@ -205,32 +203,32 @@ func (c *Client) sendLoop() {
 	}
 }
 
-// sendData registers seq in the inflight map and broadcasts the DataMessage.
-// The entry is inserted before the send so a reply can never race the map.
-func (c *Client) sendData(seq, appReqId uint64, firstSendNs int64, attempts uint32) {
+// sendRequest registers reqId in the inflight map and broadcasts the
+// BusRequestMessage. The entry is inserted before the send so a reply can never
+// race the map.
+func (c *Client) sendRequest(reqId, origReqId uint64, firstSendNs int64, attempts uint32) {
 	now := nowNs()
 	if firstSendNs == 0 {
 		firstSendNs = now
 	}
 	c.mu.Lock()
-	c.inflight[seq] = &inflightEntry{
+	c.inflight[reqId] = &inflightEntry{
 		sendTimeNs:      now,
 		firstSendTimeNs: firstSendNs,
-		appReqId:        appReqId,
+		origReqId:       origReqId,
 		attempts:        attempts,
 	}
 	c.winSent++
 	c.mu.Unlock()
 
-	msg := DataMessage{
+	msg := BusRequestMessage{
 		ClientId:   c.clientId,
-		SeqNum:     seq,
+		RequestId:  reqId,
 		SendTimeNs: uint64(now),
-		AppReqId:   appReqId,
-		Payload:    []byte("hello"),
+		Op:         []byte("hello"),
 	}
 	for i, lw := range c.writers {
-		if err := lw.send(MsgData, &msg); err != nil {
+		if err := lw.send(MsgBusRequest, &msg); err != nil {
 			Warning("[%s] send to replica %d failed: %v", c.self, i, err)
 		}
 	}
@@ -240,14 +238,14 @@ func (c *Client) sendData(seq, appReqId uint64, firstSendNs int64, attempts uint
 // lock the map, tally it, run the quorum check, and remove committed entries.
 func (c *Client) receiveLoop(rid int) {
 	reader := c.readers[rid]
-	var reply DataReplyMessage
+	var reply BusReplyMessage
 	for {
 		msgType, err := reader.ReadByte()
 		if err != nil {
 			Warning("[%s] connection to replica %d lost: %v", c.self, rid, err)
 			return
 		}
-		if msgType != MsgDataReply {
+		if msgType != MsgBusReply {
 			Warning("[%s] unknown message type %d from replica %d",
 				c.self, msgType, rid)
 			return
@@ -256,15 +254,15 @@ func (c *Client) receiveLoop(rid int) {
 			Warning("[%s] bad reply from replica %d: %v", c.self, rid, err)
 			return
 		}
-		c.handleDataReply(&reply)
+		c.handleBusReply(&reply)
 	}
 }
 
-func (c *Client) handleDataReply(msg *DataReplyMessage) {
+func (c *Client) handleBusReply(msg *BusReplyMessage) {
 	now := nowNs()
 
 	c.mu.Lock()
-	e, ok := c.inflight[msg.SeqNum]
+	e, ok := c.inflight[msg.RequestId]
 	if !ok {
 		c.mu.Unlock()
 		return // already committed (or abandoned by a resend)
@@ -291,13 +289,13 @@ func (c *Client) handleDataReply(msg *DataReplyMessage) {
 		e.replicaMask&(uint32(1)<<leaderIdx) != 0
 
 	var rttUs, totalUs int64
-	var appReqId uint64
+	var origReqId uint64
 	var attempts uint32
 	if justCommitted {
 		e.committed = true
 		rttUs = (now - e.sendTimeNs) / 1000
 		totalUs = (now - e.firstSendTimeNs) / 1000
-		appReqId, attempts = e.appReqId, e.attempts
+		origReqId, attempts = e.origReqId, e.attempts
 		c.committedCount++
 		c.totalRttUs += uint64(rttUs)
 		c.winCommitted++
@@ -312,7 +310,7 @@ func (c *Client) handleDataReply(msg *DataReplyMessage) {
 	// Once all replicas have replied there is nothing left to measure, so the
 	// entry can be reclaimed immediately rather than waiting for the janitor.
 	if e.replyCount >= c.config.N {
-		delete(c.inflight, msg.SeqNum)
+		delete(c.inflight, msg.RequestId)
 	}
 	c.mu.Unlock()
 
@@ -321,11 +319,11 @@ func (c *Client) handleDataReply(msg *DataReplyMessage) {
 	// replica). run-gcp.sh's summary and analyze-logs.py both parse this, so
 	// every region now gets a full-size sample instead of only the fraction
 	// that happened to beat the quorum.
-	Notice("[%s] REPLY from replica=%d  rtt=%dus  seq=%d  post_quorum=%d",
-		c.self, msg.ReplicaIdx, replyRttUs, msg.SeqNum, postQuorum)
+	Notice("[%s] REPLY from replica=%d  rtt=%dus  req=%d  slot=%d  post_quorum=%d",
+		c.self, msg.ReplicaIdx, replyRttUs, msg.RequestId, msg.LogSlotNum, postQuorum)
 	if justCommitted {
-		Notice("[%s] COMMITTED seq=%d app_req=%d rtt=%dus total=%dus attempts=%d",
-			c.self, msg.SeqNum, appReqId, rttUs, totalUs, attempts)
+		Notice("[%s] COMMITTED req=%d slot=%d rtt=%dus total=%dus attempts=%d",
+			c.self, origReqId, msg.LogSlotNum, rttUs, totalUs, attempts)
 	}
 }
 
@@ -342,38 +340,38 @@ func (c *Client) resendLoop() {
 	for range ticker.C {
 		now := nowNs()
 		type resend struct {
-			oldSeq, newSeq, appReqId uint64
-			firstSendNs              int64
-			attempts                 uint32
-			totalResends             uint64
+			oldReqId, newReqId, origReqId uint64
+			firstSendNs                   int64
+			attempts                      uint32
+			totalResends                  uint64
 		}
 		var expired []resend
 
 		c.mu.Lock()
-		for seq, e := range c.inflight {
+		for reqId, e := range c.inflight {
 			if e.committed {
 				continue // already committed; the janitor reclaims it
 			}
 			if now-e.sendTimeNs < resendNs {
 				continue
 			}
-			c.seqNum++ // the resend occupies a brand-new slot; appReqId is unchanged
-			newSeq := c.seqNum
+			c.requestId++ // the resend is a new bus message at a new slot; origReqId is unchanged
+			newReqId := c.requestId
 			c.resendCount++
 			c.winResends++
 			expired = append(expired, resend{
-				oldSeq: seq, newSeq: newSeq, appReqId: e.appReqId,
+				oldReqId: reqId, newReqId: newReqId, origReqId: e.origReqId,
 				firstSendNs: e.firstSendTimeNs, attempts: e.attempts,
 				totalResends: c.resendCount,
 			})
-			delete(c.inflight, seq)
+			delete(c.inflight, reqId)
 		}
 		c.mu.Unlock()
 
 		for _, rs := range expired {
-			Notice("[%s] NO-QUORUM seq=%d app_req=%d  resending as seq=%d  attempt=%d  total_resends=%d",
-				c.self, rs.oldSeq, rs.appReqId, rs.newSeq, rs.attempts+1, rs.totalResends)
-			c.sendData(rs.newSeq, rs.appReqId, rs.firstSendNs, rs.attempts+1)
+			Notice("[%s] NO-QUORUM req=%d  resending as req=%d  attempt=%d  total_resends=%d",
+				c.self, rs.oldReqId, rs.newReqId, rs.attempts+1, rs.totalResends)
+			c.sendRequest(rs.newReqId, rs.origReqId, rs.firstSendNs, rs.attempts+1)
 		}
 	}
 }
@@ -381,7 +379,7 @@ func (c *Client) resendLoop() {
 // janitorLoop reclaims committed entries whose slowest replica reply never
 // arrives (a lost packet at these WAN latencies). Committed entries are kept
 // after quorum so every replica's reply can still be measured (see
-// handleDataReply); without this sweep a dropped post-quorum reply would pin
+// handleBusReply); without this sweep a dropped post-quorum reply would pin
 // the entry forever. It runs regardless of the resend setting.
 func (c *Client) janitorLoop() {
 	ticker := time.NewTicker(500 * time.Millisecond)
