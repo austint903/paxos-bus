@@ -249,8 +249,7 @@ func (r *Replica) handleData(msg *DataMessage) bool {
 	// append only buffers; flushLoop persists it in batches. clientLog has its
 	// own lock, so this stays outside r.mu.
 	if cl != nil {
-		cl.append(msg.SeqNum, msg.SeqNum, msg.AppReqId,
-			int64(msg.SendTimeNs), actualNs, len(msg.Payload))
+		cl.append(msg.SeqNum, msg.SeqNum, msg.AppReqId, len(msg.Payload))
 	}
 	return true
 }

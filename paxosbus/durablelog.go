@@ -43,11 +43,14 @@ func openClientLog(dir string, clientId uint64) (*clientLog, error) {
 // append writes one slot record as a single JSON line. slot == seq today (the
 // client's per-message counter); both are stored so the record stays
 // self-describing if slot assignment ever diverges from seq (e.g. NoOps).
-func (cl *clientLog) append(slot, seq, appReq uint64, sendNs, recvNs int64, payloadLen int) {
+// No timestamps: the client's send time and the replica's recv time live on
+// different clocks, so they can't yield an RTT (the client measures RTT on its
+// own clock), and gap agreement only needs slot/seq/app_req.
+func (cl *clientLog) append(slot, seq, appReq uint64, payloadLen int) {
 	cl.mu.Lock()
 	fmt.Fprintf(cl.w,
-		"{\"slot\":%d,\"seq\":%d,\"app_req\":%d,\"send_ns\":%d,\"recv_ns\":%d,\"len\":%d}\n",
-		slot, seq, appReq, sendNs, recvNs, payloadLen)
+		"{\"slot\":%d,\"seq\":%d,\"app_req\":%d,\"len\":%d}\n",
+		slot, seq, appReq, payloadLen)
 	cl.mu.Unlock()
 }
 
