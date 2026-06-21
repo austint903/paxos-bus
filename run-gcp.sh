@@ -158,9 +158,10 @@ for slot in 0 1 2; do
   region="${!zone_var}"; region="${region%-*}"   # us-east1-d -> us-east1
   ssh_to "${!vm_var}" "${!zone_var}" "
     rm -f /tmp/paxosbus.log
+    rm -rf /tmp/paxosbus-durable && mkdir -p /tmp/paxosbus-durable
     cd \$HOME/paxosbus
     nohup ./paxosbus-replica \
-      -c paxosbus.conf -i $slot -l $region </dev/null >/tmp/paxosbus.log 2>&1 &
+      -c paxosbus.conf -i $slot -l $region -d /tmp/paxosbus-durable </dev/null >/tmp/paxosbus.log 2>&1 &
     disown
     sleep 1
     if pgrep -f '[p]axosbus-replica' >/dev/null; then
@@ -234,6 +235,17 @@ scp_from "$CLIENT_VM" "$CLIENT_ZONE" "/tmp/paxosbus-client-1.log" "$HOME/paxosbu
 scp_from "$CLIENT_VM" "$CLIENT_ZONE" "/tmp/paxosbus-client-2.log" "$HOME/paxosbus-logs/" \
   || echo "  WARN: no /tmp/paxosbus-client-2.log on $CLIENT_VM"
 
+echo "[ctrl] Collecting durable per-client logs into ~/paxosbus-durable/ on controller"
+rm -rf ~/paxosbus-durable && mkdir -p ~/paxosbus-durable
+for slot in 0 1 2; do
+  vm_var="REPLICA${slot}_VM"; zone_var="REPLICA${slot}_ZONE"
+  # --recurse onto a not-yet-existing dest makes scp create replica-$slot as a
+  # copy of the remote dir (so files land in replica-$slot/client-*.log).
+  gcloud compute scp --zone="${!zone_var}" --internal-ip --recurse --quiet \
+    "${!vm_var}":/tmp/paxosbus-durable "$HOME/paxosbus-durable/replica-$slot" \
+    || echo "  WARN: no durable logs on ${!vm_var}"
+done
+
 echo ""
 echo "[ctrl] Per-replica RTT summary"
 for c in 1 2; do
@@ -283,4 +295,12 @@ gcloud compute scp --zone="$CONTROLLER_ZONE" --quiet --recurse \
   echo "mode=normal"
 } > "$RUN_LOG_DIR/run-meta.txt"
 
-echo "==> Done. VMs left running. Logs in $RUN_LOG_DIR/"
+# Durable per-client logs are archived separately, mirroring the local layout.
+DURABLE_DIR="./paxosbus/logs/durable/gcp/$(basename "$RUN_LOG_DIR")"
+echo "==> Copying durable per-client logs to $DURABLE_DIR/"
+mkdir -p "$DURABLE_DIR"
+gcloud compute scp --zone="$CONTROLLER_ZONE" --quiet --recurse \
+  "$CONTROLLER_VM":~/paxosbus-durable/. "$DURABLE_DIR/" \
+  || echo "  WARN: no durable logs collected on $CONTROLLER_VM"
+
+echo "==> Done. VMs left running. Logs in $RUN_LOG_DIR/ (durable: $DURABLE_DIR/)"

@@ -3,6 +3,7 @@ package paxosbus
 import (
 	"bufio"
 	"net"
+	"os"
 	"strconv"
 	"sync"
 	"time"
@@ -39,6 +40,11 @@ type Replica struct {
 	mu      sync.Mutex
 	clients map[uint64]*clientStream
 
+	// Durable per-client logs (slot == client seq). Separate from the stderr
+	// logs above; empty logDir disables them. Guarded by mu.
+	logDir     string
+	clientLogs map[uint64]*clientLog
+
 	// 1-second window counters for the periodic summary line (all clients).
 	winRecv       uint64
 	winDeltaSumUs int64
@@ -46,17 +52,27 @@ type Replica struct {
 	winDeltaMaxUs int64
 }
 
-func NewReplica(config *Config, idx int, label string) *Replica {
+func NewReplica(config *Config, idx int, label, logDir string) *Replica {
 	self := "Replica " + strconv.Itoa(idx)
 	if label != "" {
 		self += " " + label
 	}
 	r := &Replica{
-		config:  config,
-		idx:     idx,
-		viewId:  0,
-		self:    self,
-		clients: make(map[uint64]*clientStream),
+		config:     config,
+		idx:        idx,
+		viewId:     0,
+		self:       self,
+		clients:    make(map[uint64]*clientStream),
+		logDir:     logDir,
+		clientLogs: make(map[uint64]*clientLog),
+	}
+	if logDir != "" {
+		if err := os.MkdirAll(logDir, 0o755); err != nil {
+			Warning("[%s] cannot create durable log dir %s: %v", self, logDir, err)
+			r.logDir = ""
+		} else {
+			Notice("[%s] durable per-client logs in %s", self, logDir)
+		}
 	}
 	leader := "no"
 	if r.AmLeader() {
@@ -79,6 +95,9 @@ func (r *Replica) Run() error {
 		return err
 	}
 	go r.statsLoop()
+	if r.logDir != "" {
+		go r.flushLoop()
+	}
 	for {
 		conn, err := l.Accept()
 		if err != nil {
@@ -212,7 +231,27 @@ func (r *Replica) handleData(msg *DataMessage) bool {
 	}
 	r.winDeltaSumUs += deltaUs
 	r.winRecv++
+	// Lazily open the durable log on the first data op (the sync message itself
+	// is never logged — only client->replica operations get a slot).
+	cl := r.clientLogs[msg.ClientId]
+	if cl == nil && r.logDir != "" {
+		var err error
+		if cl, err = openClientLog(r.logDir, msg.ClientId); err != nil {
+			Warning("[%s] cannot open durable log for client %d: %v",
+				r.self, msg.ClientId, err)
+		} else {
+			r.clientLogs[msg.ClientId] = cl
+		}
+	}
 	r.mu.Unlock()
+
+	// Durably record the op in this client's per-slot log (slot == seq). The
+	// append only buffers; flushLoop persists it in batches. clientLog has its
+	// own lock, so this stays outside r.mu.
+	if cl != nil {
+		cl.append(msg.SeqNum, msg.SeqNum, msg.AppReqId,
+			int64(msg.SendTimeNs), actualNs, len(msg.Payload))
+	}
 	return true
 }
 
@@ -232,5 +271,23 @@ func (r *Replica) statsLoop() {
 		// processing so analyze-logs.py parses both implementations alike.
 		Notice("[%s] 1s: received=%d dropped=0 delta_avg=%+dus delta_min=%+dus delta_max=%+dus gaps=0 recovered=0 noops=0",
 			r.self, recv, avg, min, max)
+	}
+}
+
+// flushLoop batches durable-log writes to disk. Every tick it snapshots the set
+// of client logs under mu, then flushes each (the per-log lock serializes with
+// concurrent appends), so at most one tick of appends is at risk on a crash.
+func (r *Replica) flushLoop() {
+	ticker := time.NewTicker(100 * time.Millisecond)
+	for range ticker.C {
+		r.mu.Lock()
+		logs := make([]*clientLog, 0, len(r.clientLogs))
+		for _, cl := range r.clientLogs {
+			logs = append(logs, cl)
+		}
+		r.mu.Unlock()
+		for _, cl := range logs {
+			cl.flush()
+		}
 	}
 }

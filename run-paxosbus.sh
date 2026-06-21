@@ -107,6 +107,12 @@ mkdir -p "$RUN_LOG_DIR"
     echo "resend_ms=$RESEND_MS"
 } > "$RUN_LOG_DIR/run-meta.txt"
 echo "Logs: $RUN_LOG_DIR"
+
+# ── Durable per-client logs (separate from the stderr archive above) ─────────
+# One subdir per replica; each replica writes <client-id>.log slot records into
+# its mounted /durable. Bind-mounted so the files survive the container.
+DURABLE_DIR="$SCRIPT_DIR/paxosbus/logs/durable/local/$(basename "$RUN_LOG_DIR")"
+echo "Durable logs: $DURABLE_DIR"
 echo ""
 
 # ── Network ──────────────────────────────────────────────────────────────────
@@ -117,13 +123,15 @@ for i in $(seq 0 $((NUM_REPLICAS - 1))); do
     NAME="paxosbus-replica-$i"
     IP="172.29.0.$((BASE_REPLICA_OCTET + i))"
     echo "+ replica $NAME  ($IP:$REPLICA_PORT)"
+    mkdir -p "$DURABLE_DIR/replica-$i"
     docker run -d \
         --name "$NAME" \
         --network "$NETWORK" \
         --ip "$IP" \
         -v "$CONFIG_DIR:/config:ro" \
+        -v "$DURABLE_DIR/replica-$i:/durable" \
         "$IMAGE" \
-        /paxosbus/paxosbus-replica -c /config/paxosbus.conf -i "$i" \
+        /paxosbus/paxosbus-replica -c /config/paxosbus.conf -i "$i" -d /durable \
         > /dev/null
     CONTAINERS+=("$NAME")
 done
