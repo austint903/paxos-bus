@@ -2,6 +2,7 @@ package paxosbus
 
 import (
 	"bufio"
+	"fmt"
 	"net"
 	"os"
 	"strconv"
@@ -114,6 +115,55 @@ const (
 	gapProtocolTimeout = 3 * time.Second
 )
 
+// dropMode selects which replicas artificially drop incoming requests, used to
+// force the (otherwise very rare) gap-agreement paths during a run:
+//   - dropLeader: only the leader drops, so it must recover the real op from a
+//     follower (leaderResolve Scenario 2).
+//   - dropFollowers: the f lowest-index followers drop while the leader keeps the
+//     op, so each asks the leader and is served (followerRecover Scenario 1).
+//   - dropAll: every replica drops the same slot, so nobody has it and the leader
+//     commits a NoOp (leaderResolve Scenario 3).
+//
+// Every replica is launched with the same mode and decides locally from its role
+// and the request id, so all replicas agree on which slots to drop.
+type dropMode uint8
+
+const (
+	dropNone dropMode = iota
+	dropLeader
+	dropFollowers
+	dropAll
+)
+
+// ParseDropMode converts a CLI drop-mode string into a dropMode.
+func ParseDropMode(s string) (dropMode, error) {
+	switch s {
+	case "", "none":
+		return dropNone, nil
+	case "leader":
+		return dropLeader, nil
+	case "followers":
+		return dropFollowers, nil
+	case "all":
+		return dropAll, nil
+	default:
+		return dropNone, fmt.Errorf("unknown drop mode %q (want none|leader|followers|all)", s)
+	}
+}
+
+func (m dropMode) String() string {
+	switch m {
+	case dropLeader:
+		return "leader"
+	case dropFollowers:
+		return "followers"
+	case dropAll:
+		return "all"
+	default:
+		return "none"
+	}
+}
+
 type Replica struct {
 	config *Config
 	idx    int
@@ -136,6 +186,12 @@ type Replica struct {
 	logDir     string
 	clientLogs map[uint64]*clientLog
 
+	// Artificial message dropping (gap-agreement testing). dropEvery==0 or
+	// dropMode==dropNone disables it; otherwise a slot is dropped when
+	// requestId % dropEvery == 0, on the replicas selected by dropMode.
+	dropMode  dropMode
+	dropEvery uint64
+
 	// 1-second window counters for the periodic summary line (all clients).
 	winRecv       uint64
 	winDeltaSumUs int64
@@ -144,9 +200,10 @@ type Replica struct {
 	winGaps       uint64
 	winRecovered  uint64
 	winNoops      uint64
+	winDropped    uint64
 }
 
-func NewReplica(config *Config, idx int, label, logDir string) *Replica {
+func NewReplica(config *Config, idx int, label, logDir string, mode dropMode, every uint64) *Replica {
 	self := "Replica " + strconv.Itoa(idx)
 	if label != "" {
 		self += " " + label
@@ -161,6 +218,8 @@ func NewReplica(config *Config, idx int, label, logDir string) *Replica {
 		gaps:        make(map[gapKey]*gapState),
 		logDir:      logDir,
 		clientLogs:  make(map[uint64]*clientLog),
+		dropMode:    mode,
+		dropEvery:   every,
 	}
 	if logDir != "" {
 		if err := os.MkdirAll(logDir, 0o755); err != nil {
@@ -176,11 +235,53 @@ func NewReplica(config *Config, idx int, label, logDir string) *Replica {
 	}
 	Notice("[%s] started (view=0, f=%d, quorum=%d, leader=%s)",
 		r.self, config.F, config.QuorumSize(), leader)
+	if r.dropMode != dropNone && r.dropEvery > 0 {
+		Notice("[%s] artificial drop enabled: mode=%s every=%d (drop slot when reqId%%%d==0)",
+			r.self, r.dropMode, r.dropEvery, r.dropEvery)
+	}
 	return r
 }
 
 func (r *Replica) AmLeader() bool {
 	return r.config.LeaderIndex(r.viewId) == r.idx
+}
+
+// followerRankLocked returns this replica's position among the non-leader
+// replicas ordered by index (0 = first follower). Used to select the f
+// lowest-index followers for dropFollowers. Callers hold r.mu (it reads viewId).
+func (r *Replica) followerRankLocked() int {
+	leader := r.config.LeaderIndex(r.viewId)
+	rank := 0
+	for j := 0; j < r.idx; j++ {
+		if j != leader {
+			rank++
+		}
+	}
+	return rank
+}
+
+// shouldDropLocked reports whether this replica should artificially drop the
+// request at requestId, per dropMode/dropEvery. Callers hold r.mu.
+func (r *Replica) shouldDropLocked(requestId uint64) bool {
+	if r.dropEvery == 0 || r.dropMode == dropNone {
+		return false
+	}
+	if requestId%r.dropEvery != 0 {
+		return false
+	}
+	switch r.dropMode {
+	case dropAll:
+		return true
+	case dropLeader:
+		return r.AmLeader()
+	case dropFollowers:
+		// The f lowest-index followers drop; the leader (and any remaining
+		// followers) keep the op, so client replies stay >= quorum and the op is
+		// always recoverable.
+		return !r.AmLeader() && r.followerRankLocked() < r.config.F
+	default:
+		return false
+	}
 }
 
 // Run binds the replica port, then serves one reader goroutine per client
@@ -332,6 +433,14 @@ func (r *Replica) handleRequest(msg *BusRequestMessage) bool {
 	if !ok {
 		r.mu.Unlock()
 		Warning("[%s] request from unsynced client %d, ignoring", r.self, msg.ClientId)
+		return false
+	}
+	// Artificial drop: simulate the request never arriving. Nothing is recorded
+	// and no reply is sent, so the slot stays EMPTY and the gap detector picks it
+	// up — exactly as a real network drop would.
+	if r.shouldDropLocked(msg.RequestId) {
+		r.winDropped++
+		r.mu.Unlock()
 		return false
 	}
 	if msg.RequestId > s.maxSeqSeen {
@@ -491,10 +600,12 @@ func (r *Replica) statsLoop() {
 		recv := r.winRecv
 		sum, min, max := r.winDeltaSumUs, r.winDeltaMinUs, r.winDeltaMaxUs
 		gaps, recovered, noops := r.winGaps, r.winRecovered, r.winNoops
+		dropped := r.winDropped
 		r.winRecv, r.winDeltaSumUs, r.winDeltaMinUs, r.winDeltaMaxUs = 0, 0, 0, 0
 		r.winGaps, r.winRecovered, r.winNoops = 0, 0, 0
+		r.winDropped = 0
 		r.mu.Unlock()
-		if recv == 0 && gaps == 0 && recovered == 0 && noops == 0 {
+		if recv == 0 && gaps == 0 && recovered == 0 && noops == 0 && dropped == 0 {
 			continue
 		}
 		var avg int64
@@ -503,8 +614,8 @@ func (r *Replica) statsLoop() {
 		}
 		// Same shape as the C++ replica summary; the gap fields now carry real
 		// per-window counts so analyze-logs.py parses both implementations alike.
-		Notice("[%s] 1s: received=%d dropped=0 delta_avg=%+dus delta_min=%+dus delta_max=%+dus gaps=%d recovered=%d noops=%d",
-			r.self, recv, avg, min, max, gaps, recovered, noops)
+		Notice("[%s] 1s: received=%d dropped=%d delta_avg=%+dus delta_min=%+dus delta_max=%+dus gaps=%d recovered=%d noops=%d",
+			r.self, recv, dropped, avg, min, max, gaps, recovered, noops)
 	}
 }
 

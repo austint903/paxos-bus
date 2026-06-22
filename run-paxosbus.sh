@@ -11,25 +11,31 @@ NUM_CLIENTS=2
 RESEND_MS=0            # client resend-on-no-quorum timeout (ms); 0 = disabled
 DURATION_S="${DURATION_S:-60}"  # seconds of data phase, then auto-stop; 0 = run until Ctrl+C
 SYNC_WARMUP_S=5        # client sync wait before data starts (matches syncStartDelayMs=5000)
+DROP_MODE=none         # artificial drop scenario: none|leader|followers|all
+DROP_EVERY=0           # drop a slot when reqId % DROP_EVERY == 0 (0 = disabled)
 # ────────────────────────────────────────────────────────────────────────────
 
 FORCE_BUILD=0
 
 usage() {
-    echo "Usage: $0 [-b] [-p <interval_ms>] [-t <resend_ms>] [-d <seconds>]"
+    echo "Usage: $0 [-b] [-p <interval_ms>] [-t <resend_ms>] [-d <seconds>] [-D <drop_mode>] [-F <drop_every>]"
     echo "  -b            force rebuild of Docker image"
     echo "  -p <ms>       message interval in ms (default: $MSG_INTERVAL_MS)"
     echo "  -t <ms>       client resend-on-no-quorum timeout (default: $RESEND_MS, 0=off)"
     echo "  -d <seconds>  auto-stop after this many seconds of data phase (default: run until Ctrl+C)"
+    echo "  -D <mode>     artificial drop scenario: none|leader|followers|all (default: $DROP_MODE)"
+    echo "  -F <n>        drop a slot when reqId % n == 0 (default: $DROP_EVERY, 0=off)"
     exit 1
 }
 
-while getopts "bp:t:d:h" opt; do
+while getopts "bp:t:d:D:F:h" opt; do
     case $opt in
         b) FORCE_BUILD=1 ;;
         p) MSG_INTERVAL_MS=$OPTARG ;;
         t) RESEND_MS=$OPTARG ;;
         d) DURATION_S=$OPTARG ;;
+        D) DROP_MODE=$OPTARG ;;
+        F) DROP_EVERY=$OPTARG ;;
         h) usage ;;
         *) usage ;;
     esac
@@ -91,7 +97,11 @@ F=$(( (NUM_REPLICAS - 1) / 2 ))
 
 echo "Config ($CONF):"
 sed 's/^/  /' "$CONF"
-echo "Mode: NORMAL (no gap agreement)"
+if [[ "$DROP_MODE" != "none" && "$DROP_EVERY" -gt 0 ]]; then
+    echo "Mode: ARTIFICIAL DROP (scenario=$DROP_MODE, every reqId%$DROP_EVERY==0)"
+else
+    echo "Mode: NORMAL (no artificial drops)"
+fi
 echo ""
 
 # ── Per-run log directory (durable copy of every node's stream) ──────────────
@@ -105,6 +115,8 @@ mkdir -p "$RUN_LOG_DIR"
     echo "num_replicas=$NUM_REPLICAS"
     echo "num_clients=$NUM_CLIENTS"
     echo "resend_ms=$RESEND_MS"
+    echo "drop_mode=$DROP_MODE"
+    echo "drop_every=$DROP_EVERY"
 } > "$RUN_LOG_DIR/run-meta.txt"
 echo "Logs: $RUN_LOG_DIR"
 
@@ -132,6 +144,7 @@ for i in $(seq 0 $((NUM_REPLICAS - 1))); do
         -v "$DURABLE_DIR/replica-$i:/durable" \
         "$IMAGE" \
         /paxosbus/paxosbus-replica -c /config/paxosbus.conf -i "$i" -d /durable \
+            -drop-mode "$DROP_MODE" -drop-every "$DROP_EVERY" \
         > /dev/null
     CONTAINERS+=("$NAME")
 done
