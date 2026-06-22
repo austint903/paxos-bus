@@ -44,6 +44,16 @@ func (lw *lockedWriter) send(code uint8, msg *BusRequestMessage) error {
 	return lw.w.Flush()
 }
 
+// sendMsg serializes any wire message over the connection. Replicas reuse
+// lockedWriter for their persistent peer connections (see Replica.peerWriters).
+func (lw *lockedWriter) sendMsg(code uint8, msg wireMsg) error {
+	lw.mu.Lock()
+	defer lw.mu.Unlock()
+	lw.w.WriteByte(code)
+	msg.Marshal(lw.w)
+	return lw.w.Flush()
+}
+
 // Client runs the PaxosBus open loop with two decoupled sides sharing one
 // mutex-protected inflight map:
 //   - the send goroutine paces BusRequestMessages to all replicas at a fixed
