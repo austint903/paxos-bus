@@ -496,7 +496,7 @@ func (r *Replica) handleRequest(msg *BusRequestMessage) bool {
 	// append only buffers; flushLoop persists it in batches. clientLog has its
 	// own lock, so this stays outside r.mu.
 	if stored && cl != nil {
-		cl.append(msg.RequestId, msg.RequestId, msg.Op, false)
+		cl.record(msg.RequestId, msg.RequestId, msg.Op, false)
 	}
 	return true
 }
@@ -575,8 +575,10 @@ func (r *Replica) advanceNextExpectedLocked(clientId uint64) {
 }
 
 // durableAppendLocked records a gap resolution (recovered op or NoOp) in the
-// client's durable log, lazily opening it. Used only on the rare gap path, so
-// the buffered append under r.mu is acceptable. Callers hold r.mu.
+// client's durable log, lazily opening it. The slot was overtaken by later
+// arrivals, so clientLog.record patches the placeholder reserved at the slot's
+// in-order position instead of appending at the tail. Used only on the rare gap
+// path, so the buffered write under r.mu is acceptable. Callers hold r.mu.
 func (r *Replica) durableAppendLocked(clientId, slot, reqId uint64, op []byte, noop bool) {
 	if r.logDir == "" {
 		return
@@ -590,7 +592,7 @@ func (r *Replica) durableAppendLocked(clientId, slot, reqId uint64, op []byte, n
 		}
 		r.clientLogs[clientId] = cl
 	}
-	cl.append(slot, reqId, op, noop)
+	cl.record(slot, reqId, op, noop)
 }
 
 func (r *Replica) statsLoop() {
