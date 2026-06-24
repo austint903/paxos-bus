@@ -39,9 +39,9 @@ type BusSyncMessage struct {
 }
 
 // Phase 2: a client bus request. RequestId is the client-assigned bus message
-// number (monotonic, one per request). Without gap agreement the replica's log
-// slot equals RequestId; once gap agreement lands (NoOp fill / recovery) the
-// two diverge, which is why the reply carries both.
+// number (monotonic, one per request). The replica's log slot is the GLOBAL
+// slot — RequestId's rank in the merged, predicted-arrival order across all
+// clients — not RequestId itself, which is why the reply carries both.
 type BusRequestMessage struct {
 	ClientId   uint64
 	RequestId  uint64
@@ -51,8 +51,9 @@ type BusRequestMessage struct {
 
 // Phase 2: a replica's reply to a BusRequest (sent back on the same connection
 // the request arrived on). RequestId echoes the request for matching; LogSlotNum
-// is where the replica placed it (== RequestId pre-gap-agreement); Result is the
-// operation's result (nil for now — there is no execution layer yet).
+// is the GLOBAL slot where the replica placed it (RequestId's rank in the merged
+// order, no longer == RequestId); Result is the operation's result (nil for now
+// — there is no execution layer yet).
 type BusReplyMessage struct {
 	ClientId   uint64
 	RequestId  uint64
@@ -155,11 +156,15 @@ func (m *BusReplyMessage) Unmarshal(wire io.Reader) error {
 	return nil
 }
 
-// BusGapRequest asks a peer "do you have client ClientId's slot Slot?". A
-// follower sends it to the leader; the leader also broadcasts it to all peers
-// when it lacks the slot itself.
+// Gap-agreement messages address the GLOBAL slot. The slot already determines
+// its owner (the (client, seq) that ranks there), and every replica derives that
+// owner deterministically from the agreed lines, so the wire only needs the
+// slot — no clientId is carried.
+
+// BusGapRequest asks a peer "do you have global slot Slot?". A follower sends it
+// to the leader; the leader also broadcasts it to all peers when it lacks the
+// slot itself.
 type BusGapRequest struct {
-	ClientId  uint64
 	Slot      uint64
 	SenderIdx uint32
 }
@@ -167,7 +172,6 @@ type BusGapRequest struct {
 // BusGapReply answers a BusGapRequest. It is the ONLY carrier of recovered real
 // data (pull-based, point-to-point): Found + the op bytes, or Found=false.
 type BusGapReply struct {
-	ClientId  uint64
 	Slot      uint64
 	SenderIdx uint32
 	Found     bool
@@ -177,7 +181,6 @@ type BusGapReply struct {
 // BusGapCommit is the leader's authoritative NoOp commit for a slot (Scenario 3
 // only; it never carries real data). Followers apply it unconditionally.
 type BusGapCommit struct {
-	ClientId  uint64
 	Slot      uint64
 	SenderIdx uint32
 	ViewId    uint64
@@ -185,7 +188,6 @@ type BusGapCommit struct {
 
 // BusGapCommitReply acks a BusGapCommit back to the leader.
 type BusGapCommitReply struct {
-	ClientId  uint64
 	Slot      uint64
 	SenderIdx uint32
 }
@@ -193,35 +195,32 @@ type BusGapCommitReply struct {
 func (m *BusGapRequest) New() fastrpc.Serializable { return new(BusGapRequest) }
 
 func (m *BusGapRequest) Marshal(wire io.Writer) {
-	var b [20]byte
-	binary.LittleEndian.PutUint64(b[0:8], m.ClientId)
-	binary.LittleEndian.PutUint64(b[8:16], m.Slot)
-	binary.LittleEndian.PutUint32(b[16:20], m.SenderIdx)
+	var b [12]byte
+	binary.LittleEndian.PutUint64(b[0:8], m.Slot)
+	binary.LittleEndian.PutUint32(b[8:12], m.SenderIdx)
 	wire.Write(b[:])
 }
 
 func (m *BusGapRequest) Unmarshal(wire io.Reader) error {
-	var b [20]byte
+	var b [12]byte
 	if _, err := io.ReadFull(wire, b[:]); err != nil {
 		return err
 	}
-	m.ClientId = binary.LittleEndian.Uint64(b[0:8])
-	m.Slot = binary.LittleEndian.Uint64(b[8:16])
-	m.SenderIdx = binary.LittleEndian.Uint32(b[16:20])
+	m.Slot = binary.LittleEndian.Uint64(b[0:8])
+	m.SenderIdx = binary.LittleEndian.Uint32(b[8:12])
 	return nil
 }
 
 func (m *BusGapReply) New() fastrpc.Serializable { return new(BusGapReply) }
 
 func (m *BusGapReply) Marshal(wire io.Writer) {
-	var b [25]byte
-	binary.LittleEndian.PutUint64(b[0:8], m.ClientId)
-	binary.LittleEndian.PutUint64(b[8:16], m.Slot)
-	binary.LittleEndian.PutUint32(b[16:20], m.SenderIdx)
+	var b [17]byte
+	binary.LittleEndian.PutUint64(b[0:8], m.Slot)
+	binary.LittleEndian.PutUint32(b[8:12], m.SenderIdx)
 	if m.Found {
-		b[20] = 1
+		b[12] = 1
 	}
-	binary.LittleEndian.PutUint32(b[21:25], uint32(len(m.Op)))
+	binary.LittleEndian.PutUint32(b[13:17], uint32(len(m.Op)))
 	wire.Write(b[:])
 	if len(m.Op) > 0 {
 		wire.Write(m.Op)
@@ -229,15 +228,14 @@ func (m *BusGapReply) Marshal(wire io.Writer) {
 }
 
 func (m *BusGapReply) Unmarshal(wire io.Reader) error {
-	var b [25]byte
+	var b [17]byte
 	if _, err := io.ReadFull(wire, b[:]); err != nil {
 		return err
 	}
-	m.ClientId = binary.LittleEndian.Uint64(b[0:8])
-	m.Slot = binary.LittleEndian.Uint64(b[8:16])
-	m.SenderIdx = binary.LittleEndian.Uint32(b[16:20])
-	m.Found = b[20] != 0
-	opLen := binary.LittleEndian.Uint32(b[21:25])
+	m.Slot = binary.LittleEndian.Uint64(b[0:8])
+	m.SenderIdx = binary.LittleEndian.Uint32(b[8:12])
+	m.Found = b[12] != 0
+	opLen := binary.LittleEndian.Uint32(b[13:17])
 	m.Op = make([]byte, opLen)
 	if _, err := io.ReadFull(wire, m.Op); err != nil {
 		return err
@@ -248,43 +246,39 @@ func (m *BusGapReply) Unmarshal(wire io.Reader) error {
 func (m *BusGapCommit) New() fastrpc.Serializable { return new(BusGapCommit) }
 
 func (m *BusGapCommit) Marshal(wire io.Writer) {
-	var b [28]byte
-	binary.LittleEndian.PutUint64(b[0:8], m.ClientId)
-	binary.LittleEndian.PutUint64(b[8:16], m.Slot)
-	binary.LittleEndian.PutUint32(b[16:20], m.SenderIdx)
-	binary.LittleEndian.PutUint64(b[20:28], m.ViewId)
+	var b [20]byte
+	binary.LittleEndian.PutUint64(b[0:8], m.Slot)
+	binary.LittleEndian.PutUint32(b[8:12], m.SenderIdx)
+	binary.LittleEndian.PutUint64(b[12:20], m.ViewId)
 	wire.Write(b[:])
 }
 
 func (m *BusGapCommit) Unmarshal(wire io.Reader) error {
-	var b [28]byte
+	var b [20]byte
 	if _, err := io.ReadFull(wire, b[:]); err != nil {
 		return err
 	}
-	m.ClientId = binary.LittleEndian.Uint64(b[0:8])
-	m.Slot = binary.LittleEndian.Uint64(b[8:16])
-	m.SenderIdx = binary.LittleEndian.Uint32(b[16:20])
-	m.ViewId = binary.LittleEndian.Uint64(b[20:28])
+	m.Slot = binary.LittleEndian.Uint64(b[0:8])
+	m.SenderIdx = binary.LittleEndian.Uint32(b[8:12])
+	m.ViewId = binary.LittleEndian.Uint64(b[12:20])
 	return nil
 }
 
 func (m *BusGapCommitReply) New() fastrpc.Serializable { return new(BusGapCommitReply) }
 
 func (m *BusGapCommitReply) Marshal(wire io.Writer) {
-	var b [20]byte
-	binary.LittleEndian.PutUint64(b[0:8], m.ClientId)
-	binary.LittleEndian.PutUint64(b[8:16], m.Slot)
-	binary.LittleEndian.PutUint32(b[16:20], m.SenderIdx)
+	var b [12]byte
+	binary.LittleEndian.PutUint64(b[0:8], m.Slot)
+	binary.LittleEndian.PutUint32(b[8:12], m.SenderIdx)
 	wire.Write(b[:])
 }
 
 func (m *BusGapCommitReply) Unmarshal(wire io.Reader) error {
-	var b [20]byte
+	var b [12]byte
 	if _, err := io.ReadFull(wire, b[:]); err != nil {
 		return err
 	}
-	m.ClientId = binary.LittleEndian.Uint64(b[0:8])
-	m.Slot = binary.LittleEndian.Uint64(b[8:16])
-	m.SenderIdx = binary.LittleEndian.Uint32(b[16:20])
+	m.Slot = binary.LittleEndian.Uint64(b[0:8])
+	m.SenderIdx = binary.LittleEndian.Uint32(b[8:12])
 	return nil
 }
