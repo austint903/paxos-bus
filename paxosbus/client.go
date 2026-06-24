@@ -142,9 +142,14 @@ func (c *Client) Connect() error {
 // Run executes the sync phase and then the open-loop data phase. Blocks
 // forever (the send loop never exits).
 func (c *Client) Run() {
+	// SendTimeNs is on the SHARED wall clock: the replica's agreed line is
+	// baseNs = SendTimeNs + StartDelayMs, and every replica must derive the same
+	// baseNs (and hence the same global slot) from it. Wall-clock ns are
+	// comparable across processes/hosts (one host shares the clock; a WAN rides
+	// NTP), unlike per-process monotonic nowNs.
 	syncMsg := BusSyncMessage{
 		ClientId:     c.clientId,
-		SendTimeNs:   uint64(nowNs()),
+		SendTimeNs:   uint64(wallNs()),
 		IntervalMs:   c.intervalMs,
 		StartDelayMs: syncStartDelayMs,
 	}
