@@ -10,27 +10,29 @@ import (
 	"sync"
 )
 
-// clientLog is a replica's durable, append-only operation log for ONE client,
-// kept separate from the existing stderr summary/event logs. Slot number ==
-// the client's BusRequestMessage.RequestId: slot N holds that client's request
-// N, so a dropped message leaves a hole at its slot and the slots line up across
-// replicas (gap agreement can copy slot N verbatim from a peer).
+// durableLog is a replica's single durable, append-only operation log — ONE
+// global log per replica, kept separate from the existing stderr summary/event
+// logs. Slot number == the message's GLOBAL slot (its rank in the merged,
+// predicted-arrival order across all clients), so every replica's log lines up
+// slot-for-slot and gap agreement can copy slot G verbatim from a peer. Each
+// record carries its (client, req_id) provenance, since one global log
+// interleaves every client's messages.
 //
-// The file is kept STRICTLY CONTIGUOUS in slot order. Normally requests arrive
-// in slot order and are appended compactly at the tail. When a slot is dropped,
-// later slots still arrive and overtake it; rather than writing them ahead of
-// the hole (which would leave the recovered record dangling at end-of-file when
-// gap agreement finishes much later), the log reserves the missing slot's
-// position with a fixed-width PLACEHOLDER record and remembers its byte offset.
-// When gap agreement resolves that slot (recovered op or committed NoOp), the
-// placeholder is overwritten in place via WriteAt, so the record lands at its
-// natural position between its neighbours instead of being appended out of order.
+// The file is kept STRICTLY CONTIGUOUS in slot order. Because global slots
+// interleave across clients, records routinely arrive out of slot order; rather
+// than writing a later slot ahead of an earlier hole (which would leave the
+// recovered record dangling at end-of-file when gap agreement finishes much
+// later), the log reserves each missing slot's position with a fixed-width
+// PLACEHOLDER record and remembers its byte offset. When gap agreement resolves
+// that slot (recovered op or committed NoOp), the placeholder is overwritten in
+// place via WriteAt, so the record lands at its natural position between its
+// neighbours instead of being appended out of order.
 //
 // Appends only touch the in-memory bufio buffer; the buffer is pushed to disk
 // in batches by the replica's flush loop (see Replica.flushLoop), so the hot
 // path never blocks on I/O. At most one flush interval of appends is at risk on
 // a hard crash.
-type clientLog struct {
+type durableLog struct {
 	mu sync.Mutex
 	f  *os.File
 	w  *bufio.Writer
@@ -50,10 +52,10 @@ type clientLog struct {
 	holes map[uint64]int64
 }
 
-// clientLogBufBytes sizes the append-batching buffer. The bufio writer flushes
+// durableLogBufBytes sizes the append-batching buffer. The bufio writer flushes
 // to the OS on its own when full, so high message rates still batch to disk
 // between flush ticks instead of stalling on every append.
-const clientLogBufBytes = 1 << 16 // 64 KiB
+const durableLogBufBytes = 1 << 16 // 64 KiB
 
 // holeRecordWidth is the fixed byte width (including the trailing newline) of a
 // reserved gap placeholder and of the record that later overwrites it in place.
@@ -63,11 +65,11 @@ const clientLogBufBytes = 1 << 16 // 64 KiB
 // the padding cost is negligible.
 const holeRecordWidth = 256
 
-// openClientLog opens (creating, or reopening) the durable log file for one
-// client under dir, e.g. <dir>/client-<id>.log. The file is opened without
+// openDurableLog opens (creating, or reopening) the replica's single durable
+// global log under dir, at <dir>/replica.log. The file is opened without
 // O_APPEND so placeholder records can be patched in place with WriteAt.
-func openClientLog(dir string, clientId uint64) (*clientLog, error) {
-	path := filepath.Join(dir, fmt.Sprintf("client-%d.log", clientId))
+func openDurableLog(dir string) (*durableLog, error) {
+	path := filepath.Join(dir, "replica.log")
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY, 0o644)
 	if err != nil {
 		return nil, err
@@ -78,24 +80,24 @@ func openClientLog(dir string, clientId uint64) (*clientLog, error) {
 		f.Close()
 		return nil, err
 	}
-	return &clientLog{
+	return &durableLog{
 		f:       f,
-		w:       bufio.NewWriterSize(f, clientLogBufBytes),
+		w:       bufio.NewWriterSize(f, durableLogBufBytes),
 		tailOff: off,
 		holes:   make(map[uint64]int64),
 	}, nil
 }
 
 // recordBody renders the JSON body of one slot record (no newline, no padding).
-// slot == req id for a normally-received request; gap agreement makes them
-// diverge (a recovered op keeps its original req_id, a NoOp fill sets noop=true
-// with req_id 0). The op bytes are stored hex-encoded so a peer can serve the
+// slot is the GLOBAL slot; client/req_id are the owning message's provenance (a
+// recovered op keeps its origin, a NoOp fill sets noop=true and identifies the
+// missing message). The op bytes are stored hex-encoded so a peer can serve the
 // exact request during recovery and the record stays valid JSON for arbitrary
 // payloads.
-func recordBody(slot, reqId uint64, op []byte, noop bool) string {
+func recordBody(slot, clientId, reqId uint64, op []byte, noop bool) string {
 	return fmt.Sprintf(
-		"{\"slot\":%d,\"req_id\":%d,\"len\":%d,\"op\":\"%s\",\"noop\":%t}",
-		slot, reqId, len(op), hex.EncodeToString(op), noop)
+		"{\"slot\":%d,\"client\":%d,\"req_id\":%d,\"len\":%d,\"op\":\"%s\",\"noop\":%t}",
+		slot, clientId, reqId, len(op), hex.EncodeToString(op), noop)
 }
 
 // placeholderBody renders a reserved-but-unresolved slot. The pending flag marks
@@ -127,7 +129,7 @@ func padLine(body string) []byte {
 //   - slot <  nextSlot: this is a gap resolution; overwrite the slot's reserved
 //     placeholder in place (WriteAt). If there is no placeholder (already
 //     resolved or a duplicate), ignore it.
-func (cl *clientLog) record(slot, reqId uint64, op []byte, noop bool) {
+func (cl *durableLog) record(slot, clientId, reqId uint64, op []byte, noop bool) {
 	cl.mu.Lock()
 	defer cl.mu.Unlock()
 
@@ -136,7 +138,7 @@ func (cl *clientLog) record(slot, reqId uint64, op []byte, noop bool) {
 	}
 
 	if slot < cl.nextSlot {
-		cl.patchHoleLocked(slot, reqId, op, noop)
+		cl.patchHoleLocked(slot, clientId, reqId, op, noop)
 		return
 	}
 
@@ -147,7 +149,7 @@ func (cl *clientLog) record(slot, reqId uint64, op []byte, noop bool) {
 		cl.holes[s] = off
 	}
 	// Append this slot compactly at the tail.
-	body := recordBody(slot, reqId, op, noop)
+	body := recordBody(slot, clientId, reqId, op, noop)
 	cl.writeAtTailLocked([]byte(body + "\n"))
 	cl.nextSlot = slot + 1
 }
@@ -158,12 +160,12 @@ func (cl *clientLog) record(slot, reqId uint64, op []byte, noop bool) {
 // placeholder would clobber the patch. WriteAt is positional and does not move
 // the file offset, so subsequent appends continue at the tail. Callers hold
 // cl.mu.
-func (cl *clientLog) patchHoleLocked(slot, reqId uint64, op []byte, noop bool) {
+func (cl *durableLog) patchHoleLocked(slot, clientId, reqId uint64, op []byte, noop bool) {
 	off, ok := cl.holes[slot]
 	if !ok {
 		return // already resolved, or a duplicate fill
 	}
-	body := recordBody(slot, reqId, op, noop)
+	body := recordBody(slot, clientId, reqId, op, noop)
 	cl.w.Flush()
 	cl.f.WriteAt(padLine(body), off)
 	delete(cl.holes, slot)
@@ -171,14 +173,14 @@ func (cl *clientLog) patchHoleLocked(slot, reqId uint64, op []byte, noop bool) {
 
 // writeAtTailLocked appends bytes through the bufio buffer and advances the
 // tracked tail offset. Callers hold cl.mu.
-func (cl *clientLog) writeAtTailLocked(b []byte) {
+func (cl *durableLog) writeAtTailLocked(b []byte) {
 	cl.w.Write(b)
 	cl.tailOff += int64(len(b))
 }
 
 // flush pushes the buffer to the OS and fsyncs it to disk. The replica calls it
 // on a timer so appends are persisted in batches.
-func (cl *clientLog) flush() {
+func (cl *durableLog) flush() {
 	cl.mu.Lock()
 	cl.w.Flush()
 	cl.f.Sync()
@@ -186,7 +188,7 @@ func (cl *clientLog) flush() {
 }
 
 // close flushes and closes the file (best effort).
-func (cl *clientLog) close() {
+func (cl *durableLog) close() {
 	cl.mu.Lock()
 	cl.w.Flush()
 	cl.f.Sync()
