@@ -9,14 +9,6 @@ import (
 	"time"
 )
 
-// Notice/Warning mimic the C++ lib/message.cc output with TIMESTAMP_NUMERIC:
-//
-//	20260511-170203-1234 12345 * SendTick        (client.go:85):     [Client 1] ...
-//
-// The timestamp keeps message.cc's 0-based month quirk so analyze-logs.py's
-// NUMERIC_TS parser (which does month+1) reads both C++ and Go logs the same
-// way. The trailing -1234 field is tenths of milliseconds.
-
 var logMu sync.Mutex
 var pid = os.Getpid()
 

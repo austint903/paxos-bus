@@ -2,14 +2,8 @@ package paxosbus
 
 import "testing"
 
-// ms is a millisecond expressed in the lines' nanosecond units.
 const ms = int64(1e6)
 
-// worked example from GLOBAL_LOG.md: c1 (k=2ms, b=0), c2 (k=3ms, b=1ms).
-//
-//	time(ms) 0     1     2     4        4        6     7
-//	msg      c1#1  c2#1  c1#2  c1#3     c2#2     c1#4  c2#3
-//	slot     0     1     2     3(id1)   4(id2)   5     6
 func workedLines() map[uint64]*clientLine {
 	return map[uint64]*clientLine{
 		1: {baseNs: 0, intervalNs: 2 * ms},
@@ -26,7 +20,7 @@ func TestComputeGlobalSlotWorkedExample(t *testing.T) {
 		{1, 1, 0},
 		{2, 1, 1},
 		{1, 2, 2},
-		{1, 3, 3}, // ties c2#2 at t=4, smaller clientId wins
+		{1, 3, 3},
 		{2, 2, 4},
 		{1, 4, 5},
 		{2, 3, 6},
@@ -38,8 +32,6 @@ func TestComputeGlobalSlotWorkedExample(t *testing.T) {
 	}
 }
 
-// TestCursorInvertsClosedForm checks the merge cursor (slot -> owner) is the
-// exact inverse of computeGlobalSlot (owner -> slot) over the worked example.
 func TestCursorInvertsClosedForm(t *testing.T) {
 	r := &Replica{
 		clients:     workedLines(),
@@ -60,7 +52,6 @@ func TestCursorInvertsClosedForm(t *testing.T) {
 			t.Errorf("slot %d owner = c%d#%d, want c%d#%d",
 				slot, m.clientId, m.reqId, w.clientId, w.reqId)
 		}
-		// round-trip: owner's closed-form slot must equal this slot.
 		if got := computeGlobalSlot(r.clients, m.clientId, m.reqId); got != uint64(slot) {
 			t.Errorf("round-trip: computeGlobalSlot(c%d#%d) = %d, want %d",
 				m.clientId, m.reqId, got, slot)
@@ -68,9 +59,6 @@ func TestCursorInvertsClosedForm(t *testing.T) {
 	}
 }
 
-// TestGlobalSlotBijection checks the mapping over a denser pair of lines is a
-// bijection onto 0..N-1 (no slot collisions, no gaps), which the global log and
-// nextExpected advance both rely on.
 func TestGlobalSlotBijection(t *testing.T) {
 	lines := map[uint64]*clientLine{
 		1: {baseNs: 0, intervalNs: 7 * ms},
@@ -89,10 +77,7 @@ func TestGlobalSlotBijection(t *testing.T) {
 			seen[slot] = string(rune('0'+cid)) + "#" + itoa(n)
 		}
 	}
-	// The lowest 3*perClient - maxInterval messages must form a contiguous prefix
-	// 0..k-1 (the tail is ragged because the three lines extend past each other).
-	// Check no gaps below the densest guaranteed-complete prefix.
-	complete := uint64(2 * perClient) // conservative contiguous prefix bound
+	complete := uint64(2 * perClient)
 	for s := uint64(0); s < complete; s++ {
 		if seen[s] == "" {
 			t.Fatalf("gap in slot space at %d (expected contiguous prefix)", s)

@@ -7,53 +7,34 @@ import (
 	fastrpc "github.com/imdea-software/swiftpaxos/rpc"
 )
 
-// Message type codes: one byte on the wire, followed by the marshaled body.
-// Same framing as the swiftpaxos RPC tables, so larger messages ride a TCP
-// stream instead of UDP datagrams.
 const (
 	MsgBusSync uint8 = iota + 1
 	MsgBusRequest
 	MsgBusReply
-	// Gap-agreement messages (inter-replica). They ride the same accept loop as
-	// client traffic; the type byte distinguishes a peer message from a client
-	// message. Every gap message carries SenderIdx so the receiver replies over
-	// its own outbound connection to that peer (peerWriters[SenderIdx]).
 	MsgBusGapRequest
 	MsgBusGapReply
 	MsgBusGapCommit
 	MsgBusGapCommitReply
 )
 
-// wireMsg is anything with a little-endian Marshal, so lockedWriter can send any
-// message type over a connection (see lockedWriter.sendMsg).
 type wireMsg interface {
 	Marshal(io.Writer)
 }
 
-// Phase 1: clock sync - sent once per client at startup.
 type BusSyncMessage struct {
 	ClientId     uint64
 	SendTimeNs   uint64
 	IntervalMs   uint64
-	StartDelayMs uint64 // ms from sync send until first request send
+	StartDelayMs uint64
 }
 
-// Phase 2: a client bus request. RequestId is the client-assigned bus message
-// number (monotonic, one per request). The replica's log slot is the GLOBAL
-// slot — RequestId's rank in the merged, predicted-arrival order across all
-// clients — not RequestId itself, which is why the reply carries both.
 type BusRequestMessage struct {
 	ClientId   uint64
 	RequestId  uint64
 	SendTimeNs uint64
-	Op         []byte // the operation to apply (placeholder until an exec layer)
+	Op         []byte
 }
 
-// Phase 2: a replica's reply to a BusRequest (sent back on the same connection
-// the request arrived on). RequestId echoes the request for matching; LogSlotNum
-// is the GLOBAL slot where the replica placed it (RequestId's rank in the merged
-// order, no longer == RequestId); Result is the operation's result (nil for now
-// — there is no execution layer yet).
 type BusReplyMessage struct {
 	ClientId   uint64
 	RequestId  uint64
@@ -156,21 +137,11 @@ func (m *BusReplyMessage) Unmarshal(wire io.Reader) error {
 	return nil
 }
 
-// Gap-agreement messages address the GLOBAL slot. The slot already determines
-// its owner (the (client, seq) that ranks there), and every replica derives that
-// owner deterministically from the agreed lines, so the wire only needs the
-// slot — no clientId is carried.
-
-// BusGapRequest asks a peer "do you have global slot Slot?". A follower sends it
-// to the leader; the leader also broadcasts it to all peers when it lacks the
-// slot itself.
 type BusGapRequest struct {
 	Slot      uint64
 	SenderIdx uint32
 }
 
-// BusGapReply answers a BusGapRequest. It is the ONLY carrier of recovered real
-// data (pull-based, point-to-point): Found + the op bytes, or Found=false.
 type BusGapReply struct {
 	Slot      uint64
 	SenderIdx uint32
@@ -178,15 +149,12 @@ type BusGapReply struct {
 	Op        []byte
 }
 
-// BusGapCommit is the leader's authoritative NoOp commit for a slot (Scenario 3
-// only; it never carries real data). Followers apply it unconditionally.
 type BusGapCommit struct {
 	Slot      uint64
 	SenderIdx uint32
 	ViewId    uint64
 }
 
-// BusGapCommitReply acks a BusGapCommit back to the leader.
 type BusGapCommitReply struct {
 	Slot      uint64
 	SenderIdx uint32

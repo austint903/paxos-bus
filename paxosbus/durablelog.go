@@ -10,71 +10,27 @@ import (
 	"sync"
 )
 
-// durableLog is a replica's single durable, append-only operation log — ONE
-// global log per replica, kept separate from the existing stderr summary/event
-// logs. Slot number == the message's GLOBAL slot (its rank in the merged,
-// predicted-arrival order across all clients), so every replica's log lines up
-// slot-for-slot and gap agreement can copy slot G verbatim from a peer. Each
-// record carries its (client, req_id) provenance, since one global log
-// interleaves every client's messages.
-//
-// The file is kept STRICTLY CONTIGUOUS in slot order. Because global slots
-// interleave across clients, records routinely arrive out of slot order; rather
-// than writing a later slot ahead of an earlier hole (which would leave the
-// recovered record dangling at end-of-file when gap agreement finishes much
-// later), the log reserves each missing slot's position with a fixed-width
-// PLACEHOLDER record and remembers its byte offset. When gap agreement resolves
-// that slot (recovered op or committed NoOp), the placeholder is overwritten in
-// place via WriteAt, so the record lands at its natural position between its
-// neighbours instead of being appended out of order.
-//
-// Appends only touch the in-memory bufio buffer; the buffer is pushed to disk
-// in batches by the replica's flush loop (see Replica.flushLoop), so the hot
-// path never blocks on I/O. At most one flush interval of appends is at risk on
-// a hard crash.
 type durableLog struct {
 	mu sync.Mutex
 	f  *os.File
 	w  *bufio.Writer
 
-	// tailOff is the byte offset of the next append. The file is opened WITHOUT
-	// O_APPEND (which on Linux forces every write to end-of-file and ignores
-	// WriteAt offsets), so we track the tail ourselves: bufio appends advance the
-	// OS file offset sequentially, and placeholder patches use WriteAt, which is
-	// positional and leaves the file offset at the tail.
-	tailOff int64
-	// nextSlot is the next slot expected to be written contiguously at the tail.
-	// Zero means "unset"; it is initialised to the first slot recorded.
+	tailOff  int64
 	nextSlot uint64
 	haveNext bool
-	// holes maps a reserved-but-unresolved slot to the byte offset of its
-	// fixed-width placeholder record, so a later resolution can patch it in place.
-	holes map[uint64]int64
+	holes    map[uint64]int64
 }
 
-// durableLogBufBytes sizes the append-batching buffer. The bufio writer flushes
-// to the OS on its own when full, so high message rates still batch to disk
-// between flush ticks instead of stalling on every append.
-const durableLogBufBytes = 1 << 16 // 64 KiB
+const durableLogBufBytes = 1 << 16
 
-// holeRecordWidth is the fixed byte width (including the trailing newline) of a
-// reserved gap placeholder and of the record that later overwrites it in place.
-// It must be at least as wide as the widest resolved record so the patched line
-// always fits inside the bytes the placeholder reserved. Records in this system
-// are tiny (a few bytes of op), so this is generously sized; gaps are rare, so
-// the padding cost is negligible.
 const holeRecordWidth = 256
 
-// openDurableLog opens (creating, or reopening) the replica's single durable
-// global log under dir, at <dir>/replica.log. The file is opened without
-// O_APPEND so placeholder records can be patched in place with WriteAt.
 func openDurableLog(dir string) (*durableLog, error) {
 	path := filepath.Join(dir, "replica.log")
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY, 0o644)
 	if err != nil {
 		return nil, err
 	}
-	// Resume writing at the current end of file (normally 0 for a fresh run dir).
 	off, err := f.Seek(0, io.SeekEnd)
 	if err != nil {
 		f.Close()
@@ -88,29 +44,18 @@ func openDurableLog(dir string) (*durableLog, error) {
 	}, nil
 }
 
-// recordBody renders the JSON body of one slot record (no newline, no padding).
-// slot is the GLOBAL slot; client/req_id are the owning message's provenance (a
-// recovered op keeps its origin, a NoOp fill sets noop=true and identifies the
-// missing message). The op bytes are stored hex-encoded so a peer can serve the
-// exact request during recovery and the record stays valid JSON for arbitrary
-// payloads.
 func recordBody(slot, clientId, reqId uint64, op []byte, noop bool) string {
 	return fmt.Sprintf(
 		"{\"slot\":%d,\"client\":%d,\"req_id\":%d,\"len\":%d,\"op\":\"%s\",\"noop\":%t}",
 		slot, clientId, reqId, len(op), hex.EncodeToString(op), noop)
 }
 
-// placeholderBody renders a reserved-but-unresolved slot. The pending flag marks
-// it so a reader (or a crash mid-gap) can tell the slot is awaiting resolution.
 func placeholderBody(slot uint64) string {
 	return fmt.Sprintf(
 		"{\"slot\":%d,\"req_id\":0,\"len\":0,\"op\":\"\",\"noop\":false,\"pending\":true}",
 		slot)
 }
 
-// padLine pads body to exactly holeRecordWidth bytes including the trailing
-// newline (spaces before the newline are valid JSON whitespace). Used for any
-// record that occupies a reservable, in-place-patchable position.
 func padLine(body string) []byte {
 	line := make([]byte, holeRecordWidth)
 	n := copy(line, body)
@@ -121,14 +66,6 @@ func padLine(body string) []byte {
 	return line
 }
 
-// record writes one slot's record while keeping the file strictly contiguous in
-// slot order:
-//   - slot == nextSlot: append the compact record at the tail and advance.
-//   - slot >  nextSlot: reserve a fixed-width placeholder for every intervening
-//     slot (remembering each offset), then append this slot, then advance.
-//   - slot <  nextSlot: this is a gap resolution; overwrite the slot's reserved
-//     placeholder in place (WriteAt). If there is no placeholder (already
-//     resolved or a duplicate), ignore it.
 func (cl *durableLog) record(slot, clientId, reqId uint64, op []byte, noop bool) {
 	cl.mu.Lock()
 	defer cl.mu.Unlock()
@@ -142,28 +79,20 @@ func (cl *durableLog) record(slot, clientId, reqId uint64, op []byte, noop bool)
 		return
 	}
 
-	// Reserve placeholders for any slots skipped between the tail and this one.
 	for s := cl.nextSlot; s < slot; s++ {
 		off := cl.tailOff
 		cl.writeAtTailLocked(padLine(placeholderBody(s)))
 		cl.holes[s] = off
 	}
-	// Append this slot compactly at the tail.
 	body := recordBody(slot, clientId, reqId, op, noop)
 	cl.writeAtTailLocked([]byte(body + "\n"))
 	cl.nextSlot = slot + 1
 }
 
-// patchHoleLocked overwrites a reserved placeholder with its resolved record.
-// The bufio buffer is flushed first so the (now stale) placeholder bytes are on
-// disk before WriteAt overwrites them — otherwise a later flush of the buffered
-// placeholder would clobber the patch. WriteAt is positional and does not move
-// the file offset, so subsequent appends continue at the tail. Callers hold
-// cl.mu.
 func (cl *durableLog) patchHoleLocked(slot, clientId, reqId uint64, op []byte, noop bool) {
 	off, ok := cl.holes[slot]
 	if !ok {
-		return // already resolved, or a duplicate fill
+		return
 	}
 	body := recordBody(slot, clientId, reqId, op, noop)
 	cl.w.Flush()
@@ -171,15 +100,11 @@ func (cl *durableLog) patchHoleLocked(slot, clientId, reqId uint64, op []byte, n
 	delete(cl.holes, slot)
 }
 
-// writeAtTailLocked appends bytes through the bufio buffer and advances the
-// tracked tail offset. Callers hold cl.mu.
 func (cl *durableLog) writeAtTailLocked(b []byte) {
 	cl.w.Write(b)
 	cl.tailOff += int64(len(b))
 }
 
-// flush pushes the buffer to the OS and fsyncs it to disk. The replica calls it
-// on a timer so appends are persisted in batches.
 func (cl *durableLog) flush() {
 	cl.mu.Lock()
 	cl.w.Flush()
@@ -187,7 +112,6 @@ func (cl *durableLog) flush() {
 	cl.mu.Unlock()
 }
 
-// close flushes and closes the file (best effort).
 func (cl *durableLog) close() {
 	cl.mu.Lock()
 	cl.w.Flush()

@@ -8,12 +8,6 @@ import (
 	"strings"
 )
 
-// Config mirrors the C++ specpaxos configuration file format:
-//
-//	f 1
-//	replica 172.29.0.10:7000
-//	replica 172.29.0.11:7000
-//	replica 172.29.0.12:7000
 type Config struct {
 	N        int
 	F        int
@@ -70,8 +64,6 @@ func ReadConfig(path string) (*Config, error) {
 	return c, nil
 }
 
-// QuorumSize is f+1: a majority that, combined with the leader-inclusion rule,
-// makes a commit durable across gap agreement.
 func (c *Config) QuorumSize() int {
 	return c.F + 1
 }
@@ -80,7 +72,6 @@ func (c *Config) LeaderIndex(viewId uint64) int {
 	return int(viewId % uint64(c.N))
 }
 
-// Port returns the port part of replica i's address (replicas bind 0.0.0.0).
 func (c *Config) Port(i int) string {
 	addr := c.Replicas[i]
 	return addr[strings.LastIndex(addr, ":")+1:]
