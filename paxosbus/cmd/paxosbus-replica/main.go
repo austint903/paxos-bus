@@ -12,7 +12,7 @@ func main() {
 	configPath := flag.String("c", "", "path to replica config file")
 	index := flag.Int("i", -1, "replica index")
 	label := flag.String("l", "", "location label shown in every log line, e.g. us-east1")
-	logDir := flag.String("d", "", "directory for durable per-client logs (empty = disabled)")
+	logDir := flag.String("d", "", "directory for the durable global log (replica.log; empty = disabled)")
 	dropMode := flag.String("drop-mode", "none",
 		"artificial drop scenario: none|leader|followers|all (gap-agreement testing)")
 	dropEvery := flag.Uint64("drop-every", 0,
