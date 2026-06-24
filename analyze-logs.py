@@ -14,6 +14,11 @@ wall clocks are only NTP-synced, so a merged ordering is approximate). This
 script writes <logdir>/merged.log — every line tagged with its source node,
 sorted by wall-clock timestamp where one is present — and prints RTT / gap /
 throughput statistics parsed from the client and replica measurement lines.
+
+Slot model: each replica keeps ONE global log, so the `slot=` field on REPLY /
+COMMITTED / gap lines is the global log slot (no longer == the per-client req id).
+Gap-agreement lines now report `slot=` (global); the legacy per-client `seq=`
+form is still accepted so older archived runs continue to parse.
 """
 
 import os
@@ -33,8 +38,10 @@ RE_REPLY     = re.compile(r"REPLY from replica=(\d+)\s+rtt=(\d+)us")
 RE_COMMITTED = re.compile(r"COMMITTED req=(\d+) slot=(\d+) rtt=(\d+)us total=(\d+)us attempts=(\d+)")
 RE_NOQUORUM  = re.compile(r"NO-QUORUM req=(\d+)")
 RE_SENT_1S   = re.compile(r"1s: sent=(\d+) committed=(\d+)")
-RE_DROP      = re.compile(r"DROP seq=(\d+)")
-RE_GAP       = re.compile(r"GAP detected seq=(\d+)")
+# Gap-agreement events are keyed on the global log slot now; accept the new
+# `slot=` form and the legacy per-client `seq=` form (older archived runs).
+RE_DROP      = re.compile(r"DROP (?:slot|seq)=(\d+)")
+RE_GAP       = re.compile(r"GAP detected (?:slot|seq)=(\d+)")
 RE_RECOVERED = re.compile(r"recovery_latency=(\d+)us")
 RE_NOOP      = re.compile(r"noop_latency=(\d+)us")
 RE_REPLICA   = re.compile(r"\[Replica (\d+)([^\]]*)\]")
