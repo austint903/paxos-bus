@@ -11,11 +11,24 @@ import (
 )
 
 // nowNs is a monotonic nanosecond clock (Go's time.Since uses the monotonic
-// reading, matching the C++ CLOCK_MONOTONIC usage).
+// reading, matching the C++ CLOCK_MONOTONIC usage). It is used for INTRA-process
+// durations only (gap-handler latency, client RTT) where a single process
+// compares two of its own readings.
 var startTime = time.Now()
 
 func nowNs() int64 {
 	return time.Since(startTime).Nanoseconds()
+}
+
+// wallNs is the SHARED clock for the schedule. Unlike nowNs (per-process
+// monotonic, with a different origin in every process), wall-clock nanoseconds
+// are comparable across processes: on one host they are literally the same
+// clock, and on a WAN they ride NTP/PTP (the slides' "Clock Synced among
+// Receivers"). The arrival lines (baseNs, expected arrival) and the
+// gap-detection deadline all live on this clock, so every replica computes the
+// same predicted arrival y for every message and therefore the same global slot.
+func wallNs() int64 {
+	return time.Now().UnixNano()
 }
 
 // slotState is the per-slot lifecycle used by gap agreement. The mutex
@@ -32,46 +45,100 @@ const (
 	slotNoOp
 )
 
-// slotEntry holds one client slot: its state and, for a received slot, the op
-// bytes (so a peer can serve the exact request during recovery).
-type slotEntry struct {
-	state slotState
-	op    []byte
-}
-
-// clientStream is the replica's per-client arrival model. Expected arrival of
-// seq N is base_recv_ns + (N-1)*interval_ns (the T = m*x + b line: m=interval,
-// b=base). base is provisionally anchored from the sync schedule, then pinned
-// ONCE through the first observed data arrival. The line stays fixed after
-// that, so delta measures cumulative drift from a stable baseline. (Valid
-// locally where there are no packet drops to break the seq->time mapping.)
+// clientLine is the replica's per-client AGREED arrival line, taken verbatim
+// from the sync message and never re-anchored. Expected arrival of seq N (the
+// T = k*x + b line) is baseNs + (N-1)*intervalNs, all on the shared wall clock:
 //
-// log is the queryable, back-fillable per-slot map gap agreement repairs;
-// nextExpected is the lowest slot not yet contiguously filled (received or
-// noop'd), so empty slots in [nextExpected, maxSeqSeen] are gap candidates.
-type clientStream struct {
-	baseRecvNs   int64
-	intervalNs   int64
-	anchored     bool
-	nextExpected uint64
-	maxSeqSeen   uint64
-	log          map[uint64]*slotEntry
+//	baseNs     = sync SendTimeNs + StartDelayMs  (b, shared clock)
+//	intervalNs = IntervalMs                      (k)
+//
+// Because both come straight from the sync message's bytes, every replica plugs
+// the same numbers into the same formula and computes the identical line — and
+// hence the identical global slot for every message — regardless of clock skew.
+// The line feeds the global slot formula (computeGlobalSlot) and the per-message
+// delta stat; the slot SPACE itself lives in the replica-wide global log below.
+type clientLine struct {
+	baseNs     int64
+	intervalNs int64
+	maxSeqSeen uint64
 }
 
-// slot returns the entry for seq n, creating an EMPTY one on first touch.
-func (s *clientStream) slot(n uint64) *slotEntry {
-	e := s.log[n]
-	if e == nil {
-		e = &slotEntry{state: slotEmpty}
-		s.log[n] = e
-	}
-	return e
+// expectedNs returns the predicted (shared-clock) arrival of this client's
+// seq n (1-based): y(n) = baseNs + (n-1)*intervalNs.
+func (cl *clientLine) expectedNs(n uint64) int64 {
+	return cl.baseNs + int64(n-1)*cl.intervalNs
 }
 
-// gapKey identifies an in-flight gap (one client slot).
-type gapKey struct {
+// globalEntry is one slot of the replica-wide global log. The slot is the
+// message's rank in the merged (predicted-arrival, clientId) order across ALL
+// clients — not the per-client request id. clientId/reqId are the provenance of
+// whichever message owns the slot, so a recovered/no-op'd slot can still be
+// written to the durable log with its origin.
+type globalEntry struct {
 	clientId uint64
-	slot     uint64
+	reqId    uint64
+	state    slotState
+	op       []byte
+}
+
+// slotMetaEntry is the OWNER of a global slot: which (client, seq) ranks there
+// and its predicted arrival. It is produced by the merge cursor (genCursorUpTo)
+// — the deterministic inverse of computeGlobalSlot — so gap detection can ask
+// "whose message should be at slot G, and when was it due?" without it having
+// arrived yet.
+type slotMetaEntry struct {
+	clientId   uint64
+	reqId      uint64
+	expectedNs int64
+}
+
+// computeGlobalSlot returns the global slot of (clientId, reqId): its rank when
+// every client's messages are merged and sorted by predicted arrival y, ties
+// broken by smaller clientId. It is closed-form and O(numClients) — no running
+// state, no coordination — so every replica computes the same answer from the
+// same lines. See GLOBAL_LOG.md for the derivation and worked example.
+func computeGlobalSlot(lines map[uint64]*clientLine, clientId, reqId uint64) uint64 {
+	self := lines[clientId]
+	if self == nil {
+		return reqId - 1
+	}
+	y := self.expectedNs(reqId)
+	slot := reqId - 1 // this client's own earlier messages all rank before (c, reqId)
+	for cid, line := range lines {
+		if cid == clientId {
+			continue
+		}
+		slot += countBefore(line, y, cid < clientId)
+	}
+	return slot
+}
+
+// countBefore counts how many of `line`'s messages rank before predicted time y.
+// A message n' contributes if y_line(n') < y; when tiePrecedes (the other
+// client's id is smaller), an exact tie y_line(n') == y also counts. Closed
+// form: with d = y - baseNs and k = intervalNs, the m = n'-1 >= 0 satisfying
+// m*k < d number floor((d-1)/k)+1 (for d>0), plus one more if d is an exact
+// multiple of k and ties precede.
+func countBefore(line *clientLine, y int64, tiePrecedes bool) uint64 {
+	d := y - line.baseNs
+	k := line.intervalNs
+	if k <= 0 {
+		return 0
+	}
+	var cnt uint64
+	if d > 0 {
+		cnt = uint64((d-1)/k) + 1
+	}
+	if tiePrecedes && d >= 0 && d%k == 0 {
+		cnt++
+	}
+	return cnt
+}
+
+// gapKey identifies an in-flight gap (one GLOBAL slot). The global slot already
+// encodes which client/seq it is, so the key needs nothing more.
+type gapKey struct {
+	slot uint64
 }
 
 // gapState coordinates one in-flight gap. Presence of a key in Replica.gaps is
@@ -81,7 +148,7 @@ type gapKey struct {
 //   - askers/probeReplies/commitAcks: the leader, while resolving.
 //   - doneCh: a follower, while waiting for the leader's resolution.
 type gapState struct {
-	start        int64               // gap-detection time, for latency logging
+	start        int64               // gap-detection time (monotonic), for latency logging
 	askers       map[uint32]struct{} // leader: followers awaiting recovered data
 	probeReplies chan *BusGapReply   // leader: replies to its probe broadcast
 	commitAcks   chan struct{}       // leader: NoOp-commit acks
@@ -171,20 +238,41 @@ type Replica struct {
 	self   string // log-line identity, e.g. "Replica 1 europe-north1"
 
 	mu      sync.Mutex
-	clients map[uint64]*clientStream
+	clients map[uint64]*clientLine
+
+	// The replica-wide global log: one ordered slot space holding every client's
+	// messages interleaved by predicted arrival. Keyed by global slot. Guarded by
+	// mu. nextExpected is the lowest globally-contiguous unfilled slot (so empty
+	// slots in [nextExpected, maxSlotSeen] are gap candidates); maxSlotSeen is the
+	// highest slot any received message has mapped to.
+	globalLog    map[uint64]*globalEntry
+	nextExpected uint64
+	maxSlotSeen  uint64
+	haveMax      bool
+
+	// Merge cursor: the deterministic inverse of computeGlobalSlot. It walks
+	// global slots in order, recording each slot's owner (which client/seq ranks
+	// there and when it is due), so gap detection can reason about a slot that has
+	// not arrived. cursorNextN[c] is the next seq of client c awaiting a slot;
+	// cursorSlot is the next slot to assign; slotMeta memoizes slot->owner.
+	// Guarded by mu.
+	cursorNextN map[uint64]uint64
+	cursorSlot  uint64
+	slotMeta    map[uint64]slotMetaEntry
 
 	// Persistent outbound connections to every other replica (index r.idx is
 	// nil). Gap handlers reply over peerWriters[SenderIdx]. Guarded by mu.
 	peerWriters []*lockedWriter
 
-	// In-flight gaps, keyed by (client, slot). Presence is the duplicate guard.
+	// In-flight gaps, keyed by global slot. Presence is the duplicate guard.
 	// Guarded by mu.
 	gaps map[gapKey]*gapState
 
-	// Durable per-client logs (slot == client seq). Separate from the stderr
-	// logs above; empty logDir disables them. Guarded by mu.
-	logDir     string
-	clientLogs map[uint64]*clientLog
+	// The replica's single durable global log (one file per replica, records
+	// carry slot+client+req_id). Separate from the stderr logs above; nil when
+	// logDir is empty. Guarded by mu for the open; the writer has its own lock.
+	logDir  string
+	durable *durableLog
 
 	// Artificial message dropping (gap-agreement testing). dropEvery==0 or
 	// dropMode==dropNone disables it; otherwise a slot is dropped when
@@ -213,11 +301,13 @@ func NewReplica(config *Config, idx int, label, logDir string, mode dropMode, ev
 		idx:         idx,
 		viewId:      0,
 		self:        self,
-		clients:     make(map[uint64]*clientStream),
+		clients:     make(map[uint64]*clientLine),
+		globalLog:   make(map[uint64]*globalEntry),
+		cursorNextN: make(map[uint64]uint64),
+		slotMeta:    make(map[uint64]slotMetaEntry),
 		peerWriters: make([]*lockedWriter, config.N),
 		gaps:        make(map[gapKey]*gapState),
 		logDir:      logDir,
-		clientLogs:  make(map[uint64]*clientLog),
 		dropMode:    mode,
 		dropEvery:   every,
 	}
@@ -225,8 +315,12 @@ func NewReplica(config *Config, idx int, label, logDir string, mode dropMode, ev
 		if err := os.MkdirAll(logDir, 0o755); err != nil {
 			Warning("[%s] cannot create durable log dir %s: %v", self, logDir, err)
 			r.logDir = ""
+		} else if dl, err := openDurableLog(logDir); err != nil {
+			Warning("[%s] cannot open durable global log in %s: %v", self, logDir, err)
+			r.logDir = ""
 		} else {
-			Notice("[%s] durable per-client logs in %s", self, logDir)
+			r.durable = dl
+			Notice("[%s] durable global log in %s/replica.log", self, logDir)
 		}
 	}
 	leader := "no"
@@ -294,7 +388,7 @@ func (r *Replica) Run() error {
 	go r.statsLoop()
 	go r.connectPeers()
 	go r.gapDetectLoop()
-	if r.logDir != "" {
+	if r.durable != nil {
 		go r.flushLoop()
 	}
 	for {
@@ -344,16 +438,17 @@ func (r *Replica) clientListener(conn net.Conn) {
 				Warning("[%s] bad bus request message: %v", r.self, err)
 				return
 			}
-			if !r.handleRequest(&reqMsg) {
+			slot, ok := r.handleRequest(&reqMsg)
+			if !ok {
 				continue
 			}
-			// LogSlotNum == RequestId until gap agreement makes them diverge.
-			// Result is nil: there is no execution layer, so the op is logged
-			// but not applied.
+			// LogSlotNum is the GLOBAL slot (the message's rank in the merged
+			// order), no longer == RequestId. Result is nil: there is no execution
+			// layer, so the op is logged but not applied.
 			reply = BusReplyMessage{
 				ClientId:   reqMsg.ClientId,
 				RequestId:  reqMsg.RequestId,
-				LogSlotNum: reqMsg.RequestId,
+				LogSlotNum: slot,
 				ViewId:     r.viewId,
 				ReplicaIdx: uint32(r.idx),
 				Result:     nil,
@@ -406,34 +501,44 @@ func (r *Replica) clientListener(conn net.Conn) {
 }
 
 func (r *Replica) handleSync(msg *BusSyncMessage) {
-	recvNs := nowNs()
 	r.mu.Lock()
-	// Anchor baseline to when the first data message is expected to arrive:
-	// base = sync_recv + start_delay, so expected(N) = base + (N-1)*interval.
-	// Provisional; re-anchored to observed arrivals in handleRequest.
-	r.clients[msg.ClientId] = &clientStream{
-		baseRecvNs:   recvNs + int64(msg.StartDelayMs)*1e6,
-		intervalNs:   int64(msg.IntervalMs) * 1e6,
-		anchored:     false,
-		nextExpected: 1,
-		maxSeqSeen:   0,
-		log:          make(map[uint64]*slotEntry),
+	// The agreed line comes straight from the sync message, on the shared wall
+	// clock: base = SendTimeNs + start_delay, k = interval. NOT re-anchored to a
+	// local arrival, so expected(N) = base + (N-1)*interval is identical on every
+	// replica and the global slot order is consistent across replicas.
+	r.clients[msg.ClientId] = &clientLine{
+		baseNs:     int64(msg.SendTimeNs) + int64(msg.StartDelayMs)*1e6,
+		intervalNs: int64(msg.IntervalMs) * 1e6,
 	}
+	// A (re)sync changes the client set, which shifts every slot's owner, so the
+	// merge cursor is rebuilt. In normal operation all syncs land in the 5 s
+	// before any data, so cursorSlot is still 0 and this is a no-op.
+	r.resetCursorLocked()
 	r.mu.Unlock()
 	Notice("[%s] sync from client %d: interval=%dms",
 		r.self, msg.ClientId, msg.IntervalMs)
 }
 
-// handleRequest updates the arrival model and stats; returns false if the
-// client never synced (no reply is sent then, as in the C++ implementation).
-func (r *Replica) handleRequest(msg *BusRequestMessage) bool {
-	actualNs := nowNs()
+// resetCursorLocked discards the merge cursor so it regenerates against the
+// current client set. Callers hold r.mu.
+func (r *Replica) resetCursorLocked() {
+	r.cursorSlot = 0
+	r.cursorNextN = make(map[uint64]uint64)
+	r.slotMeta = make(map[uint64]slotMetaEntry)
+}
+
+// handleRequest maps the request to its global slot, records it under the slot
+// state machine, and returns (globalSlot, true). Returns (_, false) if the
+// client never synced or the request was artificially dropped (no reply is sent
+// then, as in the C++ implementation).
+func (r *Replica) handleRequest(msg *BusRequestMessage) (uint64, bool) {
+	actualNs := wallNs()
 	r.mu.Lock()
-	s, ok := r.clients[msg.ClientId]
+	line, ok := r.clients[msg.ClientId]
 	if !ok {
 		r.mu.Unlock()
 		Warning("[%s] request from unsynced client %d, ignoring", r.self, msg.ClientId)
-		return false
+		return 0, false
 	}
 	// Artificial drop: simulate the request never arriving. Nothing is recorded
 	// and no reply is sent, so the slot stays EMPTY and the gap detector picks it
@@ -441,24 +546,16 @@ func (r *Replica) handleRequest(msg *BusRequestMessage) bool {
 	if r.shouldDropLocked(msg.RequestId) {
 		r.winDropped++
 		r.mu.Unlock()
-		return false
+		return 0, false
 	}
-	if msg.RequestId > s.maxSeqSeen {
-		s.maxSeqSeen = msg.RequestId
+	if msg.RequestId > line.maxSeqSeen {
+		line.maxSeqSeen = msg.RequestId
 	}
 
-	// Anchor once: pin b through the first observed arrival so expected(this
-	// req) == actual, then leave the line fixed. Subsequent deltas are measured
-	// against that fixed line, so they capture cumulative drift, not per-message
-	// jitter off a sliding anchor.
-	var deltaUs int64
-	if !s.anchored {
-		s.baseRecvNs = actualNs - int64(msg.RequestId-1)*s.intervalNs
-		s.anchored = true
-	} else {
-		expectedNs := s.baseRecvNs + int64(msg.RequestId-1)*s.intervalNs
-		deltaUs = (actualNs - expectedNs) / 1000
-	}
+	// Delta measures arrival drift off the fixed (un-re-anchored) line, both on
+	// the shared wall clock.
+	expectedNs := line.expectedNs(msg.RequestId)
+	deltaUs := (actualNs - expectedNs) / 1000
 	if r.winRecv == 0 {
 		r.winDeltaMinUs, r.winDeltaMaxUs = deltaUs, deltaUs
 	} else {
@@ -472,127 +569,171 @@ func (r *Replica) handleRequest(msg *BusRequestMessage) bool {
 	r.winDeltaSumUs += deltaUs
 	r.winRecv++
 
-	// Record the slot under the state machine. A late request bounces off a
-	// committed NoOp (NoOp is final) and a duplicate is ignored; only a fresh
-	// EMPTY->RECEIVED transition is durably logged. advanceNextExpected then
-	// walks past any contiguous slots a prior gap fill may have completed.
-	stored := r.recordReceivedLocked(msg.ClientId, msg.RequestId, msg.Op)
-	r.advanceNextExpectedLocked(msg.ClientId)
-	// Lazily open the durable log on the first request (the sync message itself
-	// is never logged — only client->replica operations get a slot).
-	cl := r.clientLogs[msg.ClientId]
-	if cl == nil && r.logDir != "" {
-		var err error
-		if cl, err = openClientLog(r.logDir, msg.ClientId); err != nil {
-			Warning("[%s] cannot open durable log for client %d: %v",
-				r.self, msg.ClientId, err)
-		} else {
-			r.clientLogs[msg.ClientId] = cl
-		}
-	}
+	// Map to the global slot and record it under the state machine. A late
+	// request bounces off a committed NoOp (NoOp is final) and a duplicate is
+	// ignored; only a fresh EMPTY->RECEIVED transition is durably logged.
+	// advanceNextExpected then walks past any contiguous slots a prior gap fill
+	// may have completed.
+	slot := computeGlobalSlot(r.clients, msg.ClientId, msg.RequestId)
+	stored := r.recordReceivedLocked(slot, msg.ClientId, msg.RequestId, msg.Op)
+	r.advanceNextExpectedLocked()
 	r.mu.Unlock()
 
-	// Durably record the op in this client's per-slot log (slot == req id). The
-	// append only buffers; flushLoop persists it in batches. clientLog has its
+	// Durably record the op in the global log at its slot. Global slots interleave
+	// across clients, so this slot may arrive out of order; durableLog.record
+	// reserves placeholders for skipped slots and patches them in place later. The
+	// append only buffers; flushLoop persists it in batches. durableLog has its
 	// own lock, so this stays outside r.mu.
-	if stored && cl != nil {
-		cl.record(msg.RequestId, msg.RequestId, msg.Op, false)
+	if stored && r.durable != nil {
+		r.durable.record(slot, msg.ClientId, msg.RequestId, msg.Op, false)
 	}
-	return true
+	return slot, true
+}
+
+// slotEntryLocked returns the global log entry for slot, creating an EMPTY one
+// on first touch. Callers hold r.mu.
+func (r *Replica) slotEntryLocked(slot uint64) *globalEntry {
+	e := r.globalLog[slot]
+	if e == nil {
+		e = &globalEntry{state: slotEmpty}
+		r.globalLog[slot] = e
+	}
+	return e
+}
+
+// observeSlotLocked raises maxSlotSeen to include slot. Callers hold r.mu.
+func (r *Replica) observeSlotLocked(slot uint64) {
+	if !r.haveMax || slot > r.maxSlotSeen {
+		r.maxSlotSeen = slot
+		r.haveMax = true
+	}
 }
 
 // recordReceivedLocked applies the data-path slot rule for real data: a
 // committed NOOP is final (drop), a RECEIVED slot is idempotent (ignore), and
-// an EMPTY slot is filled with the op. Returns true only on the EMPTY->RECEIVED
-// transition (i.e. when a durable append is warranted). Callers hold r.mu.
-func (r *Replica) recordReceivedLocked(clientId, slot uint64, op []byte) bool {
-	s := r.clients[clientId]
-	if s == nil {
-		return false
-	}
-	e := s.slot(slot)
-	if slot > s.maxSeqSeen {
-		s.maxSeqSeen = slot
-	}
+// an EMPTY slot is filled with the op and its provenance. Returns true only on
+// the EMPTY->RECEIVED transition (i.e. when a durable append is warranted).
+// Callers hold r.mu.
+func (r *Replica) recordReceivedLocked(slot, clientId, reqId uint64, op []byte) bool {
+	r.observeSlotLocked(slot)
+	e := r.slotEntryLocked(slot)
 	switch e.state {
 	case slotNoOp, slotReceived:
 		return false
 	default:
 		e.state = slotReceived
+		e.clientId = clientId
+		e.reqId = reqId
 		e.op = op
 		return true
 	}
 }
 
 // setNoOpLocked commits a NoOp at a slot, overwriting EMPTY or RECEIVED (the
-// leader has initiative once it broadcasts a commit). Returns true on a real
-// transition (so the change is logged once). Callers hold r.mu.
-func (r *Replica) setNoOpLocked(clientId, slot uint64) bool {
-	s := r.clients[clientId]
-	if s == nil {
-		return false
-	}
-	e := s.slot(slot)
-	if slot > s.maxSeqSeen {
-		s.maxSeqSeen = slot
-	}
+// leader has initiative once it broadcasts a commit). The owner provenance is
+// kept (from the cursor) so the durable record still identifies the missing
+// message. Returns true on a real transition (so the change is logged once).
+// Callers hold r.mu.
+func (r *Replica) setNoOpLocked(slot uint64) bool {
+	r.observeSlotLocked(slot)
+	e := r.slotEntryLocked(slot)
 	if e.state == slotNoOp {
 		return false
+	}
+	if e.clientId == 0 {
+		m := r.slotOwnerLocked(slot)
+		e.clientId, e.reqId = m.clientId, m.reqId
 	}
 	e.state = slotNoOp
 	e.op = nil
 	return true
 }
 
-// slotStateLocked reports a slot's state (EMPTY if the client/slot is unknown).
-// Callers hold r.mu.
-func (r *Replica) slotStateLocked(clientId, slot uint64) slotState {
-	s := r.clients[clientId]
-	if s == nil {
-		return slotEmpty
-	}
-	if e := s.log[slot]; e != nil {
+// slotStateLocked reports a slot's state (EMPTY if unknown). Callers hold r.mu.
+func (r *Replica) slotStateLocked(slot uint64) slotState {
+	if e := r.globalLog[slot]; e != nil {
 		return e.state
 	}
 	return slotEmpty
 }
 
+// slotOpLocked returns a slot's op bytes (nil if absent). Callers hold r.mu.
+func (r *Replica) slotOpLocked(slot uint64) []byte {
+	if e := r.globalLog[slot]; e != nil {
+		return e.op
+	}
+	return nil
+}
+
 // advanceNextExpectedLocked walks nextExpected past every contiguous filled
 // (received or noop'd) slot, so the detector's scan window starts at the first
 // real hole. Callers hold r.mu.
-func (r *Replica) advanceNextExpectedLocked(clientId uint64) {
-	s := r.clients[clientId]
-	if s == nil {
-		return
-	}
+func (r *Replica) advanceNextExpectedLocked() {
 	for {
-		e := s.log[s.nextExpected]
+		e := r.globalLog[r.nextExpected]
 		if e == nil || e.state == slotEmpty {
 			return
 		}
-		s.nextExpected++
+		r.nextExpected++
 	}
 }
 
+// genCursorUpToLocked extends the merge cursor so every slot in [0, target] has
+// a known owner. It is the forward inverse of computeGlobalSlot: at each step it
+// picks the client whose next un-assigned seq has the smallest predicted arrival
+// (ties broken by smaller clientId) and assigns it the next slot. Callers hold
+// r.mu.
+func (r *Replica) genCursorUpToLocked(target uint64) {
+	for r.cursorSlot <= target {
+		var (
+			bestCid uint64
+			bestN   uint64
+			bestY   int64
+			found   bool
+		)
+		for cid, line := range r.clients {
+			n := r.cursorNextN[cid]
+			if n == 0 {
+				n = 1
+			}
+			y := line.expectedNs(n)
+			if !found || y < bestY || (y == bestY && cid < bestCid) {
+				bestCid, bestN, bestY, found = cid, n, y, true
+			}
+		}
+		if !found {
+			return // no clients yet
+		}
+		r.slotMeta[r.cursorSlot] = slotMetaEntry{clientId: bestCid, reqId: bestN, expectedNs: bestY}
+		r.cursorNextN[bestCid] = bestN + 1
+		r.cursorSlot++
+	}
+}
+
+// slotOwnerLocked returns the owner (client, seq, expected arrival) of a global
+// slot, generating the merge cursor up to it as needed. Callers hold r.mu.
+func (r *Replica) slotOwnerLocked(slot uint64) slotMetaEntry {
+	r.genCursorUpToLocked(slot)
+	return r.slotMeta[slot]
+}
+
 // durableAppendLocked records a gap resolution (recovered op or NoOp) in the
-// client's durable log, lazily opening it. The slot was overtaken by later
-// arrivals, so clientLog.record patches the placeholder reserved at the slot's
-// in-order position instead of appending at the tail. Used only on the rare gap
-// path, so the buffered write under r.mu is acceptable. Callers hold r.mu.
-func (r *Replica) durableAppendLocked(clientId, slot, reqId uint64, op []byte, noop bool) {
-	if r.logDir == "" {
+// global durable log. The slot was overtaken by later arrivals, so
+// durableLog.record patches the placeholder reserved at the slot's in-order
+// position instead of appending at the tail. Provenance comes from the slot's
+// entry if known, else from the merge cursor. Callers hold r.mu.
+func (r *Replica) durableAppendLocked(slot uint64, op []byte, noop bool) {
+	if r.durable == nil {
 		return
 	}
-	cl := r.clientLogs[clientId]
-	if cl == nil {
-		var err error
-		if cl, err = openClientLog(r.logDir, clientId); err != nil {
-			Warning("[%s] cannot open durable log for client %d: %v", r.self, clientId, err)
-			return
-		}
-		r.clientLogs[clientId] = cl
+	var clientId, reqId uint64
+	if e := r.globalLog[slot]; e != nil && e.clientId != 0 {
+		clientId, reqId = e.clientId, e.reqId
+	} else {
+		m := r.slotOwnerLocked(slot)
+		clientId, reqId = m.clientId, m.reqId
 	}
-	cl.record(slot, reqId, op, noop)
+	r.durable.record(slot, clientId, reqId, op, noop)
 }
 
 func (r *Replica) statsLoop() {
@@ -621,21 +762,12 @@ func (r *Replica) statsLoop() {
 	}
 }
 
-// flushLoop batches durable-log writes to disk. Every tick it snapshots the set
-// of client logs under mu, then flushes each (the per-log lock serializes with
-// concurrent appends), so at most one tick of appends is at risk on a crash.
+// flushLoop batches durable-log writes to disk. The per-log lock serializes with
+// concurrent appends, so at most one tick of appends is at risk on a crash.
 func (r *Replica) flushLoop() {
 	ticker := time.NewTicker(100 * time.Millisecond)
 	for range ticker.C {
-		r.mu.Lock()
-		logs := make([]*clientLog, 0, len(r.clientLogs))
-		for _, cl := range r.clientLogs {
-			logs = append(logs, cl)
-		}
-		r.mu.Unlock()
-		for _, cl := range logs {
-			cl.flush()
-		}
+		r.durable.flush()
 	}
 }
 
@@ -702,42 +834,48 @@ func (r *Replica) broadcastToPeers(code uint8, msg wireMsg) {
 
 // ── Gap detection ────────────────────────────────────────────────────────────
 
-// gapDetectLoop scans every client's empty slots in [nextExpected, maxSeqSeen]
-// once a second. A slot still empty past expected(slot)+delta is declared a gap:
-// a gapState is registered (its presence guards against a duplicate handler) and
-// a handler is spawned on its own goroutine, so the client data path keeps
-// flowing while the gap is resolved.
+// gapDetectLoop scans the global log's empty slots in [nextExpected, maxSlotSeen]
+// once a second. The merge cursor names each slot's owner and its predicted
+// arrival; a slot still empty past expected+delta (on the shared clock) is
+// declared a gap: a gapState is registered (its presence guards against a
+// duplicate handler) and a handler is spawned on its own goroutine, so the
+// client data path keeps flowing while the gap is resolved.
 func (r *Replica) gapDetectLoop() {
+	type spawnInfo struct {
+		slot, clientId, reqId uint64
+	}
 	ticker := time.NewTicker(time.Second)
 	for range ticker.C {
-		now := nowNs()
-		var spawn []gapKey
+		wallNow := wallNs()
+		monoNow := nowNs()
+		var spawn []spawnInfo
 		r.mu.Lock()
-		for clientId, s := range r.clients {
-			if !s.anchored {
-				continue
-			}
-			for seq := s.nextExpected; seq <= s.maxSeqSeen; seq++ {
-				if e := s.log[seq]; e != nil && e.state != slotEmpty {
+		if r.haveMax && len(r.clients) > 0 {
+			r.genCursorUpToLocked(r.maxSlotSeen)
+			for slot := r.nextExpected; slot <= r.maxSlotSeen; slot++ {
+				if e := r.globalLog[slot]; e != nil && e.state != slotEmpty {
 					continue
 				}
-				deadline := s.baseRecvNs + int64(seq-1)*s.intervalNs + int64(gapDelta)
-				if now <= deadline {
+				meta, ok := r.slotMeta[slot]
+				if !ok {
 					continue
 				}
-				key := gapKey{clientId, seq}
+				if wallNow <= meta.expectedNs+int64(gapDelta) {
+					continue
+				}
+				key := gapKey{slot}
 				if _, busy := r.gaps[key]; busy {
 					continue
 				}
-				r.gaps[key] = newGapState(now)
+				r.gaps[key] = newGapState(monoNow)
 				r.winGaps++
-				spawn = append(spawn, key)
+				spawn = append(spawn, spawnInfo{slot, meta.clientId, meta.reqId})
 			}
 		}
 		r.mu.Unlock()
-		for _, key := range spawn {
-			Notice("[%s] GAP detected seq=%d client=%d", r.self, key.slot, key.clientId)
-			go r.handleGap(key.clientId, key.slot)
+		for _, s := range spawn {
+			Notice("[%s] GAP detected slot=%d client=%d req=%d", r.self, s.slot, s.clientId, s.reqId)
+			go r.handleGap(s.slot)
 		}
 	}
 }
@@ -747,8 +885,8 @@ func (r *Replica) gapDetectLoop() {
 // handleGap drives one gap to resolution on its own goroutine. The leader
 // coordinates (recover from a peer, else commit a NoOp); a follower asks the
 // leader and waits. Network waits never hold r.mu.
-func (r *Replica) handleGap(clientId, slot uint64) {
-	key := gapKey{clientId, slot}
+func (r *Replica) handleGap(slot uint64) {
+	key := gapKey{slot}
 	r.mu.Lock()
 	gs := r.gaps[key]
 	r.mu.Unlock()
@@ -756,38 +894,50 @@ func (r *Replica) handleGap(clientId, slot uint64) {
 		return
 	}
 	if r.AmLeader() {
-		r.leaderResolve(clientId, slot, gs)
+		r.leaderResolve(slot, gs)
 	} else {
-		r.followerRecover(clientId, slot, gs)
+		r.followerRecover(slot, gs)
 	}
+}
+
+// ownerLog formats a slot's owner provenance for a log line. Acquires r.mu.
+func (r *Replica) ownerLog(slot uint64) (uint64, uint64) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if e := r.globalLog[slot]; e != nil && e.clientId != 0 {
+		return e.clientId, e.reqId
+	}
+	m := r.slotOwnerLocked(slot)
+	return m.clientId, m.reqId
 }
 
 // followerRecover (Scenario 1) asks the leader for the slot and waits for the
 // resolution to land: either a BusGapReply with the real op (handleGapReply
 // fills the slot) or a BusGapCommit NoOp (handleGapCommit applies it). Both
 // signal doneCh. On timeout the detector will retry later.
-func (r *Replica) followerRecover(clientId, slot uint64, gs *gapState) {
+func (r *Replica) followerRecover(slot uint64, gs *gapState) {
 	leader := r.config.LeaderIndex(r.viewId)
 	r.sendToPeer(leader, MsgBusGapRequest,
-		&BusGapRequest{ClientId: clientId, Slot: slot, SenderIdx: uint32(r.idx)})
+		&BusGapRequest{Slot: slot, SenderIdx: uint32(r.idx)})
 
 	select {
 	case <-gs.doneCh:
 		lat := (nowNs() - gs.start) / 1000
 		r.mu.Lock()
-		st := r.slotStateLocked(clientId, slot)
-		delete(r.gaps, gapKey{clientId, slot})
+		st := r.slotStateLocked(slot)
+		delete(r.gaps, gapKey{slot})
 		r.mu.Unlock()
+		clientId, reqId := r.ownerLog(slot)
 		switch st {
 		case slotReceived:
-			Notice("[%s] recovery_latency=%dus client=%d seq=%d", r.self, lat, clientId, slot)
+			Notice("[%s] recovery_latency=%dus slot=%d client=%d req=%d", r.self, lat, slot, clientId, reqId)
 		case slotNoOp:
-			Notice("[%s] noop_latency=%dus client=%d seq=%d", r.self, lat, clientId, slot)
+			Notice("[%s] noop_latency=%dus slot=%d client=%d req=%d", r.self, lat, slot, clientId, reqId)
 		}
 	case <-time.After(gapProtocolTimeout):
-		Warning("[%s] gap recovery timed out client=%d seq=%d", r.self, clientId, slot)
+		Warning("[%s] gap recovery timed out slot=%d", r.self, slot)
 		r.mu.Lock()
-		delete(r.gaps, gapKey{clientId, slot})
+		delete(r.gaps, gapKey{slot})
 		r.mu.Unlock()
 	}
 }
@@ -795,18 +945,18 @@ func (r *Replica) followerRecover(clientId, slot uint64, gs *gapState) {
 // leaderResolve coordinates a gap from the leader. It first checks whether the
 // slot is already resolved, then probes peers for the real op (Scenario 2), and
 // finally commits a NoOp (Scenario 3) if nobody has it.
-func (r *Replica) leaderResolve(clientId, slot uint64, gs *gapState) {
-	key := gapKey{clientId, slot}
+func (r *Replica) leaderResolve(slot uint64, gs *gapState) {
+	key := gapKey{slot}
 
 	// Already resolved (data arrived, or a NoOp was already committed)?
 	r.mu.Lock()
-	if st := r.slotStateLocked(clientId, slot); st != slotEmpty {
-		op := r.slotOpLocked(clientId, slot)
+	if st := r.slotStateLocked(slot); st != slotEmpty {
+		op := r.slotOpLocked(slot)
 		askers := gs.snapshotAskers()
 		delete(r.gaps, key)
 		r.mu.Unlock()
 		if st == slotReceived {
-			r.answerAskers(clientId, slot, askers, op)
+			r.answerAskers(slot, askers, op)
 		}
 		return
 	}
@@ -814,7 +964,7 @@ func (r *Replica) leaderResolve(clientId, slot uint64, gs *gapState) {
 
 	// Scenario 2: probe all peers for the real op.
 	r.broadcastToPeers(MsgBusGapRequest,
-		&BusGapRequest{ClientId: clientId, Slot: slot, SenderIdx: uint32(r.idx)})
+		&BusGapRequest{Slot: slot, SenderIdx: uint32(r.idx)})
 	var recovered []byte
 	timeout := time.After(gapProtocolTimeout)
 probe:
@@ -832,19 +982,20 @@ probe:
 
 	if recovered != nil {
 		r.mu.Lock()
-		stored := r.recordReceivedLocked(clientId, slot, recovered)
+		m := r.slotOwnerLocked(slot)
+		stored := r.recordReceivedLocked(slot, m.clientId, m.reqId, recovered)
 		if stored {
-			r.durableAppendLocked(clientId, slot, slot, recovered, false)
+			r.durableAppendLocked(slot, recovered, false)
 			r.winRecovered++
 		}
-		r.advanceNextExpectedLocked(clientId)
-		op := r.slotOpLocked(clientId, slot)
+		r.advanceNextExpectedLocked()
+		op := r.slotOpLocked(slot)
 		askers := gs.snapshotAskers()
 		delete(r.gaps, key)
 		r.mu.Unlock()
-		r.answerAskers(clientId, slot, askers, op)
-		Notice("[%s] recovery_latency=%dus client=%d seq=%d",
-			r.self, (nowNs()-gs.start)/1000, clientId, slot)
+		r.answerAskers(slot, askers, op)
+		Notice("[%s] recovery_latency=%dus slot=%d client=%d req=%d",
+			r.self, (nowNs()-gs.start)/1000, slot, m.clientId, m.reqId)
 		return
 	}
 
@@ -852,24 +1003,24 @@ probe:
 	// EMPTY (commit-checks-empty); if the real request arrived during the probe,
 	// keep it and answer the askers with the real data instead.
 	r.mu.Lock()
-	if r.slotStateLocked(clientId, slot) == slotReceived {
-		op := r.slotOpLocked(clientId, slot)
+	if r.slotStateLocked(slot) == slotReceived {
+		op := r.slotOpLocked(slot)
 		askers := gs.snapshotAskers()
 		delete(r.gaps, key)
 		r.mu.Unlock()
-		r.answerAskers(clientId, slot, askers, op)
+		r.answerAskers(slot, askers, op)
 		return
 	}
-	if r.setNoOpLocked(clientId, slot) {
-		r.durableAppendLocked(clientId, slot, 0, nil, true)
+	if r.setNoOpLocked(slot) {
+		r.durableAppendLocked(slot, nil, true)
 		r.winNoops++
 	}
-	r.advanceNextExpectedLocked(clientId)
+	r.advanceNextExpectedLocked()
 	r.mu.Unlock()
 
 	// Broadcast the commit and wait for f+1 acks (counting this leader).
 	r.broadcastToPeers(MsgBusGapCommit,
-		&BusGapCommit{ClientId: clientId, Slot: slot, SenderIdx: uint32(r.idx), ViewId: r.viewId})
+		&BusGapCommit{Slot: slot, SenderIdx: uint32(r.idx), ViewId: r.viewId})
 	acks := 1
 	timeout = time.After(gapProtocolTimeout)
 collect:
@@ -878,36 +1029,25 @@ collect:
 		case <-gs.commitAcks:
 			acks++
 		case <-timeout:
-			Warning("[%s] noop commit got only %d/%d acks client=%d seq=%d",
-				r.self, acks, r.config.QuorumSize(), clientId, slot)
+			Warning("[%s] noop commit got only %d/%d acks slot=%d",
+				r.self, acks, r.config.QuorumSize(), slot)
 			break collect
 		}
 	}
+	clientId, reqId := r.ownerLog(slot)
 	r.mu.Lock()
 	delete(r.gaps, key)
 	r.mu.Unlock()
-	Notice("[%s] noop_latency=%dus client=%d seq=%d",
-		r.self, (nowNs()-gs.start)/1000, clientId, slot)
-}
-
-// slotOpLocked returns a slot's op bytes (nil if absent). Callers hold r.mu.
-func (r *Replica) slotOpLocked(clientId, slot uint64) []byte {
-	s := r.clients[clientId]
-	if s == nil {
-		return nil
-	}
-	if e := s.log[slot]; e != nil {
-		return e.op
-	}
-	return nil
+	Notice("[%s] noop_latency=%dus slot=%d client=%d req=%d",
+		r.self, (nowNs()-gs.start)/1000, slot, clientId, reqId)
 }
 
 // answerAskers sends the recovered op to every follower that asked the leader
 // for this slot (pull-based: only the askers, no rebroadcast).
-func (r *Replica) answerAskers(clientId, slot uint64, askers []uint32, op []byte) {
+func (r *Replica) answerAskers(slot uint64, askers []uint32, op []byte) {
 	for _, idx := range askers {
 		r.sendToPeer(int(idx), MsgBusGapReply,
-			&BusGapReply{ClientId: clientId, Slot: slot, SenderIdx: uint32(r.idx), Found: true, Op: op})
+			&BusGapReply{Slot: slot, SenderIdx: uint32(r.idx), Found: true, Op: op})
 	}
 }
 
@@ -917,14 +1057,14 @@ func (r *Replica) answerAskers(clientId, slot uint64, askers []uint32, op []byte
 // asker if the leader also lacks it. On a follower it is the leader's probe
 // (Scenario 2): reply Found with the op, or not-found.
 func (r *Replica) handleGapRequest(msg *BusGapRequest) {
-	clientId, slot := msg.ClientId, msg.Slot
+	slot := msg.Slot
 	r.mu.Lock()
-	st := r.slotStateLocked(clientId, slot)
-	op := r.slotOpLocked(clientId, slot)
+	st := r.slotStateLocked(slot)
+	op := r.slotOpLocked(slot)
 	r.mu.Unlock()
 
 	if !r.AmLeader() {
-		reply := &BusGapReply{ClientId: clientId, Slot: slot, SenderIdx: uint32(r.idx), Found: st == slotReceived}
+		reply := &BusGapReply{Slot: slot, SenderIdx: uint32(r.idx), Found: st == slotReceived}
 		if reply.Found {
 			reply.Op = op
 		}
@@ -935,21 +1075,21 @@ func (r *Replica) handleGapRequest(msg *BusGapRequest) {
 	switch st {
 	case slotReceived:
 		r.sendToPeer(int(msg.SenderIdx), MsgBusGapReply,
-			&BusGapReply{ClientId: clientId, Slot: slot, SenderIdx: uint32(r.idx), Found: true, Op: op})
+			&BusGapReply{Slot: slot, SenderIdx: uint32(r.idx), Found: true, Op: op})
 	case slotNoOp:
 		// Already NoOp'd: tell the asker to apply the NoOp directly.
 		r.sendToPeer(int(msg.SenderIdx), MsgBusGapCommit,
-			&BusGapCommit{ClientId: clientId, Slot: slot, SenderIdx: uint32(r.idx), ViewId: r.viewId})
+			&BusGapCommit{Slot: slot, SenderIdx: uint32(r.idx), ViewId: r.viewId})
 	default:
-		r.ensureLeaderResolve(clientId, slot, msg.SenderIdx)
+		r.ensureLeaderResolve(slot, msg.SenderIdx)
 	}
 }
 
 // ensureLeaderResolve starts leader resolution for a slot the leader is missing
 // (registering the asking follower), or just adds the asker if resolution is
 // already underway.
-func (r *Replica) ensureLeaderResolve(clientId, slot uint64, asker uint32) {
-	key := gapKey{clientId, slot}
+func (r *Replica) ensureLeaderResolve(slot uint64, asker uint32) {
+	key := gapKey{slot}
 	r.mu.Lock()
 	gs := r.gaps[key]
 	spawn := false
@@ -960,10 +1100,11 @@ func (r *Replica) ensureLeaderResolve(clientId, slot uint64, asker uint32) {
 		spawn = true
 	}
 	gs.askers[asker] = struct{}{}
+	m := r.slotOwnerLocked(slot)
 	r.mu.Unlock()
 	if spawn {
-		Notice("[%s] GAP detected seq=%d client=%d (peer request)", r.self, slot, clientId)
-		go r.handleGap(clientId, slot)
+		Notice("[%s] GAP detected slot=%d client=%d req=%d (peer request)", r.self, slot, m.clientId, m.reqId)
+		go r.handleGap(slot)
 	}
 }
 
@@ -972,7 +1113,7 @@ func (r *Replica) ensureLeaderResolve(clientId, slot uint64, asker uint32) {
 // leader's answer to its own request: fill the slot with the recovered op and
 // signal the waiter.
 func (r *Replica) handleGapReply(msg *BusGapReply) {
-	key := gapKey{msg.ClientId, msg.Slot}
+	key := gapKey{msg.Slot}
 	r.mu.Lock()
 	gs := r.gaps[key]
 	r.mu.Unlock()
@@ -988,11 +1129,12 @@ func (r *Replica) handleGapReply(msg *BusGapReply) {
 	}
 	if msg.Found {
 		r.mu.Lock()
-		if r.recordReceivedLocked(msg.ClientId, msg.Slot, msg.Op) {
-			r.durableAppendLocked(msg.ClientId, msg.Slot, msg.Slot, msg.Op, false)
+		m := r.slotOwnerLocked(msg.Slot)
+		if r.recordReceivedLocked(msg.Slot, m.clientId, m.reqId, msg.Op) {
+			r.durableAppendLocked(msg.Slot, msg.Op, false)
 			r.winRecovered++
 		}
-		r.advanceNextExpectedLocked(msg.ClientId)
+		r.advanceNextExpectedLocked()
 		r.mu.Unlock()
 		select {
 		case gs.doneCh <- struct{}{}:
@@ -1004,13 +1146,13 @@ func (r *Replica) handleGapReply(msg *BusGapReply) {
 // handleGapCommit applies the leader's authoritative NoOp (overwriting EMPTY or
 // RECEIVED — the leader has initiative), acks it, and signals any waiter.
 func (r *Replica) handleGapCommit(msg *BusGapCommit) {
-	key := gapKey{msg.ClientId, msg.Slot}
+	key := gapKey{msg.Slot}
 	r.mu.Lock()
-	if r.setNoOpLocked(msg.ClientId, msg.Slot) {
-		r.durableAppendLocked(msg.ClientId, msg.Slot, 0, nil, true)
+	if r.setNoOpLocked(msg.Slot) {
+		r.durableAppendLocked(msg.Slot, nil, true)
 		r.winNoops++
 	}
-	r.advanceNextExpectedLocked(msg.ClientId)
+	r.advanceNextExpectedLocked()
 	gs := r.gaps[key]
 	r.mu.Unlock()
 	if gs != nil {
@@ -1020,14 +1162,14 @@ func (r *Replica) handleGapCommit(msg *BusGapCommit) {
 		}
 	}
 	r.sendToPeer(int(msg.SenderIdx), MsgBusGapCommitReply,
-		&BusGapCommitReply{ClientId: msg.ClientId, Slot: msg.Slot, SenderIdx: uint32(r.idx)})
+		&BusGapCommitReply{Slot: msg.Slot, SenderIdx: uint32(r.idx)})
 }
 
 // handleGapCommitReply forwards a follower's NoOp-commit ack to the waiting
 // leader resolver.
 func (r *Replica) handleGapCommitReply(msg *BusGapCommitReply) {
 	r.mu.Lock()
-	gs := r.gaps[gapKey{msg.ClientId, msg.Slot}]
+	gs := r.gaps[gapKey{msg.Slot}]
 	r.mu.Unlock()
 	if gs == nil {
 		return
