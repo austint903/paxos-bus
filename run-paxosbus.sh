@@ -120,9 +120,10 @@ mkdir -p "$RUN_LOG_DIR"
 } > "$RUN_LOG_DIR/run-meta.txt"
 echo "Logs: $RUN_LOG_DIR"
 
-# ── Durable per-client logs (separate from the stderr archive above) ─────────
-# One subdir per replica; each replica writes <client-id>.log slot records into
-# its mounted /durable. Bind-mounted so the files survive the container.
+# ── Durable global log (separate from the stderr archive above) ──────────────
+# One subdir per replica; each replica writes a single global replica.log of
+# slot records into its mounted /durable. Bind-mounted so the files survive the
+# container.
 DURABLE_DIR="$SCRIPT_DIR/paxosbus/logs/durable/local/$(basename "$RUN_LOG_DIR")"
 echo "Durable logs: $DURABLE_DIR"
 echo ""
