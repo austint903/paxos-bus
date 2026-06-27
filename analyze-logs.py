@@ -35,8 +35,18 @@ NUMERIC_TS = re.compile(r"^(\d{4})(\d{2})(\d{2})-(\d{2})(\d{2})(\d{2})-(\d{4}) \
 
 RE_CLIENT    = re.compile(r"\[Client (\d+)([^\]]*)\]")
 RE_REPLY     = re.compile(r"REPLY from replica=(\d+)\s+rtt=(\d+)us")
+# Request-generator (-r) REPLY line also carries the bus slot the request rode.
+# Counting distinct bus_slot values gives the number of buses that actually
+# carried a (committed-or-not) passenger, i.e. the layer-1 throughput, while the
+# committed-request count is the layer-2 throughput. The ratio of the two is the
+# headline "~1000 requests per bus" batching factor.
+RE_REPLY_BUS = re.compile(r"req=\d+\s+bus_slot=(\d+)\s+log_index=\d+")
 RE_COMMITTED = re.compile(r"COMMITTED req=(\d+) slot=(\d+) rtt=(\d+)us total=(\d+)us attempts=(\d+)")
+# Request-generator (-r) COMMITTED line is keyed on log_index, not the bus slot,
+# and has no attempts field (retry granularity is the bus, not the request).
+RE_COMMITTED_R = re.compile(r"COMMITTED req=(\d+) log_index=(\d+) rtt=(\d+)us total=(\d+)us")
 RE_NOQUORUM  = re.compile(r"NO-QUORUM req=(\d+)")
+RE_BUSTIMEOUT = re.compile(r"BUS-TIMEOUT bus=(\d+) reboarding=(\d+)")
 RE_SENT_1S   = re.compile(r"1s: sent=(\d+) committed=(\d+)")
 # Gap-agreement events are keyed on the global log slot now; accept the new
 # `slot=` form and the legacy per-client `seq=` form (older archived runs).
@@ -105,6 +115,7 @@ def main():
 
     merged = []          # (ts, node, text)
     replies = {}         # client -> replica -> [rtt_us]
+    buses = {}           # client -> set of distinct bus slots seen (-r only)
     quorum = {}          # client -> [rtt_us]
     commit_span = {}     # client -> [first_committed_ts, last_committed_ts]
     # Throughput window is anchored to the SEND phase, not to commit timestamps:
@@ -122,6 +133,7 @@ def main():
     send_fail = {}       # client -> ts of first failed send (≈ last successful send)
     totals = {}          # client -> [total_us] for requests with attempts > 1
     attempts = {}        # client -> count of NO-QUORUM resends
+    reboards = {}        # client -> count of requests re-boarded by bus timeouts (-r)
     sent_per_s = {}      # client -> [sent in each 1s window]
     drops = {}           # replica -> count
     gaps = {}            # replica -> count
@@ -151,6 +163,9 @@ def main():
                     if m:
                         replies.setdefault(cid, {}).setdefault(
                             int(m.group(1)), []).append(int(m.group(2)))
+                        bm = RE_REPLY_BUS.search(text)
+                        if bm:  # -r mode: track which buses carried passengers
+                            buses.setdefault(cid, set()).add(int(bm.group(1)))
                         continue
                     m = RE_COMMITTED.search(text)
                     if m:
@@ -167,13 +182,31 @@ def main():
                         if ts > span[1]:
                             span[1] = ts
                         continue
+                    m = RE_COMMITTED_R.search(text)
+                    if m:
+                        rtt, total = int(m.group(3)), int(m.group(4))
+                        quorum.setdefault(cid, []).append(rtt)
+                        if total > rtt:  # took more than one bus → re-boarded
+                            totals.setdefault(cid, []).append(total)
+                        span = commit_span.setdefault(cid, [ts, ts])
+                        if ts < span[0]:
+                            span[0] = ts
+                        if ts > span[1]:
+                            span[1] = ts
+                        continue
                     if RE_NOQUORUM.search(text):
                         attempts[cid] = attempts.get(cid, 0) + 1
                         continue
-                    if "starting open-loop data phase" in text:
+                    m = RE_BUSTIMEOUT.search(text)
+                    if m:
+                        reboards[cid] = reboards.get(cid, 0) + int(m.group(2))
+                        continue
+                    if ("starting open-loop data phase" in text or
+                            "starting request-gen data phase" in text):
                         send_start.setdefault(cid, ts)
                         continue
-                    if "send to replica" in text and "failed" in text:
+                    if (("send to replica" in text or "send bus to replica" in text)
+                            and "failed" in text):
                         send_fail.setdefault(cid, ts)  # first failure = last good send
                         continue
                     m = RE_SENT_1S.search(text)
@@ -222,19 +255,33 @@ def main():
         rates = sent_per_s.get(cid, [])
         rate_txt = (f"  send rate avg={sum(rates) // len(rates)}/s"
                     f" max={max(rates)}/s" if rates else "")
-        print(f"    committed={n_commits}  resends={n_resends}{rate_txt}")
+        reboard_txt = f"  reboarded={reboards[cid]}" if cid in reboards else ""
+        print(f"    committed={n_commits}  resends={n_resends}{reboard_txt}{rate_txt}")
         start = send_start.get(cid)
         end = send_fail.get(cid, send_end.get(cid))  # last good send, else last commit
+        # Fallback: under heavy -r load the bus goroutine can stall before it ever
+        # emits a "1s:" line (or a failed send), so send_start/send_end are absent.
+        # Use the commit span (first->last committed reply) so req/bus throughput
+        # still reports — it's the real elapsed time over which commits landed.
+        end_label = "last successful send" if cid in send_fail else "last live commit"
+        span = commit_span.get(cid)
+        if (start is None or end is None) and span and span[1] > span[0]:
+            start, end = span
+            end_label = "last committed (commit-span fallback)"
+        n_buses = len(buses.get(cid, ()))
         if start is not None and end is not None and end > start:
             elapsed = end - start
             t0 = datetime.fromtimestamp(start, timezone.utc).strftime("%H:%M:%S.%f")[:-3]
             t1 = datetime.fromtimestamp(end, timezone.utc).strftime("%H:%M:%S.%f")[:-3]
-            end_label = ("last successful send" if cid in send_fail
-                         else "last live commit")
             print(f"    send window    {t0} -> {t1} UTC  ({elapsed:.2f}s, "
                   f"data-phase start to {end_label})")
-            print(f"    throughput={n_commits / elapsed:.1f} req/s "
+            print(f"    req throughput ={n_commits / elapsed:.1f} req/s "
                   f"(committed/send_window = {n_commits}/{elapsed:.2f}s)")
+            if n_buses:  # -r mode: also report the layer-1 (bus) throughput
+                print(f"    bus throughput ={n_buses / elapsed:.1f} bus/s "
+                      f"(distinct_buses/send_window = {n_buses}/{elapsed:.2f}s)")
+                print(f"    batching       ={n_commits / n_buses:.1f} committed reqs/bus "
+                      f"({n_commits}/{n_buses})")
         print()
 
     if drops or gaps or recoveries or noops:
