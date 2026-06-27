@@ -25,6 +25,8 @@ INTERVAL_MS="${INTERVAL_MS:-1}"
 DURATION_S="${DURATION_S:-60}"
 DROP_MODE="${DROP_MODE:-none}"   # artificial drop scenario: none|leader|followers|all
 DROP_EVERY="${DROP_EVERY:-0}"    # drop a slot when reqId % DROP_EVERY == 0 (0 = disabled)
+REQUEST_GEN="${REQUEST_GEN:-0}"      # 1 = request-generator mode (= local -r)
+GEN_INTERVAL_US="${GEN_INTERVAL_US:-1}"  # request generation interval in µs (= local -g; REQUEST_GEN only)
 
 CONTROLLER_VM="pb-controller"
 CONTROLLER_ZONE="us-east1-c"
@@ -86,6 +88,7 @@ cat > "$ORCH" <<'ORCH_EOF'
 set -euo pipefail
 
 : "${REPO_URL:?}" "${INTERVAL_MS:?}" "${DURATION_S:?}" "${DROP_MODE:?}" "${DROP_EVERY:?}"
+: "${REQUEST_GEN:?}" "${GEN_INTERVAL_US:?}"
 : "${REPLICA0_VM:?}" "${REPLICA0_ZONE:?}" "${REPLICA0_IP:?}"
 : "${REPLICA1_VM:?}" "${REPLICA1_ZONE:?}" "${REPLICA1_IP:?}"
 : "${REPLICA2_VM:?}" "${REPLICA2_ZONE:?}" "${REPLICA2_IP:?}"
@@ -179,12 +182,16 @@ sleep 3
 
 echo "[ctrl] Launch 2 clients on $CLIENT_VM (asia) — pinging replicas"
 CLIENT_REGION="${CLIENT_ZONE%-*}"   # asia-east1-c -> asia-east1
+CLIENT_EXTRA=""
+if [[ "$REQUEST_GEN" == "1" ]]; then
+  CLIENT_EXTRA="-r -g $GEN_INTERVAL_US"
+fi
 for id in 1 2; do
   ssh_to "$CLIENT_VM" "$CLIENT_ZONE" "
     rm -f /tmp/paxosbus-client-$id.log
     cd \$HOME/paxosbus
     nohup ./paxosbus-client \
-      -c paxosbus.conf -I $id -p $INTERVAL_MS -l $CLIENT_REGION \
+      -c paxosbus.conf -I $id -p $INTERVAL_MS -l $CLIENT_REGION $CLIENT_EXTRA \
       </dev/null >/tmp/paxosbus-client-$id.log 2>&1 &
     disown
     sleep 1
@@ -278,6 +285,8 @@ gcloud compute ssh "$CONTROLLER_VM" --zone="$CONTROLLER_ZONE" --quiet -- "
   DURATION_S='$DURATION_S' \
   DROP_MODE='$DROP_MODE' \
   DROP_EVERY='$DROP_EVERY' \
+  REQUEST_GEN='$REQUEST_GEN' \
+  GEN_INTERVAL_US='$GEN_INTERVAL_US' \
   REPLICA0_VM='$REPLICA0_VM' REPLICA0_ZONE='$REPLICA0_ZONE' REPLICA0_IP='$REPLICA0_IP' \
   REPLICA1_VM='$REPLICA1_VM' REPLICA1_ZONE='$REPLICA1_ZONE' REPLICA1_IP='$REPLICA1_IP' \
   REPLICA2_VM='$REPLICA2_VM' REPLICA2_ZONE='$REPLICA2_ZONE' REPLICA2_IP='$REPLICA2_IP' \
@@ -299,6 +308,8 @@ gcloud compute scp --zone="$CONTROLLER_ZONE" --quiet --recurse \
   echo "duration_s=$DURATION_S"
   echo "drop_mode=$DROP_MODE"
   echo "drop_every=$DROP_EVERY"
+  echo "request_gen=$REQUEST_GEN"
+  echo "gen_interval_us=$GEN_INTERVAL_US"
   if [[ "$DROP_MODE" != "none" && "$DROP_EVERY" -gt 0 ]]; then
     echo "mode=drop-$DROP_MODE"
   else
