@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 )
 
@@ -50,6 +51,20 @@ func recordBody(slot, clientId, reqId uint64, op []byte, noop bool) string {
 		slot, clientId, reqId, len(op), hex.EncodeToString(op), noop)
 }
 
+func busRecordBody(slot, clientId, busSeq uint64, reqs []RequestMessage, noop bool) string {
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "{\"slot\":%d,\"client\":%d,\"bus\":%d,\"reqs\":[", slot, clientId, busSeq)
+	for i := range reqs {
+		if i > 0 {
+			sb.WriteByte(',')
+		}
+		fmt.Fprintf(&sb, "{\"c\":%d,\"r\":%d,\"len\":%d,\"op\":\"%s\"}",
+			reqs[i].ClientId, reqs[i].RequestId, len(reqs[i].Op), hex.EncodeToString(reqs[i].Op))
+	}
+	fmt.Fprintf(&sb, "],\"noop\":%t}", noop)
+	return sb.String()
+}
+
 func placeholderBody(slot uint64) string {
 	return fmt.Sprintf(
 		"{\"slot\":%d,\"req_id\":0,\"len\":0,\"op\":\"\",\"noop\":false,\"pending\":true}",
@@ -69,13 +84,22 @@ func padLine(body string) []byte {
 func (cl *durableLog) record(slot, clientId, reqId uint64, op []byte, noop bool) {
 	cl.mu.Lock()
 	defer cl.mu.Unlock()
+	cl.recordBodyLocked(slot, recordBody(slot, clientId, reqId, op, noop))
+}
 
+func (cl *durableLog) recordBus(slot, clientId, busSeq uint64, reqs []RequestMessage, noop bool) {
+	cl.mu.Lock()
+	defer cl.mu.Unlock()
+	cl.recordBodyLocked(slot, busRecordBody(slot, clientId, busSeq, reqs, noop))
+}
+
+func (cl *durableLog) recordBodyLocked(slot uint64, body string) {
 	if !cl.haveNext {
 		cl.nextSlot, cl.haveNext = slot, true
 	}
 
 	if slot < cl.nextSlot {
-		cl.patchHoleLocked(slot, clientId, reqId, op, noop)
+		cl.patchHoleLocked(slot, body)
 		return
 	}
 
@@ -84,17 +108,15 @@ func (cl *durableLog) record(slot, clientId, reqId uint64, op []byte, noop bool)
 		cl.writeAtTailLocked(padLine(placeholderBody(s)))
 		cl.holes[s] = off
 	}
-	body := recordBody(slot, clientId, reqId, op, noop)
 	cl.writeAtTailLocked([]byte(body + "\n"))
 	cl.nextSlot = slot + 1
 }
 
-func (cl *durableLog) patchHoleLocked(slot, clientId, reqId uint64, op []byte, noop bool) {
+func (cl *durableLog) patchHoleLocked(slot uint64, body string) {
 	off, ok := cl.holes[slot]
 	if !ok {
 		return
 	}
-	body := recordBody(slot, clientId, reqId, op, noop)
 	cl.w.Flush()
 	cl.f.WriteAt(padLine(body), off)
 	delete(cl.holes, slot)
