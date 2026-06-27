@@ -5,32 +5,38 @@ set -euo pipefail
 # Mirrors prevImplementation/run-paxosbus.sh minus the gap-agreement knobs.
 
 # ── Message rate and topology ───────────────────────────────────────────────
-MSG_INTERVAL_MS=1      # change this: 1000=1s  100=100ms  10=10ms  2=2ms  1=1ms
+MSG_INTERVAL_MS=1      # change this: 1000=1s  100=100ms  10=10ms  2=2ms  1=1ms (bus interval under -r)
 NUM_REPLICAS=3
 NUM_CLIENTS=2
-RESEND_MS=0            # client resend-on-no-quorum timeout (ms); 0 = disabled
+RESEND_MS=0            # client resend-on-no-quorum timeout (ms); 0 = disabled (bus timeout under -r)
 DURATION_S="${DURATION_S:-60}"  # seconds of data phase, then auto-stop; 0 = run until Ctrl+C
 SYNC_WARMUP_S=5        # client sync wait before data starts (matches syncStartDelayMs=5000)
 DROP_MODE=none         # artificial drop scenario: none|leader|followers|all
 DROP_EVERY=0           # drop a slot when reqId % DROP_EVERY == 0 (0 = disabled)
+REQUEST_GEN=0          # 1 = request-generator mode (-r): batch requests onto buses
+GEN_INTERVAL_US=1      # request generation interval in µs (-r only; -g 1 -p 1 ≈ 1000 reqs/bus)
 # ────────────────────────────────────────────────────────────────────────────
 
 FORCE_BUILD=0
 
 usage() {
-    echo "Usage: $0 [-b] [-p <interval_ms>] [-t <resend_ms>] [-d <seconds>] [-D <drop_mode>] [-F <drop_every>]"
+    echo "Usage: $0 [-b] [-r] [-g <gen_us>] [-p <interval_ms>] [-t <resend_ms>] [-d <seconds>] [-D <drop_mode>] [-F <drop_every>]"
     echo "  -b            force rebuild of Docker image"
-    echo "  -p <ms>       message interval in ms (default: $MSG_INTERVAL_MS)"
-    echo "  -t <ms>       client resend-on-no-quorum timeout (default: $RESEND_MS, 0=off)"
+    echo "  -r            request-generator mode: batch requests onto buses (two-layer log)"
+    echo "  -g <us>       request generation interval in µs (-r only; default: $GEN_INTERVAL_US)"
+    echo "  -p <ms>       message interval in ms (bus interval under -r) (default: $MSG_INTERVAL_MS)"
+    echo "  -t <ms>       client resend/bus timeout (default: $RESEND_MS, 0=off)"
     echo "  -d <seconds>  auto-stop after this many seconds of data phase (default: run until Ctrl+C)"
     echo "  -D <mode>     artificial drop scenario: none|leader|followers|all (default: $DROP_MODE)"
     echo "  -F <n>        drop a slot when reqId % n == 0 (default: $DROP_EVERY, 0=off)"
     exit 1
 }
 
-while getopts "bp:t:d:D:F:h" opt; do
+while getopts "brg:p:t:d:D:F:h" opt; do
     case $opt in
         b) FORCE_BUILD=1 ;;
+        r) REQUEST_GEN=1 ;;
+        g) GEN_INTERVAL_US=$OPTARG ;;
         p) MSG_INTERVAL_MS=$OPTARG ;;
         t) RESEND_MS=$OPTARG ;;
         d) DURATION_S=$OPTARG ;;
@@ -102,6 +108,11 @@ if [[ "$DROP_MODE" != "none" && "$DROP_EVERY" -gt 0 ]]; then
 else
     echo "Mode: NORMAL (no artificial drops)"
 fi
+if [[ $REQUEST_GEN -eq 1 ]]; then
+    echo "Path: REQUEST-GEN (-r, gen=${GEN_INTERVAL_US}us, bus=${MSG_INTERVAL_MS}ms)"
+else
+    echo "Path: DEFAULT (one request per bus)"
+fi
 echo ""
 
 # ── Per-run log directory (durable copy of every node's stream) ──────────────
@@ -117,6 +128,8 @@ mkdir -p "$RUN_LOG_DIR"
     echo "resend_ms=$RESEND_MS"
     echo "drop_mode=$DROP_MODE"
     echo "drop_every=$DROP_EVERY"
+    echo "request_gen=$REQUEST_GEN"
+    echo "gen_interval_us=$GEN_INTERVAL_US"
 } > "$RUN_LOG_DIR/run-meta.txt"
 echo "Logs: $RUN_LOG_DIR"
 
@@ -156,7 +169,10 @@ sleep 2
 # ── Clients ───────────────────────────────────────────────────────────────────
 CLIENT_FLAGS=()
 if [[ $RESEND_MS -gt 0 ]]; then
-    CLIENT_FLAGS=(-t "$RESEND_MS")
+    CLIENT_FLAGS+=(-t "$RESEND_MS")
+fi
+if [[ $REQUEST_GEN -eq 1 ]]; then
+    CLIENT_FLAGS+=(-r -g "$GEN_INTERVAL_US")
 fi
 for i in $(seq 1 $NUM_CLIENTS); do
     NAME="paxosbus-client-$i"
