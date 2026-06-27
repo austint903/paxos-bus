@@ -43,6 +43,27 @@ type globalEntry struct {
 	reqId    uint64
 	state    slotState
 	op       []byte
+	requests []RequestMessage
+	isBus    bool
+}
+
+type reqKey struct {
+	clientId  uint64
+	requestId uint64
+}
+
+type logEntry struct {
+	clientId  uint64
+	requestId uint64
+	op        []byte
+}
+
+type pendingReply struct {
+	clientId  uint64
+	requestId uint64
+	busSlot   uint64
+	logIndex  uint64
+	viewId    uint64
 }
 
 type slotMetaEntry struct {
@@ -169,6 +190,14 @@ type Replica struct {
 	maxSlotSeen  uint64
 	haveMax      bool
 
+	logList []logEntry
+	dedup   map[reqKey]uint64
+	busMode bool
+
+	cwMu          sync.Mutex
+	clientWriters map[uint64]*lockedWriter
+	replyCh       chan pendingReply
+
 	cursorNextN map[uint64]uint64
 	cursorSlot  uint64
 	slotMeta    map[uint64]slotMetaEntry
@@ -199,19 +228,22 @@ func NewReplica(config *Config, idx int, label, logDir string, mode dropMode, ev
 		self += " " + label
 	}
 	r := &Replica{
-		config:      config,
-		idx:         idx,
-		viewId:      0,
-		self:        self,
-		clients:     make(map[uint64]*clientLine),
-		globalLog:   make(map[uint64]*globalEntry),
-		cursorNextN: make(map[uint64]uint64),
-		slotMeta:    make(map[uint64]slotMetaEntry),
-		peerWriters: make([]*lockedWriter, config.N),
-		gaps:        make(map[gapKey]*gapState),
-		logDir:      logDir,
-		dropMode:    mode,
-		dropEvery:   every,
+		config:        config,
+		idx:           idx,
+		viewId:        0,
+		self:          self,
+		clients:       make(map[uint64]*clientLine),
+		globalLog:     make(map[uint64]*globalEntry),
+		dedup:         make(map[reqKey]uint64),
+		clientWriters: make(map[uint64]*lockedWriter),
+		replyCh:       make(chan pendingReply, 1<<16),
+		cursorNextN:   make(map[uint64]uint64),
+		slotMeta:      make(map[uint64]slotMetaEntry),
+		peerWriters:   make([]*lockedWriter, config.N),
+		gaps:          make(map[gapKey]*gapState),
+		logDir:        logDir,
+		dropMode:      mode,
+		dropEvery:     every,
 	}
 	if logDir != "" {
 		if err := os.MkdirAll(logDir, 0o755); err != nil {
@@ -280,6 +312,7 @@ func (r *Replica) Run() error {
 	go r.statsLoop()
 	go r.connectPeers()
 	go r.gapDetectLoop()
+	go r.replyLoop()
 	if r.durable != nil {
 		go r.flushLoop()
 	}
@@ -299,11 +332,12 @@ func (r *Replica) Run() error {
 func (r *Replica) clientListener(conn net.Conn) {
 	defer conn.Close()
 	reader := bufio.NewReader(conn)
-	writer := bufio.NewWriter(conn)
+	lw := &lockedWriter{w: bufio.NewWriter(conn)}
 
 	var (
 		syncMsg BusSyncMessage
 		reqMsg  BusRequestMessage
+		busMsg  BusMessage
 		reply   BusReplyMessage
 	)
 
@@ -339,13 +373,18 @@ func (r *Replica) clientListener(conn net.Conn) {
 				ReplicaIdx: uint32(r.idx),
 				Result:     nil,
 			}
-			writer.WriteByte(MsgBusReply)
-			reply.Marshal(writer)
-			if err := writer.Flush(); err != nil {
+			if err := lw.sendMsg(MsgBusReply, &reply); err != nil {
 				Warning("[%s] failed to send reply for req=%d: %v",
 					r.self, reqMsg.RequestId, err)
 				return
 			}
+
+		case MsgBus:
+			if err := busMsg.Unmarshal(reader); err != nil {
+				Warning("[%s] bad bus message: %v", r.self, err)
+				return
+			}
+			r.handleBus(&busMsg, lw)
 
 		case MsgBusGapRequest:
 			var m BusGapRequest
@@ -448,6 +487,89 @@ func (r *Replica) handleRequest(msg *BusRequestMessage) (uint64, bool) {
 	return slot, true
 }
 
+func (r *Replica) handleBus(msg *BusMessage, lw *lockedWriter) {
+	actualNs := wallNs()
+	r.cwMu.Lock()
+	r.clientWriters[msg.ClientId] = lw
+	r.cwMu.Unlock()
+
+	r.mu.Lock()
+	line, ok := r.clients[msg.ClientId]
+	if !ok {
+		r.mu.Unlock()
+		Warning("[%s] bus from unsynced client %d, ignoring", r.self, msg.ClientId)
+		return
+	}
+	if r.shouldDropLocked(msg.BusSeqNum) {
+		r.winDropped++
+		r.mu.Unlock()
+		return
+	}
+	if msg.BusSeqNum > line.maxSeqSeen {
+		line.maxSeqSeen = msg.BusSeqNum
+	}
+
+	expectedNs := line.expectedNs(msg.BusSeqNum)
+	deltaUs := (actualNs - expectedNs) / 1000
+	if r.winRecv == 0 {
+		r.winDeltaMinUs, r.winDeltaMaxUs = deltaUs, deltaUs
+	} else {
+		if deltaUs < r.winDeltaMinUs {
+			r.winDeltaMinUs = deltaUs
+		}
+		if deltaUs > r.winDeltaMaxUs {
+			r.winDeltaMaxUs = deltaUs
+		}
+	}
+	r.winDeltaSumUs += deltaUs
+	r.winRecv++
+
+	r.busMode = true
+	slot := computeGlobalSlot(r.clients, msg.ClientId, msg.BusSeqNum)
+	r.recordBusReceivedLocked(slot, msg.ClientId, msg.BusSeqNum, msg.Requests)
+	r.advanceNextExpectedLocked()
+	r.mu.Unlock()
+}
+
+func (r *Replica) recordBusReceivedLocked(slot, clientId, busSeq uint64, reqs []RequestMessage) bool {
+	r.observeSlotLocked(slot)
+	e := r.slotEntryLocked(slot)
+	switch e.state {
+	case slotNoOp, slotReceived:
+		return false
+	default:
+		e.state = slotReceived
+		e.clientId = clientId
+		e.reqId = busSeq
+		e.requests = reqs
+		e.isBus = true
+		return true
+	}
+}
+
+func (r *Replica) slotGapPayloadLocked(slot uint64) ([]byte, bool) {
+	e := r.globalLog[slot]
+	if e == nil {
+		return nil, false
+	}
+	if e.isBus {
+		return marshalRequests(e.requests), true
+	}
+	return e.op, false
+}
+
+func (r *Replica) storeRecoveredLocked(slot, clientId, reqId uint64, payload []byte, isBus bool) bool {
+	if isBus {
+		reqs, err := unmarshalRequests(payload)
+		if err != nil {
+			Warning("[%s] cannot decode recovered bus for slot=%d: %v", r.self, slot, err)
+			return false
+		}
+		return r.recordBusReceivedLocked(slot, clientId, reqId, reqs)
+	}
+	return r.recordReceivedLocked(slot, clientId, reqId, payload)
+}
+
 func (r *Replica) slotEntryLocked(slot uint64) *globalEntry {
 	e := r.globalLog[slot]
 	if e == nil {
@@ -510,11 +632,76 @@ func (r *Replica) slotOpLocked(slot uint64) []byte {
 
 func (r *Replica) advanceNextExpectedLocked() {
 	for {
-		e := r.globalLog[r.nextExpected]
+		slot := r.nextExpected
+		e := r.globalLog[slot]
 		if e == nil || e.state == slotEmpty {
 			return
 		}
+		r.appendBusToLogListLocked(slot)
+		if r.busMode && r.durable != nil {
+			r.durableRecordCursorLocked(slot, e)
+		}
 		r.nextExpected++
+	}
+}
+
+func (r *Replica) durableRecordCursorLocked(slot uint64, e *globalEntry) {
+	clientId, reqId := e.clientId, e.reqId
+	if clientId == 0 {
+		m := r.slotOwnerLocked(slot)
+		clientId, reqId = m.clientId, m.reqId
+	}
+	r.durable.recordBus(slot, clientId, reqId, e.requests, e.state == slotNoOp)
+}
+
+func (r *Replica) appendBusToLogListLocked(slot uint64) {
+	e := r.globalLog[slot]
+	if e == nil || e.state == slotNoOp {
+		return
+	}
+	for i := range e.requests {
+		req := &e.requests[i]
+		key := reqKey{req.ClientId, req.RequestId}
+		li, ok := r.dedup[key]
+		if !ok {
+			li = uint64(len(r.logList))
+			r.logList = append(r.logList, logEntry{req.ClientId, req.RequestId, req.Op})
+			r.dedup[key] = li
+		}
+		r.enqueueReply(req.ClientId, req.RequestId, slot, li)
+	}
+}
+
+func (r *Replica) enqueueReply(clientId, requestId, busSlot, logIndex uint64) {
+	r.replyCh <- pendingReply{
+		clientId:  clientId,
+		requestId: requestId,
+		busSlot:   busSlot,
+		logIndex:  logIndex,
+		viewId:    r.viewId,
+	}
+}
+
+func (r *Replica) replyLoop() {
+	for pr := range r.replyCh {
+		r.cwMu.Lock()
+		lw := r.clientWriters[pr.clientId]
+		r.cwMu.Unlock()
+		if lw == nil {
+			continue
+		}
+		msg := &RequestReplyMessage{
+			ClientId:   pr.clientId,
+			RequestId:  pr.requestId,
+			BusSlotNum: pr.busSlot,
+			LogIndex:   pr.logIndex,
+			ViewId:     pr.viewId,
+			ReplicaIdx: uint32(r.idx),
+		}
+		if err := lw.sendMsg(MsgRequestReply, msg); err != nil {
+			Warning("[%s] failed to send request reply to client %d: %v",
+				r.self, pr.clientId, err)
+		}
 	}
 }
 
@@ -551,7 +738,7 @@ func (r *Replica) slotOwnerLocked(slot uint64) slotMetaEntry {
 }
 
 func (r *Replica) durableAppendLocked(slot uint64, op []byte, noop bool) {
-	if r.durable == nil {
+	if r.durable == nil || r.busMode {
 		return
 	}
 	var clientId, reqId uint64
@@ -744,12 +931,12 @@ func (r *Replica) leaderResolve(slot uint64, gs *gapState) {
 
 	r.mu.Lock()
 	if st := r.slotStateLocked(slot); st != slotEmpty {
-		op := r.slotOpLocked(slot)
+		op, isBus := r.slotGapPayloadLocked(slot)
 		askers := gs.snapshotAskers()
 		delete(r.gaps, key)
 		r.mu.Unlock()
 		if st == slotReceived {
-			r.answerAskers(slot, askers, op)
+			r.answerAskers(slot, askers, op, isBus)
 		}
 		return
 	}
@@ -758,6 +945,7 @@ func (r *Replica) leaderResolve(slot uint64, gs *gapState) {
 	r.broadcastToPeers(MsgBusGapRequest,
 		&BusGapRequest{Slot: slot, SenderIdx: uint32(r.idx)})
 	var recovered []byte
+	var recoveredBus bool
 	timeout := time.After(gapProtocolTimeout)
 probe:
 	for {
@@ -765,6 +953,7 @@ probe:
 		case reply := <-gs.probeReplies:
 			if reply.Found {
 				recovered = reply.Op
+				recoveredBus = reply.Bus
 				break probe
 			}
 		case <-timeout:
@@ -775,17 +964,17 @@ probe:
 	if recovered != nil {
 		r.mu.Lock()
 		m := r.slotOwnerLocked(slot)
-		stored := r.recordReceivedLocked(slot, m.clientId, m.reqId, recovered)
+		stored := r.storeRecoveredLocked(slot, m.clientId, m.reqId, recovered, recoveredBus)
 		if stored {
 			r.durableAppendLocked(slot, recovered, false)
 			r.winRecovered++
 		}
 		r.advanceNextExpectedLocked()
-		op := r.slotOpLocked(slot)
+		op, isBus := r.slotGapPayloadLocked(slot)
 		askers := gs.snapshotAskers()
 		delete(r.gaps, key)
 		r.mu.Unlock()
-		r.answerAskers(slot, askers, op)
+		r.answerAskers(slot, askers, op, isBus)
 		Notice("[%s] recovery_latency=%dus slot=%d client=%d req=%d",
 			r.self, (nowNs()-gs.start)/1000, slot, m.clientId, m.reqId)
 		return
@@ -793,11 +982,11 @@ probe:
 
 	r.mu.Lock()
 	if r.slotStateLocked(slot) == slotReceived {
-		op := r.slotOpLocked(slot)
+		op, isBus := r.slotGapPayloadLocked(slot)
 		askers := gs.snapshotAskers()
 		delete(r.gaps, key)
 		r.mu.Unlock()
-		r.answerAskers(slot, askers, op)
+		r.answerAskers(slot, askers, op, isBus)
 		return
 	}
 	if r.setNoOpLocked(slot) {
@@ -830,10 +1019,10 @@ collect:
 		r.self, (nowNs()-gs.start)/1000, slot, clientId, reqId)
 }
 
-func (r *Replica) answerAskers(slot uint64, askers []uint32, op []byte) {
+func (r *Replica) answerAskers(slot uint64, askers []uint32, op []byte, isBus bool) {
 	for _, idx := range askers {
 		r.sendToPeer(int(idx), MsgBusGapReply,
-			&BusGapReply{Slot: slot, SenderIdx: uint32(r.idx), Found: true, Op: op})
+			&BusGapReply{Slot: slot, SenderIdx: uint32(r.idx), Found: true, Bus: isBus, Op: op})
 	}
 }
 
@@ -841,13 +1030,14 @@ func (r *Replica) handleGapRequest(msg *BusGapRequest) {
 	slot := msg.Slot
 	r.mu.Lock()
 	st := r.slotStateLocked(slot)
-	op := r.slotOpLocked(slot)
+	op, isBus := r.slotGapPayloadLocked(slot)
 	r.mu.Unlock()
 
 	if !r.AmLeader() {
 		reply := &BusGapReply{Slot: slot, SenderIdx: uint32(r.idx), Found: st == slotReceived}
 		if reply.Found {
 			reply.Op = op
+			reply.Bus = isBus
 		}
 		r.sendToPeer(int(msg.SenderIdx), MsgBusGapReply, reply)
 		return
@@ -856,7 +1046,7 @@ func (r *Replica) handleGapRequest(msg *BusGapRequest) {
 	switch st {
 	case slotReceived:
 		r.sendToPeer(int(msg.SenderIdx), MsgBusGapReply,
-			&BusGapReply{Slot: slot, SenderIdx: uint32(r.idx), Found: true, Op: op})
+			&BusGapReply{Slot: slot, SenderIdx: uint32(r.idx), Found: true, Bus: isBus, Op: op})
 	case slotNoOp:
 		r.sendToPeer(int(msg.SenderIdx), MsgBusGapCommit,
 			&BusGapCommit{Slot: slot, SenderIdx: uint32(r.idx), ViewId: r.viewId})
@@ -903,7 +1093,7 @@ func (r *Replica) handleGapReply(msg *BusGapReply) {
 	if msg.Found {
 		r.mu.Lock()
 		m := r.slotOwnerLocked(msg.Slot)
-		if r.recordReceivedLocked(msg.Slot, m.clientId, m.reqId, msg.Op) {
+		if r.storeRecoveredLocked(msg.Slot, m.clientId, m.reqId, msg.Op, msg.Bus) {
 			r.durableAppendLocked(msg.Slot, msg.Op, false)
 			r.winRecovered++
 		}
