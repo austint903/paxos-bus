@@ -22,19 +22,11 @@ type inflightEntry struct {
 }
 
 type reqInflight struct {
-	busSeqNum   uint64
 	sendTimeNs  int64
 	firstSendNs int64
 	op          []byte
 	votes       map[uint64]uint32
 	committed   bool
-}
-
-type busRecord struct {
-	seqNum     uint64
-	sendTimeNs int64
-	reqIds     []uint64
-	retired    bool
 }
 
 const gcCommittedNs = 2 * int64(time.Second)
@@ -69,7 +61,7 @@ type Client struct {
 
 	requestGen    bool
 	genIntervalUs uint64
-	busTimeoutNs  int64
+	reqTimeoutNs  int64
 
 	conns   []net.Conn
 	readers []*bufio.Reader
@@ -85,9 +77,8 @@ type Client struct {
 	retryMu sync.Mutex
 	retry   []RequestMessage
 
-	busSeqNum   uint64
-	rInflight   map[uint64]*reqInflight
-	busInflight map[uint64]*busRecord
+	busSeqNum uint64
+	rInflight map[uint64]*reqInflight
 
 	committedCount uint64
 	totalRttUs     uint64
@@ -113,13 +104,12 @@ func NewClient(config *Config, clientId, intervalMs, resendMs uint64, label stri
 		self:          self,
 		requestGen:    requestGen,
 		genIntervalUs: genIntervalUs,
-		busTimeoutNs:  int64(resendMs) * 1e6,
+		reqTimeoutNs:  int64(resendMs) * 1e6,
 		conns:         make([]net.Conn, config.N),
 		readers:       make([]*bufio.Reader, config.N),
 		writers:       make([]*lockedWriter, config.N),
 		inflight:      make(map[uint64]*inflightEntry),
 		rInflight:     make(map[uint64]*reqInflight),
-		busInflight:   make(map[uint64]*busRecord),
 	}
 	resend := ""
 	if resendMs > 0 {
@@ -129,7 +119,7 @@ func NewClient(config *Config, clientId, intervalMs, resendMs uint64, label stri
 		Notice("[%s] started  request-gen  gen=%dus  bus=%dms  replicas=%d  f=%d  quorum=%d (f+1, must include leader)%s",
 			c.self, genIntervalUs, intervalMs, config.N, config.F, config.QuorumSize(), resend)
 		if resendMs > 0 {
-			Notice("[%s] bus-timeout=%dms", c.self, resendMs)
+			Notice("[%s] req-timeout=%dms", c.self, resendMs)
 		}
 		return c
 	}
@@ -191,8 +181,8 @@ func (c *Client) Run() {
 	if c.requestGen {
 		Notice("[%s] sync wait done, starting request-gen data phase (gen=%dus bus=%dms)",
 			c.self, c.genIntervalUs, c.intervalMs)
-		if c.busTimeoutNs > 0 {
-			go c.busTimeoutLoop()
+		if c.reqTimeoutNs > 0 {
+			go c.reqTimeoutLoop()
 		}
 		go c.janitorLoop()
 		go c.genLoop()
@@ -278,20 +268,16 @@ func (c *Client) sendBus() {
 	c.mu.Lock()
 	c.busSeqNum++
 	seq := c.busSeqNum
-	reqIds := make([]uint64, 0, len(reqs))
 	for i := range reqs {
 		rid := reqs[i].RequestId
-		reqIds = append(reqIds, rid)
 		e := c.rInflight[rid]
 		if e == nil {
 			e = &reqInflight{firstSendNs: now, op: reqs[i].Op, votes: make(map[uint64]uint32)}
 			c.rInflight[rid] = e
 		}
-		e.busSeqNum = seq
 		e.sendTimeNs = now
 		reqs[i].SendTimeNs = uint64(now)
 	}
-	c.busInflight[seq] = &busRecord{seqNum: seq, sendTimeNs: now, reqIds: reqIds}
 	c.winSent += uint64(len(reqs))
 	c.mu.Unlock()
 
@@ -308,7 +294,7 @@ func (c *Client) sendBus() {
 	}
 }
 
-func (c *Client) busTimeoutLoop() {
+func (c *Client) reqTimeoutLoop() {
 	tick := time.Duration(c.resendMs) * time.Millisecond / 4
 	if tick < time.Millisecond {
 		tick = time.Millisecond
@@ -318,34 +304,23 @@ func (c *Client) busTimeoutLoop() {
 		now := nowNs()
 		var reboard []RequestMessage
 		c.mu.Lock()
-		for seq, br := range c.busInflight {
-			if br.retired || now-br.sendTimeNs < c.busTimeoutNs {
+		for rid, e := range c.rInflight {
+			if e.committed || now-e.sendTimeNs < c.reqTimeoutNs {
 				continue
 			}
-			uncommitted := 0
-			for _, rid := range br.reqIds {
-				e := c.rInflight[rid]
-				if e == nil || e.committed || e.busSeqNum != seq {
-					continue
-				}
-				uncommitted++
-				reboard = append(reboard, RequestMessage{
-					ClientId: c.clientId, RequestId: rid, Op: e.op,
-				})
-			}
-			br.retired = true
-			delete(c.busInflight, seq)
-			if uncommitted > 0 {
-				c.resendCount += uint64(uncommitted)
-				c.winResends += uint64(uncommitted)
-				Notice("[%s] BUS-TIMEOUT bus=%d reboarding=%d requests", c.self, seq, uncommitted)
-			}
+			e.sendTimeNs = now
+			c.resendCount++
+			c.winResends++
+			reboard = append(reboard, RequestMessage{
+				ClientId: c.clientId, RequestId: rid, Op: e.op,
+			})
 		}
 		c.mu.Unlock()
 		if len(reboard) > 0 {
 			c.retryMu.Lock()
 			c.retry = append(c.retry, reboard...)
 			c.retryMu.Unlock()
+			Notice("[%s] REQ-TIMEOUT reboarding=%d requests", c.self, len(reboard))
 		}
 	}
 }
@@ -592,11 +567,6 @@ func (c *Client) janitorLoop() {
 		for rid, e := range c.rInflight {
 			if e.committed && now-e.sendTimeNs >= gcCommittedNs {
 				delete(c.rInflight, rid)
-			}
-		}
-		for seq, br := range c.busInflight {
-			if now-br.sendTimeNs >= gcCommittedNs {
-				delete(c.busInflight, seq)
 			}
 		}
 		c.mu.Unlock()

@@ -12,7 +12,7 @@ func main() {
 	configPath := flag.String("c", "", "path to replica config file")
 	clientId := flag.Uint64("I", 0, "client ID (positive integer, unique per client)")
 	intervalMs := flag.Uint64("p", 1, "message interval in milliseconds (bus interval under -r)")
-	resendMs := flag.Uint64("t", 0, "resend-on-no-quorum timeout in ms (bus timeout under -r; 0 = disabled)")
+	resendMs := flag.Uint64("t", 0, "resend-on-no-quorum timeout in ms (per-request timeout under -r; 0 = disabled)")
 	label := flag.String("l", "", "location label shown in every log line, e.g. asia-east1")
 	requestGen := flag.Bool("r", false, "request-generator mode: batch requests onto buses (two-layer log)")
 	genIntervalUs := flag.Uint64("g", 1, "request generation interval in microseconds (-r only)")
