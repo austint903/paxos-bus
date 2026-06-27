@@ -194,6 +194,8 @@ type Replica struct {
 	dedup   map[reqKey]uint64
 	busMode bool
 
+	pendingBuses []*BusMessage
+
 	cwMu          sync.Mutex
 	clientWriters map[uint64]*lockedWriter
 	replyCh       chan pendingReply
@@ -525,10 +527,51 @@ func (r *Replica) handleBus(msg *BusMessage, lw *lockedWriter) {
 	r.winRecv++
 
 	r.busMode = true
+
+	if len(r.gaps) > 0 {
+		slot := computeGlobalSlot(r.clients, msg.ClientId, msg.BusSeqNum)
+		if gs, isGap := r.gaps[gapKey{slot}]; isGap {
+			r.recordBusReceivedLocked(slot, msg.ClientId, msg.BusSeqNum, msg.Requests)
+			r.advanceNextExpectedLocked()
+			if gs != nil {
+				select {
+				case gs.doneCh <- struct{}{}:
+				default:
+				}
+			}
+			r.mu.Unlock()
+			return
+		}
+		cp := *msg
+		r.pendingBuses = append(r.pendingBuses, &cp)
+		r.mu.Unlock()
+		return
+	}
+
 	slot := computeGlobalSlot(r.clients, msg.ClientId, msg.BusSeqNum)
 	r.recordBusReceivedLocked(slot, msg.ClientId, msg.BusSeqNum, msg.Requests)
 	r.advanceNextExpectedLocked()
 	r.mu.Unlock()
+}
+
+func (r *Replica) finishGapLocked(key gapKey) {
+	delete(r.gaps, key)
+	if len(r.gaps) == 0 {
+		r.drainPendingBusesLocked()
+	}
+}
+
+func (r *Replica) drainPendingBusesLocked() {
+	if len(r.pendingBuses) == 0 {
+		return
+	}
+	buses := r.pendingBuses
+	r.pendingBuses = nil
+	for _, b := range buses {
+		slot := computeGlobalSlot(r.clients, b.ClientId, b.BusSeqNum)
+		r.recordBusReceivedLocked(slot, b.ClientId, b.BusSeqNum, b.Requests)
+	}
+	r.advanceNextExpectedLocked()
 }
 
 func (r *Replica) recordBusReceivedLocked(slot, clientId, busSeq uint64, reqs []RequestMessage) bool {
@@ -909,7 +952,7 @@ func (r *Replica) followerRecover(slot uint64, gs *gapState) {
 		lat := (nowNs() - gs.start) / 1000
 		r.mu.Lock()
 		st := r.slotStateLocked(slot)
-		delete(r.gaps, gapKey{slot})
+		r.finishGapLocked(gapKey{slot})
 		r.mu.Unlock()
 		clientId, reqId := r.ownerLog(slot)
 		switch st {
@@ -921,7 +964,7 @@ func (r *Replica) followerRecover(slot uint64, gs *gapState) {
 	case <-time.After(gapProtocolTimeout):
 		Warning("[%s] gap recovery timed out slot=%d", r.self, slot)
 		r.mu.Lock()
-		delete(r.gaps, gapKey{slot})
+		r.finishGapLocked(gapKey{slot})
 		r.mu.Unlock()
 	}
 }
@@ -933,7 +976,7 @@ func (r *Replica) leaderResolve(slot uint64, gs *gapState) {
 	if st := r.slotStateLocked(slot); st != slotEmpty {
 		op, isBus := r.slotGapPayloadLocked(slot)
 		askers := gs.snapshotAskers()
-		delete(r.gaps, key)
+		r.finishGapLocked(key)
 		r.mu.Unlock()
 		if st == slotReceived {
 			r.answerAskers(slot, askers, op, isBus)
@@ -972,7 +1015,7 @@ probe:
 		r.advanceNextExpectedLocked()
 		op, isBus := r.slotGapPayloadLocked(slot)
 		askers := gs.snapshotAskers()
-		delete(r.gaps, key)
+		r.finishGapLocked(key)
 		r.mu.Unlock()
 		r.answerAskers(slot, askers, op, isBus)
 		Notice("[%s] recovery_latency=%dus slot=%d client=%d req=%d",
@@ -984,7 +1027,7 @@ probe:
 	if r.slotStateLocked(slot) == slotReceived {
 		op, isBus := r.slotGapPayloadLocked(slot)
 		askers := gs.snapshotAskers()
-		delete(r.gaps, key)
+		r.finishGapLocked(key)
 		r.mu.Unlock()
 		r.answerAskers(slot, askers, op, isBus)
 		return
@@ -1013,7 +1056,7 @@ collect:
 	}
 	clientId, reqId := r.ownerLog(slot)
 	r.mu.Lock()
-	delete(r.gaps, key)
+	r.finishGapLocked(key)
 	r.mu.Unlock()
 	Notice("[%s] noop_latency=%dus slot=%d client=%d req=%d",
 		r.self, (nowNs()-gs.start)/1000, slot, clientId, reqId)
