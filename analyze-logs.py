@@ -43,10 +43,11 @@ RE_REPLY     = re.compile(r"REPLY from replica=(\d+)\s+rtt=(\d+)us")
 RE_REPLY_BUS = re.compile(r"req=\d+\s+bus_slot=(\d+)\s+log_index=\d+")
 RE_COMMITTED = re.compile(r"COMMITTED req=(\d+) slot=(\d+) rtt=(\d+)us total=(\d+)us attempts=(\d+)")
 # Request-generator (-r) COMMITTED line is keyed on log_index, not the bus slot,
-# and has no attempts field (retry granularity is the bus, not the request).
+# and has no attempts field (retry granularity is the request, not the bus).
 RE_COMMITTED_R = re.compile(r"COMMITTED req=(\d+) log_index=(\d+) rtt=(\d+)us total=(\d+)us")
 RE_NOQUORUM  = re.compile(r"NO-QUORUM req=(\d+)")
-RE_BUSTIMEOUT = re.compile(r"BUS-TIMEOUT bus=(\d+) reboarding=(\d+)")
+# -r retry is per request: requests that miss quorum re-board the next bus.
+RE_REQTIMEOUT = re.compile(r"REQ-TIMEOUT reboarding=(\d+)")
 RE_SENT_1S   = re.compile(r"1s: sent=(\d+) committed=(\d+)")
 # Gap-agreement events are keyed on the global log slot now; accept the new
 # `slot=` form and the legacy per-client `seq=` form (older archived runs).
@@ -133,7 +134,7 @@ def main():
     send_fail = {}       # client -> ts of first failed send (≈ last successful send)
     totals = {}          # client -> [total_us] for requests with attempts > 1
     attempts = {}        # client -> count of NO-QUORUM resends
-    reboards = {}        # client -> count of requests re-boarded by bus timeouts (-r)
+    reboards = {}        # client -> count of requests re-boarded by per-request timeouts (-r)
     sent_per_s = {}      # client -> [sent in each 1s window]
     drops = {}           # replica -> count
     gaps = {}            # replica -> count
@@ -197,9 +198,9 @@ def main():
                     if RE_NOQUORUM.search(text):
                         attempts[cid] = attempts.get(cid, 0) + 1
                         continue
-                    m = RE_BUSTIMEOUT.search(text)
+                    m = RE_REQTIMEOUT.search(text)
                     if m:
-                        reboards[cid] = reboards.get(cid, 0) + int(m.group(2))
+                        reboards[cid] = reboards.get(cid, 0) + int(m.group(1))
                         continue
                     if ("starting open-loop data phase" in text or
                             "starting request-gen data phase" in text):

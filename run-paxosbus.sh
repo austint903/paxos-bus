@@ -8,7 +8,7 @@ set -euo pipefail
 MSG_INTERVAL_MS=1      # change this: 1000=1s  100=100ms  10=10ms  2=2ms  1=1ms (bus interval under -r)
 NUM_REPLICAS=3
 NUM_CLIENTS=2
-RESEND_MS=0            # client resend-on-no-quorum timeout (ms); 0 = disabled (bus timeout under -r)
+RESEND_MS=0            # client resend-on-no-quorum timeout (ms); 0 = disabled (per-request timeout under -r)
 DURATION_S="${DURATION_S:-60}"  # seconds of data phase, then auto-stop; 0 = run until Ctrl+C
 SYNC_WARMUP_S=5        # client sync wait before data starts (matches syncStartDelayMs=5000)
 DROP_MODE=none         # artificial drop scenario: none|leader|followers|all
@@ -25,7 +25,7 @@ usage() {
     echo "  -r            request-generator mode: batch requests onto buses (two-layer log)"
     echo "  -g <us>       request generation interval in µs (-r only; default: $GEN_INTERVAL_US)"
     echo "  -p <ms>       message interval in ms (bus interval under -r) (default: $MSG_INTERVAL_MS)"
-    echo "  -t <ms>       client resend/bus timeout (default: $RESEND_MS, 0=off)"
+    echo "  -t <ms>       client resend timeout; per-request under -r (default: $RESEND_MS, 0=off)"
     echo "  -d <seconds>  auto-stop after this many seconds of data phase (default: run until Ctrl+C)"
     echo "  -D <mode>     artificial drop scenario: none|leader|followers|all (default: $DROP_MODE)"
     echo "  -F <n>        drop a slot when reqId % n == 0 (default: $DROP_EVERY, 0=off)"
