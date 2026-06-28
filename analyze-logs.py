@@ -116,9 +116,10 @@ def main():
 
     merged = []          # (ts, node, text)
     replies = {}         # client -> replica -> [rtt_us]
-    buses = {}           # client -> set of distinct bus slots seen (-r only)
+    buses = {}           # client -> {bus_slot: first_seen_ts}  (-r only)
     quorum = {}          # client -> [rtt_us]
     commit_span = {}     # client -> [first_committed_ts, last_committed_ts]
+    commit_ts = {}       # client -> [ts of each COMMITTED reply] (window gating)
     # Throughput window is anchored to the SEND phase, not to commit timestamps:
     #   start = when the client began the open-loop data phase (first send)
     #   end   = the last successful send, i.e. the moment just before sends
@@ -165,12 +166,14 @@ def main():
                         replies.setdefault(cid, {}).setdefault(
                             int(m.group(1)), []).append(int(m.group(2)))
                         bm = RE_REPLY_BUS.search(text)
-                        if bm:  # -r mode: track which buses carried passengers
-                            buses.setdefault(cid, set()).add(int(bm.group(1)))
+                        if bm:  # -r mode: record each bus's first-seen ts so the
+                            # in-flight tail can be trimmed from the bus count too
+                            buses.setdefault(cid, {}).setdefault(int(bm.group(1)), ts)
                         continue
                     m = RE_COMMITTED.search(text)
                     if m:
                         quorum.setdefault(cid, []).append(int(m.group(3)))
+                        commit_ts.setdefault(cid, []).append(ts)
                         if int(m.group(5)) > 1:
                             totals.setdefault(cid, []).append(int(m.group(4)))
                         # Track the actual data-phase span from the first to the
@@ -187,6 +190,7 @@ def main():
                     if m:
                         rtt, total = int(m.group(3)), int(m.group(4))
                         quorum.setdefault(cid, []).append(rtt)
+                        commit_ts.setdefault(cid, []).append(ts)
                         if total > rtt:  # took more than one bus → re-boarded
                             totals.setdefault(cid, []).append(total)
                         span = commit_span.setdefault(cid, [ts, ts])
@@ -251,13 +255,12 @@ def main():
         print(stat_line("quorum (COMMITTED) RTT", quorum.get(cid, [])))
         if totals.get(cid):
             print(stat_line("total latency (resent reqs)", totals[cid]))
-        n_commits = len(quorum.get(cid, []))
-        n_resends = attempts.get(cid, 0)
-        rates = sent_per_s.get(cid, [])
-        rate_txt = (f"  send rate avg={sum(rates) // len(rates)}/s"
-                    f" max={max(rates)}/s" if rates else "")
-        reboard_txt = f"  reboarded={reboards[cid]}" if cid in reboards else ""
-        print(f"    committed={n_commits}  resends={n_resends}{reboard_txt}{rate_txt}")
+        # Throughput window: data-phase start -> last successful send (or last
+        # live commit). Compute it BEFORE counting commits so requests still in
+        # flight when the window closes (replies draining in after the last send)
+        # are excluded from the count. Otherwise the numerator would include that
+        # tail while the denominator stops at the window end, inflating the rate
+        # above the true sustained value.
         start = send_start.get(cid)
         end = send_fail.get(cid, send_end.get(cid))  # last good send, else last commit
         # Fallback: under heavy -r load the bus goroutine can stall before it ever
@@ -269,7 +272,23 @@ def main():
         if (start is None or end is None) and span and span[1] > span[0]:
             start, end = span
             end_label = "last committed (commit-span fallback)"
-        n_buses = len(buses.get(cid, ()))
+
+        # Count only requests/buses that landed within [start, end]; the in-flight
+        # tail that commits after the window closes is dropped so throughput
+        # reflects the true sustained rate (e.g. 1000/s, not 1006/s).
+        if start is not None and end is not None:
+            n_commits = sum(1 for t in commit_ts.get(cid, []) if start <= t <= end)
+            n_buses = sum(1 for t in buses.get(cid, {}).values() if start <= t <= end)
+        else:
+            n_commits = len(commit_ts.get(cid, []))
+            n_buses = len(buses.get(cid, {}))
+
+        n_resends = attempts.get(cid, 0)
+        rates = sent_per_s.get(cid, [])
+        rate_txt = (f"  send rate avg={sum(rates) // len(rates)}/s"
+                    f" max={max(rates)}/s" if rates else "")
+        reboard_txt = f"  reboarded={reboards[cid]}" if cid in reboards else ""
+        print(f"    committed={n_commits}  resends={n_resends}{reboard_txt}{rate_txt}")
         if start is not None and end is not None and end > start:
             elapsed = end - start
             t0 = datetime.fromtimestamp(start, timezone.utc).strftime("%H:%M:%S.%f")[:-3]
