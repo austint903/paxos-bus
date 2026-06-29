@@ -48,10 +48,18 @@ $SUDO apt-get install -y --no-install-recommends \
     iputils-ping netcat-openbsd autossh
 
 # ── Go ───────────────────────────────────────────────────────────────────────
+# Map uname -m -> Go's release arch. The clusters are mixed: Wisconsin/Clemson
+# are x86_64, Utah is aarch64. Hardcoding amd64 lands an x86 Go on the ARM node,
+# where every `go` call dies with "cannot execute binary file: Exec format error".
+case "$(uname -m)" in
+    x86_64)        GOARCH_TAR=amd64 ;;
+    aarch64|arm64) GOARCH_TAR=arm64 ;;
+    *) echo "[setup] unsupported arch: $(uname -m)" >&2; exit 1 ;;
+esac
 if [[ ! -x /usr/local/go/bin/go ]] || ! /usr/local/go/bin/go version | grep -q "go${GO_VERSION}"; then
-    log "installing Go ${GO_VERSION}"
+    log "installing Go ${GO_VERSION} (${GOARCH_TAR})"
     $SUDO rm -rf /usr/local/go
-    curl -fsSL "https://go.dev/dl/go${GO_VERSION}.linux-amd64.tar.gz" \
+    curl -fsSL "https://go.dev/dl/go${GO_VERSION}.linux-${GOARCH_TAR}.tar.gz" \
         | $SUDO tar -C /usr/local -xz
 fi
 GO=/usr/local/go/bin/go
