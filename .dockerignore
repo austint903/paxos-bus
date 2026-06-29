@@ -1,0 +1,8 @@
+# Keep the Docker build context small. The swiftpaxos image does COPY . . so
+# exclude the heavy, build-irrelevant paths.
+.git
+prev/
+paxosbus/logs/
+config-paxosbus/
+config-swiftpaxos/
+*.md
