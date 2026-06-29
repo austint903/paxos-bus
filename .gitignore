@@ -1,3 +1,4 @@
 # Per-run log archives written by run-paxosbus.sh / run-gcp.sh
 paxosbus/logs/
 prev/
+*.MD
