@@ -128,10 +128,12 @@ func (cl *durableLog) writeAtTailLocked(b []byte) {
 }
 
 func (cl *durableLog) flush() {
+
 	cl.mu.Lock()
 	cl.w.Flush()
-	cl.f.Sync()
+	f := cl.f
 	cl.mu.Unlock()
+	f.Sync()
 }
 
 func (cl *durableLog) close() {
