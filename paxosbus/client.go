@@ -213,9 +213,10 @@ func (c *Client) genLoop() {
 			rid++
 			c.pendingMu.Lock()
 			c.pending = append(c.pending, RequestMessage{
-				ClientId:  c.clientId,
-				RequestId: rid,
-				Op:        []byte("hello"),
+				ClientId:   c.clientId,
+				RequestId:  rid,
+				SendTimeNs: uint64(now), // generation time; per-request latency clock starts here
+				Op:         []byte("hello"),
 			})
 			c.pendingMu.Unlock()
 			next += intervalNs
@@ -272,7 +273,13 @@ func (c *Client) sendBus() {
 		rid := reqs[i].RequestId
 		e := c.rInflight[rid]
 		if e == nil {
-			e = &reqInflight{firstSendNs: now, op: reqs[i].Op, votes: make(map[uint64]uint32)}
+			// firstSendNs = generation time (stamped in genLoop) so per-request
+			// latency includes the wait in c.pending before boarding this bus.
+			genNs := int64(reqs[i].SendTimeNs)
+			if genNs == 0 {
+				genNs = now
+			}
+			e = &reqInflight{firstSendNs: genNs, op: reqs[i].Op, votes: make(map[uint64]uint32)}
 			c.rInflight[rid] = e
 		}
 		e.sendTimeNs = now
@@ -439,11 +446,11 @@ func (c *Client) handleRequestReply(msg *RequestReplyMessage) {
 	if justCommitted {
 		e.committed = true
 		rttUs = (now - e.sendTimeNs) / 1000
-		totalUs = (now - e.firstSendNs) / 1000
+		totalUs = (now - e.firstSendNs) / 1000 // generation -> commit
 		c.committedCount++
-		c.totalRttUs += uint64(rttUs)
+		c.totalRttUs += uint64(totalUs)
 		c.winCommitted++
-		c.winRttSumUs += uint64(rttUs)
+		c.winRttSumUs += uint64(totalUs)
 	}
 	c.mu.Unlock()
 
@@ -595,6 +602,6 @@ func (c *Client) emitStats() {
 	if cumCommitted > 0 {
 		cumAvgUs = cumRttSum / cumCommitted
 	}
-	Notice("[%s] 1s: sent=%d committed=%d resends=%d inflight=%d rtt_avg=%dus  cumulative: committed=%d rtt_avg=%dus",
+	Notice("[%s] 1s: sent=%d committed=%d resends=%d inflight=%d lat_avg=%dus  cumulative: committed=%d lat_avg=%dus",
 		c.self, sent, committed, resends, inflight, winAvgUs, cumCommitted, cumAvgUs)
 }
