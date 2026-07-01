@@ -188,6 +188,7 @@ type Replica struct {
 
 	globalLog    map[uint64]*globalEntry
 	nextExpected uint64
+	prunedBelow  uint64
 	maxSlotSeen  uint64
 	haveMax      bool
 
@@ -685,13 +686,42 @@ func (r *Replica) advanceNextExpectedLocked() {
 		slot := r.nextExpected
 		e := r.globalLog[slot]
 		if e == nil || e.state == slotEmpty {
-			return
+			break
 		}
 		logIdxs := r.appendBusToLogListLocked(slot)
 		if r.busMode && r.durable != nil {
 			r.durableRecordCursorLocked(slot, e, logIdxs)
 		}
 		r.nextExpected++
+	}
+	r.pruneCommittedLocked()
+}
+
+// committedRetainSlots bounds how many already-committed slots the replica keeps
+// in memory (globalLog/slotMeta) below nextExpected. Without this these maps grow
+// ~one entry per request forever, and the rising GC pressure is the leading
+// suspect for the mid-run stall. The window stays well above the gap-recovery
+// window (gapDelta 5s + gapProtocolTimeout 3s ≈ 8s of traffic, ~16k slots at the
+// benchmark's ~2k/s) so a lagging peer's gap request is still answerable from
+// memory; older slots live only in the durable log. drop-mode none never gaps,
+// so this is a pure memory win for the current runs.
+const committedRetainSlots = 1 << 14
+
+// pruneCommittedLocked drops fully-committed slots that sit far enough below
+// nextExpected that no in-flight gap recovery can still need them, bounding the
+// heap. Slots are contiguous and monotonic, so prunedBelow lets each slot be
+// visited exactly once (amortized O(1) per committed slot).
+func (r *Replica) pruneCommittedLocked() {
+	if r.nextExpected <= committedRetainSlots {
+		return
+	}
+	target := r.nextExpected - committedRetainSlots
+	for s := r.prunedBelow; s < target; s++ {
+		delete(r.globalLog, s)
+		delete(r.slotMeta, s)
+	}
+	if target > r.prunedBelow {
+		r.prunedBelow = target
 	}
 }
 
