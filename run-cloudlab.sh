@@ -57,6 +57,7 @@ DROP_MODE="${DROP_MODE:-none}"
 DROP_EVERY="${DROP_EVERY:-0}"
 REQUEST_GEN="${REQUEST_GEN:-0}"
 GEN_INTERVAL_US="${GEN_INTERVAL_US:-1}"
+GCTRACE="${GCTRACE:-0}"          # 1 = instrument the leader (GODEBUG=gctrace=1 + vmstat sampler)
 NUM_CLIENTS="${NUM_CLIENTS:-1}"
 TRANSPORT="${TRANSPORT:-direct}"
 REPO_URL="${REPO_URL:-https://github.com/austint903/paxos-bus.git}"
@@ -295,10 +296,20 @@ launch() {
     echo "==> Launching replicas — one ssh process per node, in parallel"
     local lpids=()
     for i in 0 1 2; do
+        # GCTRACE=1 instruments the leader only: GODEBUG=gctrace=1 (GC timing goes to
+        # the replica log via stderr) plus a vmstat sampler (CPU steal / io-wait /
+        # swap) so a single run can tell a GC pause apart from a node/VM freeze. The
+        # env assignment must precede nohup so it lands in the replica's environment.
+        local envp="" vmstat_cmd="true"
+        if [[ "$GCTRACE" == "1" && "$i" == "$LEADER_IDX" ]]; then
+            envp="GODEBUG=gctrace=1 "
+            vmstat_cmd="nohup timeout $((DURATION_S + 20)) vmstat -t 1 </dev/null >/tmp/paxosbus-vmstat.log 2>&1 &"
+        fi
         ssh_to "${RHOST[$i]}" "
-            rm -f /tmp/paxosbus.log
+            rm -f /tmp/paxosbus.log /tmp/paxosbus-vmstat.log
             rm -rf /tmp/paxosbus-durable && mkdir -p /tmp/paxosbus-durable
-            nohup $BIN/paxosbus-replica \
+            $vmstat_cmd
+            ${envp}nohup $BIN/paxosbus-replica \
               -c $CONF -i $i -l ${RLABEL[$i]} -d /tmp/paxosbus-durable \
               -drop-mode $DROP_MODE -drop-every $DROP_EVERY \
               </dev/null >/tmp/paxosbus.log 2>&1 &
@@ -365,6 +376,10 @@ collect() {
         scp "${SSH_OPTS[@]}" -r "$SSH_USER@${RHOST[$i]}:/tmp/paxosbus-durable" "$durable_dir/replica-$i" \
             || echo "  WARN: no durable logs on ${RHOST[$i]}"
     done
+    if [[ "$GCTRACE" == "1" ]]; then
+        scp_from "${RHOST[$LEADER_IDX]}" "/tmp/paxosbus-vmstat.log" "$run_dir/leader-vmstat.log" \
+            || echo "  WARN: no leader vmstat log"
+    fi
     for id in $(seq 1 "$NUM_CLIENTS"); do
         scp_from "$CLIENT_HOST" "/tmp/paxosbus-client-$id.log" "$run_dir/paxosbus-client-$id.log" \
             || echo "  WARN: no client-$id log"
@@ -382,6 +397,7 @@ collect() {
         echo "drop_every=$DROP_EVERY"
         echo "request_gen=$REQUEST_GEN"
         echo "gen_interval_us=$GEN_INTERVAL_US"
+        echo "gctrace=$GCTRACE"
         echo "client=$CLIENT_LABEL replicas=${RLABEL[*]}"
         if [[ "$DROP_MODE" != "none" && "$DROP_EVERY" -gt 0 ]]; then echo "mode=drop-$DROP_MODE"; else echo "mode=normal"; fi
     } > "$run_dir/run-meta.txt"
