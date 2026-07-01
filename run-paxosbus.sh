@@ -174,9 +174,9 @@ fi
 if [[ $REQUEST_GEN -eq 1 ]]; then
     CLIENT_FLAGS+=(-r -g "$GEN_INTERVAL_US")
 fi
-for i in $(seq 1 $NUM_CLIENTS); do
+for i in $(seq 0 $((NUM_CLIENTS - 1))); do
     NAME="paxosbus-client-$i"
-    IP="172.29.0.$((BASE_CLIENT_OCTET + i - 1))"
+    IP="172.29.0.$((BASE_CLIENT_OCTET + i))"
     echo "+ client  $NAME  ($IP  id=$i  interval=${MSG_INTERVAL_MS}ms)"
     docker run -d \
         --name "$NAME" \
@@ -212,7 +212,7 @@ for i in $(seq 0 $((NUM_REPLICAS - 1))); do
 done
 
 # Also follow client logs so sync/send messages are visible
-for i in $(seq 1 $NUM_CLIENTS); do
+for i in $(seq 0 $((NUM_CLIENTS - 1))); do
     docker logs -f --timestamps "paxosbus-client-$i" 2>&1 \
         | tee "$RUN_LOG_DIR/client-$i.log" \
         | sed "s/^/[client-$i]  /" &

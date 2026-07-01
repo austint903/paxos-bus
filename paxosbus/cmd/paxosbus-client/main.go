@@ -10,7 +10,7 @@ import (
 
 func main() {
 	configPath := flag.String("c", "", "path to replica config file")
-	clientId := flag.Uint64("I", 0, "client ID (positive integer, unique per client)")
+	clientId := flag.Uint64("I", 0, "client ID (unique per client; 0-indexed)")
 	intervalMs := flag.Uint64("p", 1, "message interval in milliseconds (bus interval under -r)")
 	resendMs := flag.Uint64("t", 0, "resend-on-no-quorum timeout in ms (per-request timeout under -r; 0 = disabled)")
 	label := flag.String("l", "", "location label shown in every log line, e.g. asia-east1")
@@ -18,7 +18,14 @@ func main() {
 	genIntervalUs := flag.Uint64("g", 1, "request generation interval in microseconds (-r only)")
 	flag.Parse()
 
-	if *configPath == "" || *clientId == 0 || *intervalMs == 0 {
+	idSet := false
+	flag.Visit(func(f *flag.Flag) {
+		if f.Name == "I" {
+			idSet = true
+		}
+	})
+
+	if *configPath == "" || !idSet || *intervalMs == 0 {
 		fmt.Fprintf(os.Stderr,
 			"usage: %s -c <config-file> -I <client-id> [-p <interval-ms>] [-t <resend-ms>] [-l <label>] [-r] [-g <gen-us>]\n",
 			os.Args[0])
