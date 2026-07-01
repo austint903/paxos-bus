@@ -198,9 +198,10 @@ type Replica struct {
 
 	pendingBuses []*BusMessage
 
-	cwMu          sync.Mutex
-	clientWriters map[uint64]*lockedWriter
-	replyCh       chan pendingReply
+	cwMu           sync.Mutex
+	clientWriters  map[uint64]*lockedWriter
+	pendingReplies []pendingReply // guarded by r.mu; drained by replyLoop off-lock so a slow client can't freeze r.mu
+	replyWake      chan struct{}  // cap-1 signal that pendingReplies is non-empty
 
 	cursorNextN map[uint64]uint64
 	cursorSlot  uint64
@@ -225,6 +226,7 @@ type Replica struct {
 	winRecovered  uint64
 	winNoops      uint64
 	winDropped    uint64
+	winReplyMax   int
 }
 
 func NewReplica(config *Config, idx int, label, logDir string, mode dropMode, every uint64) *Replica {
@@ -241,7 +243,7 @@ func NewReplica(config *Config, idx int, label, logDir string, mode dropMode, ev
 		globalLog:     make(map[uint64]*globalEntry),
 		dedup:         make(map[reqKey]uint64),
 		clientWriters: make(map[uint64]*lockedWriter),
-		replyCh:       make(chan pendingReply, 1<<16),
+		replyWake:     make(chan struct{}, 1),
 		cursorNextN:   make(map[uint64]uint64),
 		slotMeta:      make(map[uint64]slotMetaEntry),
 		peerWriters:   make([]*lockedWriter, config.N),
@@ -765,35 +767,59 @@ func (r *Replica) appendBusToLogListLocked(slot uint64) []uint64 {
 	return logIdxs
 }
 
+// enqueueReply is called under r.mu. It only appends to an in-memory buffer and
+// wakes replyLoop — it never touches the network — so a slow/backed-up client
+// can no longer stall r.mu (and thus the leader's bus intake). The actual send
+// happens off-lock in replyLoop; the buffer is a growable slice, so a transient
+// reply-drain hiccup is absorbed rather than blocking the hot path.
 func (r *Replica) enqueueReply(clientId, requestId, busSlot, logIndex uint64) {
-	r.replyCh <- pendingReply{
+	r.pendingReplies = append(r.pendingReplies, pendingReply{
 		clientId:  clientId,
 		requestId: requestId,
 		busSlot:   busSlot,
 		logIndex:  logIndex,
 		viewId:    r.viewId,
+	})
+	if n := len(r.pendingReplies); n > r.winReplyMax {
+		r.winReplyMax = n
+	}
+	select {
+	case r.replyWake <- struct{}{}:
+	default:
 	}
 }
 
 func (r *Replica) replyLoop() {
-	for pr := range r.replyCh {
-		r.cwMu.Lock()
-		lw := r.clientWriters[pr.clientId]
-		r.cwMu.Unlock()
-		if lw == nil {
-			continue
-		}
-		msg := &RequestReplyMessage{
-			ClientId:   pr.clientId,
-			RequestId:  pr.requestId,
-			BusSlotNum: pr.busSlot,
-			LogIndex:   pr.logIndex,
-			ViewId:     pr.viewId,
-			ReplicaIdx: uint32(r.idx),
-		}
-		if err := lw.sendMsg(MsgRequestReply, msg); err != nil {
-			Warning("[%s] failed to send request reply to client %d: %v",
-				r.self, pr.clientId, err)
+	for range r.replyWake {
+		for {
+			r.mu.Lock()
+			batch := r.pendingReplies
+			r.pendingReplies = nil
+			r.mu.Unlock()
+			if len(batch) == 0 {
+				break
+			}
+			for i := range batch {
+				pr := &batch[i]
+				r.cwMu.Lock()
+				lw := r.clientWriters[pr.clientId]
+				r.cwMu.Unlock()
+				if lw == nil {
+					continue
+				}
+				msg := &RequestReplyMessage{
+					ClientId:   pr.clientId,
+					RequestId:  pr.requestId,
+					BusSlotNum: pr.busSlot,
+					LogIndex:   pr.logIndex,
+					ViewId:     pr.viewId,
+					ReplicaIdx: uint32(r.idx),
+				}
+				if err := lw.sendMsg(MsgRequestReply, msg); err != nil {
+					Warning("[%s] failed to send request reply to client %d: %v",
+						r.self, pr.clientId, err)
+				}
+			}
 		}
 	}
 }
@@ -852,9 +878,11 @@ func (r *Replica) statsLoop() {
 		sum, min, max := r.winDeltaSumUs, r.winDeltaMinUs, r.winDeltaMaxUs
 		gaps, recovered, noops := r.winGaps, r.winRecovered, r.winNoops
 		dropped := r.winDropped
+		replyMax := r.winReplyMax
 		r.winRecv, r.winDeltaSumUs, r.winDeltaMinUs, r.winDeltaMaxUs = 0, 0, 0, 0
 		r.winGaps, r.winRecovered, r.winNoops = 0, 0, 0
 		r.winDropped = 0
+		r.winReplyMax = 0
 		r.mu.Unlock()
 		if recv == 0 && gaps == 0 && recovered == 0 && noops == 0 && dropped == 0 {
 			continue
@@ -863,8 +891,8 @@ func (r *Replica) statsLoop() {
 		if recv > 0 {
 			avg = sum / int64(recv)
 		}
-		Notice("[%s] 1s: received=%d dropped=%d delta_avg=%+dus delta_min=%+dus delta_max=%+dus gaps=%d recovered=%d noops=%d",
-			r.self, recv, dropped, avg, min, max, gaps, recovered, noops)
+		Notice("[%s] 1s: received=%d dropped=%d delta_avg=%+dus delta_min=%+dus delta_max=%+dus gaps=%d recovered=%d noops=%d reply_backlog_max=%d",
+			r.self, recv, dropped, avg, min, max, gaps, recovered, noops, replyMax)
 	}
 }
 
