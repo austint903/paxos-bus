@@ -322,9 +322,6 @@ func (r *Replica) Run() error {
 	go r.connectPeers()
 	go r.gapDetectLoop()
 	go r.replyLoop()
-	if r.durable != nil {
-		go r.flushLoop()
-	}
 	for {
 		conn, err := l.Accept()
 		if err != nil {
@@ -838,16 +835,6 @@ func (r *Replica) statsLoop() {
 		}
 		Notice("[%s] 1s: received=%d dropped=%d delta_avg=%+dus delta_min=%+dus delta_max=%+dus gaps=%d recovered=%d noops=%d",
 			r.self, recv, dropped, avg, min, max, gaps, recovered, noops)
-	}
-}
-
-func (r *Replica) flushLoop() {
-	ticker := time.NewTicker(100 * time.Millisecond)
-	for range ticker.C {
-		r.durable.flush()
-		if r.reqListLog != nil {
-			r.reqListLog.flush()
-		}
 	}
 }
 

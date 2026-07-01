@@ -8,13 +8,15 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"sync"
+	"time"
 )
 
 type durableLog struct {
-	mu sync.Mutex
 	f  *os.File
 	w  *bufio.Writer
+	ch chan logRecord
+
+	closed chan struct{}
 
 	tailOff  int64
 	nextSlot uint64
@@ -22,7 +24,16 @@ type durableLog struct {
 	holes    map[uint64]int64
 }
 
+type logRecord struct {
+	slot uint64
+	body string
+}
+
 const durableLogBufBytes = 1 << 16
+
+const durableQueueDepth = 1 << 16
+
+const durableSyncInterval = time.Second
 
 const holeRecordWidth = 256
 
@@ -37,12 +48,16 @@ func openDurableLog(dir, name string) (*durableLog, error) {
 		f.Close()
 		return nil, err
 	}
-	return &durableLog{
+	cl := &durableLog{
 		f:       f,
 		w:       bufio.NewWriterSize(f, durableLogBufBytes),
+		ch:      make(chan logRecord, durableQueueDepth),
+		closed:  make(chan struct{}),
 		tailOff: off,
 		holes:   make(map[uint64]int64),
-	}, nil
+	}
+	go cl.writeLoop()
+	return cl, nil
 }
 
 func recordBody(slot, clientId, reqId uint64, op []byte, noop bool) string {
@@ -95,43 +110,58 @@ func padLine(body string) []byte {
 }
 
 func (cl *durableLog) record(slot, clientId, reqId uint64, op []byte, noop bool) {
-	cl.mu.Lock()
-	defer cl.mu.Unlock()
-	cl.recordBodyLocked(slot, recordBody(slot, clientId, reqId, op, noop))
+	cl.ch <- logRecord{slot, recordBody(slot, clientId, reqId, op, noop)}
 }
 
 func (cl *durableLog) recordBus(slot, clientId, busSeq uint64, logIdxs []uint64, noop bool) {
-	cl.mu.Lock()
-	defer cl.mu.Unlock()
-	cl.recordBodyLocked(slot, busRecordBody(slot, clientId, busSeq, logIdxs, noop))
+	cl.ch <- logRecord{slot, busRecordBody(slot, clientId, busSeq, logIdxs, noop)}
 }
 
 func (cl *durableLog) recordReq(logIndex, clientId, reqId uint64, op []byte) {
-	cl.mu.Lock()
-	defer cl.mu.Unlock()
-	cl.recordBodyLocked(logIndex, reqListRecordBody(logIndex, clientId, reqId, op))
+	cl.ch <- logRecord{logIndex, reqListRecordBody(logIndex, clientId, reqId, op)}
 }
 
-func (cl *durableLog) recordBodyLocked(slot uint64, body string) {
+func (cl *durableLog) writeLoop() {
+	ticker := time.NewTicker(durableSyncInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case rec, ok := <-cl.ch:
+			if !ok {
+				cl.w.Flush()
+				cl.f.Sync()
+				cl.f.Close()
+				close(cl.closed)
+				return
+			}
+			cl.apply(rec.slot, rec.body)
+		case <-ticker.C:
+			cl.w.Flush()
+			cl.f.Sync()
+		}
+	}
+}
+
+func (cl *durableLog) apply(slot uint64, body string) {
 	if !cl.haveNext {
 		cl.nextSlot, cl.haveNext = slot, true
 	}
 
 	if slot < cl.nextSlot {
-		cl.patchHoleLocked(slot, body)
+		cl.patchHole(slot, body)
 		return
 	}
 
 	for s := cl.nextSlot; s < slot; s++ {
 		off := cl.tailOff
-		cl.writeAtTailLocked(padLine(placeholderBody(s)))
+		cl.writeAtTail(padLine(placeholderBody(s)))
 		cl.holes[s] = off
 	}
-	cl.writeAtTailLocked([]byte(body + "\n"))
+	cl.writeAtTail([]byte(body + "\n"))
 	cl.nextSlot = slot + 1
 }
 
-func (cl *durableLog) patchHoleLocked(slot uint64, body string) {
+func (cl *durableLog) patchHole(slot uint64, body string) {
 	off, ok := cl.holes[slot]
 	if !ok {
 		return
@@ -141,24 +171,12 @@ func (cl *durableLog) patchHoleLocked(slot uint64, body string) {
 	delete(cl.holes, slot)
 }
 
-func (cl *durableLog) writeAtTailLocked(b []byte) {
+func (cl *durableLog) writeAtTail(b []byte) {
 	cl.w.Write(b)
 	cl.tailOff += int64(len(b))
 }
 
-func (cl *durableLog) flush() {
-
-	cl.mu.Lock()
-	cl.w.Flush()
-	f := cl.f
-	cl.mu.Unlock()
-	f.Sync()
-}
-
 func (cl *durableLog) close() {
-	cl.mu.Lock()
-	cl.w.Flush()
-	cl.f.Sync()
-	cl.f.Close()
-	cl.mu.Unlock()
+	close(cl.ch)
+	<-cl.closed
 }
