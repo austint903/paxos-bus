@@ -884,6 +884,18 @@ func (r *Replica) statsLoop() {
 		r.winDropped = 0
 		r.winReplyMax = 0
 		r.mu.Unlock()
+		// durable logs carry their own mutex, so sample their backlog off r.mu.
+		durMax := 0
+		if r.durable != nil {
+			if m := r.durable.backlogMax(); m > durMax {
+				durMax = m
+			}
+		}
+		if r.reqListLog != nil {
+			if m := r.reqListLog.backlogMax(); m > durMax {
+				durMax = m
+			}
+		}
 		if recv == 0 && gaps == 0 && recovered == 0 && noops == 0 && dropped == 0 {
 			continue
 		}
@@ -891,8 +903,8 @@ func (r *Replica) statsLoop() {
 		if recv > 0 {
 			avg = sum / int64(recv)
 		}
-		Notice("[%s] 1s: received=%d dropped=%d delta_avg=%+dus delta_min=%+dus delta_max=%+dus gaps=%d recovered=%d noops=%d reply_backlog_max=%d",
-			r.self, recv, dropped, avg, min, max, gaps, recovered, noops, replyMax)
+		Notice("[%s] 1s: received=%d dropped=%d delta_avg=%+dus delta_min=%+dus delta_max=%+dus gaps=%d recovered=%d noops=%d reply_backlog_max=%d durable_backlog_max=%d",
+			r.self, recv, dropped, avg, min, max, gaps, recovered, noops, replyMax, durMax)
 	}
 }
 

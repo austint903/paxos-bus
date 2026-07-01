@@ -8,13 +8,24 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 )
 
 type durableLog struct {
-	f  *os.File
-	w  *bufio.Writer
-	ch chan logRecord
+	f *os.File
+	w *bufio.Writer
+
+	// pending is an unbounded in-memory hand-off to writeLoop. The hot path
+	// (record*) only appends under mu and never blocks on the disk goroutine, so
+	// a disk latency spike can't stall the caller's r.mu — it just grows this
+	// buffer transiently and drains once the disk catches up. maxDepth is the
+	// high-water mark since the last backlogMax() read, exposed in the stats line.
+	mu       sync.Mutex
+	pending  []logRecord
+	maxDepth int
+	closing  bool
+	wake     chan struct{} // cap-1 signal that pending is non-empty (or closing)
 
 	closed chan struct{}
 
@@ -30,8 +41,6 @@ type logRecord struct {
 }
 
 const durableLogBufBytes = 1 << 16
-
-const durableQueueDepth = 1 << 16
 
 const durableSyncInterval = time.Second
 
@@ -51,7 +60,7 @@ func openDurableLog(dir, name string) (*durableLog, error) {
 	cl := &durableLog{
 		f:       f,
 		w:       bufio.NewWriterSize(f, durableLogBufBytes),
-		ch:      make(chan logRecord, durableQueueDepth),
+		wake:    make(chan struct{}, 1),
 		closed:  make(chan struct{}),
 		tailOff: off,
 		holes:   make(map[uint64]int64),
@@ -110,15 +119,41 @@ func padLine(body string) []byte {
 }
 
 func (cl *durableLog) record(slot, clientId, reqId uint64, op []byte, noop bool) {
-	cl.ch <- logRecord{slot, recordBody(slot, clientId, reqId, op, noop)}
+	cl.push(logRecord{slot, recordBody(slot, clientId, reqId, op, noop)})
 }
 
 func (cl *durableLog) recordBus(slot, clientId, busSeq uint64, logIdxs []uint64, noop bool) {
-	cl.ch <- logRecord{slot, busRecordBody(slot, clientId, busSeq, logIdxs, noop)}
+	cl.push(logRecord{slot, busRecordBody(slot, clientId, busSeq, logIdxs, noop)})
 }
 
 func (cl *durableLog) recordReq(logIndex, clientId, reqId uint64, op []byte) {
-	cl.ch <- logRecord{logIndex, reqListRecordBody(logIndex, clientId, reqId, op)}
+	cl.push(logRecord{logIndex, reqListRecordBody(logIndex, clientId, reqId, op)})
+}
+
+// push is the hot-path enqueue. It only appends under mu and wakes writeLoop —
+// it never waits on disk — so callers holding r.mu are never blocked by an fsync
+// stall. The disk write itself happens off-lock in writeLoop.
+func (cl *durableLog) push(rec logRecord) {
+	cl.mu.Lock()
+	cl.pending = append(cl.pending, rec)
+	if n := len(cl.pending); n > cl.maxDepth {
+		cl.maxDepth = n
+	}
+	cl.mu.Unlock()
+	select {
+	case cl.wake <- struct{}{}:
+	default:
+	}
+}
+
+// backlogMax returns and resets the high-water mark of the pending buffer since
+// the last call — the durable analogue of the reply backlog stat.
+func (cl *durableLog) backlogMax() int {
+	cl.mu.Lock()
+	m := cl.maxDepth
+	cl.maxDepth = 0
+	cl.mu.Unlock()
+	return m
 }
 
 func (cl *durableLog) writeLoop() {
@@ -126,18 +161,34 @@ func (cl *durableLog) writeLoop() {
 	defer ticker.Stop()
 	for {
 		select {
-		case rec, ok := <-cl.ch:
-			if !ok {
-				cl.w.Flush()
-				cl.f.Sync()
-				cl.f.Close()
-				close(cl.closed)
-				return
-			}
-			cl.apply(rec.slot, rec.body)
+		case <-cl.wake:
 		case <-ticker.C:
 			cl.w.Flush()
 			cl.f.Sync()
+			continue
+		}
+		// Drain the whole pending buffer (swapped out under mu so the hot path
+		// keeps appending while we do disk I/O off-lock), then, if we were asked
+		// to close, flush+sync+close once it's empty.
+		for {
+			cl.mu.Lock()
+			batch := cl.pending
+			cl.pending = nil
+			closing := cl.closing
+			cl.mu.Unlock()
+			for i := range batch {
+				cl.apply(batch[i].slot, batch[i].body)
+			}
+			if len(batch) == 0 {
+				if closing {
+					cl.w.Flush()
+					cl.f.Sync()
+					cl.f.Close()
+					close(cl.closed)
+					return
+				}
+				break
+			}
 		}
 	}
 }
@@ -177,6 +228,12 @@ func (cl *durableLog) writeAtTail(b []byte) {
 }
 
 func (cl *durableLog) close() {
-	close(cl.ch)
+	cl.mu.Lock()
+	cl.closing = true
+	cl.mu.Unlock()
+	select {
+	case cl.wake <- struct{}{}:
+	default:
+	}
 	<-cl.closed
 }
