@@ -114,14 +114,14 @@ host_ip() {
 
 ensure_ready() {
     local host="$1"
-    if ssh_to "$host" "test -x $BIN/paxosbus-replica && test -f /local/paxosbus-cloudlab/setup.done"; then
-        return 0
-    fi
-    echo "  [$host] not ready — running setup.sh (first time can take a few minutes)"
+    
+    echo "  [$host] syncing origin/master + rebuilding (first time can take a few minutes)"
     ssh_to "$host" "sudo bash -c '
         export DEBIAN_FRONTEND=noninteractive
-        if [ ! -d /local/paxos-bus/.git ]; then git clone $REPO_URL /local/paxos-bus
-        else git -C /local/paxos-bus pull --ff-only || true; fi
+        if [ ! -d /local/paxos-bus/.git ]; then git clone $REPO_URL /local/paxos-bus; fi
+        git -C /local/paxos-bus fetch --prune origin
+        git -C /local/paxos-bus reset --hard origin/master
+        git -C /local/paxos-bus clean -fd
         REPO_URL=$REPO_URL bash /local/paxos-bus/cloudlab/setup.sh'"
 }
 
