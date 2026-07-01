@@ -45,6 +45,7 @@ type globalEntry struct {
 	op       []byte
 	requests []RequestMessage
 	isBus    bool
+	ownerSet bool // clientId/reqId hold this slot's real owner (client id 0 is valid)
 }
 
 type reqKey struct {
@@ -208,8 +209,9 @@ type Replica struct {
 
 	gaps map[gapKey]*gapState
 
-	logDir  string
-	durable *durableLog
+	logDir     string
+	durable    *durableLog // BusMessage Log: slot -> bus (replica.log)
+	reqListLog *durableLog // Request Log List: log_index -> deduped request (requestlist.log)
 
 	dropMode  dropMode
 	dropEvery uint64
@@ -251,12 +253,17 @@ func NewReplica(config *Config, idx int, label, logDir string, mode dropMode, ev
 		if err := os.MkdirAll(logDir, 0o755); err != nil {
 			Warning("[%s] cannot create durable log dir %s: %v", self, logDir, err)
 			r.logDir = ""
-		} else if dl, err := openDurableLog(logDir); err != nil {
-			Warning("[%s] cannot open durable global log in %s: %v", self, logDir, err)
+		} else if busLog, err := openDurableLog(logDir, "replica.log"); err != nil {
+			Warning("[%s] cannot open durable bus-message log in %s: %v", self, logDir, err)
+			r.logDir = ""
+		} else if reqLog, err := openDurableLog(logDir, "requestlist.log"); err != nil {
+			Warning("[%s] cannot open durable request-list log in %s: %v", self, logDir, err)
+			busLog.close()
 			r.logDir = ""
 		} else {
-			r.durable = dl
-			Notice("[%s] durable global log in %s/replica.log", self, logDir)
+			r.durable = busLog
+			r.reqListLog = reqLog
+			Notice("[%s] durable logs in %s: replica.log (bus-message log) + requestlist.log (request log list)", self, logDir)
 		}
 	}
 	leader := "no"
@@ -586,6 +593,7 @@ func (r *Replica) recordBusReceivedLocked(slot, clientId, busSeq uint64, reqs []
 		e.reqId = busSeq
 		e.requests = reqs
 		e.isBus = true
+		e.ownerSet = true
 		return true
 	}
 }
@@ -640,6 +648,7 @@ func (r *Replica) recordReceivedLocked(slot, clientId, reqId uint64, op []byte) 
 		e.clientId = clientId
 		e.reqId = reqId
 		e.op = op
+		e.ownerSet = true
 		return true
 	}
 }
@@ -650,9 +659,10 @@ func (r *Replica) setNoOpLocked(slot uint64) bool {
 	if e.state == slotNoOp {
 		return false
 	}
-	if e.clientId == 0 {
+	if !e.ownerSet {
 		m := r.slotOwnerLocked(slot)
 		e.clientId, e.reqId = m.clientId, m.reqId
+		e.ownerSet = true
 	}
 	e.state = slotNoOp
 	e.op = nil
@@ -680,28 +690,36 @@ func (r *Replica) advanceNextExpectedLocked() {
 		if e == nil || e.state == slotEmpty {
 			return
 		}
-		r.appendBusToLogListLocked(slot)
+		logIdxs := r.appendBusToLogListLocked(slot)
 		if r.busMode && r.durable != nil {
-			r.durableRecordCursorLocked(slot, e)
+			r.durableRecordCursorLocked(slot, e, logIdxs)
 		}
 		r.nextExpected++
 	}
 }
 
-func (r *Replica) durableRecordCursorLocked(slot uint64, e *globalEntry) {
+func (r *Replica) durableRecordCursorLocked(slot uint64, e *globalEntry, logIdxs []uint64) {
 	clientId, reqId := e.clientId, e.reqId
-	if clientId == 0 {
+	if !e.ownerSet {
 		m := r.slotOwnerLocked(slot)
 		clientId, reqId = m.clientId, m.reqId
 	}
-	r.durable.recordBus(slot, clientId, reqId, e.requests, e.state == slotNoOp)
+	r.durable.recordBus(slot, clientId, reqId, logIdxs, e.state == slotNoOp)
 }
 
-func (r *Replica) appendBusToLogListLocked(slot uint64) {
+// appendBusToLogListLocked appends the slot's bus passengers to the request log
+// list, deduplicating across all buses: a request re-boarded after missing
+// quorum keeps the log index it was first assigned. It returns the ordered log
+// index of every passenger (duplicates included) so the caller can record which
+// indexes this bus covers, and persists each newly appended request to the
+// durable request log list. A reply is still enqueued for every passenger,
+// including duplicates, so clients short replies for quorum get them.
+func (r *Replica) appendBusToLogListLocked(slot uint64) []uint64 {
 	e := r.globalLog[slot]
 	if e == nil || e.state == slotNoOp {
-		return
+		return nil
 	}
+	logIdxs := make([]uint64, 0, len(e.requests))
 	for i := range e.requests {
 		req := &e.requests[i]
 		key := reqKey{req.ClientId, req.RequestId}
@@ -710,9 +728,14 @@ func (r *Replica) appendBusToLogListLocked(slot uint64) {
 			li = uint64(len(r.logList))
 			r.logList = append(r.logList, logEntry{req.ClientId, req.RequestId, req.Op})
 			r.dedup[key] = li
+			if r.reqListLog != nil {
+				r.reqListLog.recordReq(li, req.ClientId, req.RequestId, req.Op)
+			}
 		}
+		logIdxs = append(logIdxs, li)
 		r.enqueueReply(req.ClientId, req.RequestId, slot, li)
 	}
+	return logIdxs
 }
 
 func (r *Replica) enqueueReply(clientId, requestId, busSlot, logIndex uint64) {
@@ -785,7 +808,7 @@ func (r *Replica) durableAppendLocked(slot uint64, op []byte, noop bool) {
 		return
 	}
 	var clientId, reqId uint64
-	if e := r.globalLog[slot]; e != nil && e.clientId != 0 {
+	if e := r.globalLog[slot]; e != nil && e.ownerSet {
 		clientId, reqId = e.clientId, e.reqId
 	} else {
 		m := r.slotOwnerLocked(slot)
@@ -822,6 +845,9 @@ func (r *Replica) flushLoop() {
 	ticker := time.NewTicker(100 * time.Millisecond)
 	for range ticker.C {
 		r.durable.flush()
+		if r.reqListLog != nil {
+			r.reqListLog.flush()
+		}
 	}
 }
 
@@ -935,7 +961,7 @@ func (r *Replica) handleGap(slot uint64) {
 func (r *Replica) ownerLog(slot uint64) (uint64, uint64) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if e := r.globalLog[slot]; e != nil && e.clientId != 0 {
+	if e := r.globalLog[slot]; e != nil && e.ownerSet {
 		return e.clientId, e.reqId
 	}
 	m := r.slotOwnerLocked(slot)

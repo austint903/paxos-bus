@@ -26,8 +26,8 @@ const durableLogBufBytes = 1 << 16
 
 const holeRecordWidth = 256
 
-func openDurableLog(dir string) (*durableLog, error) {
-	path := filepath.Join(dir, "replica.log")
+func openDurableLog(dir, name string) (*durableLog, error) {
+	path := filepath.Join(dir, name)
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY, 0o644)
 	if err != nil {
 		return nil, err
@@ -51,18 +51,31 @@ func recordBody(slot, clientId, reqId uint64, op []byte, noop bool) string {
 		slot, clientId, reqId, len(op), hex.EncodeToString(op), noop)
 }
 
-func busRecordBody(slot, clientId, busSeq uint64, reqs []RequestMessage, noop bool) string {
+// busRecordBody is one line of the BusMessage Log: which bus occupies this
+// global slot and which request-log-list indexes its passengers map to. The
+// request payloads themselves live in the separate request log list (see
+// reqListRecordBody); the bus log only references them by index, so a request
+// carried by several buses (re-boarded after missing quorum) is stored once.
+func busRecordBody(slot, clientId, busSeq uint64, logIdxs []uint64, noop bool) string {
 	var sb strings.Builder
-	fmt.Fprintf(&sb, "{\"slot\":%d,\"client\":%d,\"bus\":%d,\"reqs\":[", slot, clientId, busSeq)
-	for i := range reqs {
+	fmt.Fprintf(&sb, "{\"slot\":%d,\"client\":%d,\"bus\":%d,\"log_indexes\":[", slot, clientId, busSeq)
+	for i, li := range logIdxs {
 		if i > 0 {
 			sb.WriteByte(',')
 		}
-		fmt.Fprintf(&sb, "{\"c\":%d,\"r\":%d,\"len\":%d,\"op\":\"%s\"}",
-			reqs[i].ClientId, reqs[i].RequestId, len(reqs[i].Op), hex.EncodeToString(reqs[i].Op))
+		fmt.Fprintf(&sb, "%d", li)
 	}
 	fmt.Fprintf(&sb, "],\"noop\":%t}", noop)
 	return sb.String()
+}
+
+// reqListRecordBody is one line of the Request Log List: the deduplicated
+// request stored at log_index. Appended in strict log-index order, so the file
+// is contiguous (no holes) unlike the slot-indexed bus/global logs.
+func reqListRecordBody(logIndex, clientId, reqId uint64, op []byte) string {
+	return fmt.Sprintf(
+		"{\"log_index\":%d,\"client\":%d,\"req_id\":%d,\"len\":%d,\"op\":\"%s\"}",
+		logIndex, clientId, reqId, len(op), hex.EncodeToString(op))
 }
 
 func placeholderBody(slot uint64) string {
@@ -87,10 +100,16 @@ func (cl *durableLog) record(slot, clientId, reqId uint64, op []byte, noop bool)
 	cl.recordBodyLocked(slot, recordBody(slot, clientId, reqId, op, noop))
 }
 
-func (cl *durableLog) recordBus(slot, clientId, busSeq uint64, reqs []RequestMessage, noop bool) {
+func (cl *durableLog) recordBus(slot, clientId, busSeq uint64, logIdxs []uint64, noop bool) {
 	cl.mu.Lock()
 	defer cl.mu.Unlock()
-	cl.recordBodyLocked(slot, busRecordBody(slot, clientId, busSeq, reqs, noop))
+	cl.recordBodyLocked(slot, busRecordBody(slot, clientId, busSeq, logIdxs, noop))
+}
+
+func (cl *durableLog) recordReq(logIndex, clientId, reqId uint64, op []byte) {
+	cl.mu.Lock()
+	defer cl.mu.Unlock()
+	cl.recordBodyLocked(logIndex, reqListRecordBody(logIndex, clientId, reqId, op))
 }
 
 func (cl *durableLog) recordBodyLocked(slot uint64, body string) {
