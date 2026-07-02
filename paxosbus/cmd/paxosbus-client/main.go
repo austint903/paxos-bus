@@ -16,6 +16,7 @@ func main() {
 	label := flag.String("l", "", "location label shown in every log line, e.g. asia-east1")
 	requestGen := flag.Bool("r", false, "request-generator mode: batch requests onto buses (two-layer log)")
 	genIntervalUs := flag.Uint64("g", 1, "request generation interval in microseconds (-r only)")
+	verbose := flag.Bool("v", false, "log every per-replica REPLY line (3 log writes per request at high rates; COMMITTED lines are always logged)")
 	flag.Parse()
 
 	idSet := false
@@ -38,7 +39,8 @@ func main() {
 		os.Exit(1)
 	}
 
-	client := paxosbus.NewClient(config, *clientId, *intervalMs, *resendMs, *label, *requestGen, *genIntervalUs)
+	client := paxosbus.NewClient(config, *clientId, *intervalMs, *resendMs, *label,
+		*requestGen, *genIntervalUs, *verbose)
 	if err := client.Connect(); err != nil {
 		fmt.Fprintf(os.Stderr, "cannot connect: %v\n", err)
 		os.Exit(1)

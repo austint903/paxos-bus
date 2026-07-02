@@ -62,6 +62,7 @@ type Client struct {
 	requestGen    bool
 	genIntervalUs uint64
 	reqTimeoutNs  int64
+	verbose       bool
 
 	conns   []net.Conn
 	readers []*bufio.Reader
@@ -91,7 +92,7 @@ type Client struct {
 }
 
 func NewClient(config *Config, clientId, intervalMs, resendMs uint64, label string,
-	requestGen bool, genIntervalUs uint64) *Client {
+	requestGen bool, genIntervalUs uint64, verbose bool) *Client {
 	self := "Client " + strconv.FormatUint(clientId, 10)
 	if label != "" {
 		self += " " + label
@@ -105,6 +106,7 @@ func NewClient(config *Config, clientId, intervalMs, resendMs uint64, label stri
 		requestGen:    requestGen,
 		genIntervalUs: genIntervalUs,
 		reqTimeoutNs:  int64(resendMs) * 1e6,
+		verbose:       verbose,
 		conns:         make([]net.Conn, config.N),
 		readers:       make([]*bufio.Reader, config.N),
 		writers:       make([]*lockedWriter, config.N),
@@ -454,8 +456,14 @@ func (c *Client) handleRequestReply(msg *RequestReplyMessage) {
 	}
 	c.mu.Unlock()
 
-	Notice("[%s] REPLY from replica=%d  rtt=%dus  req=%d  bus_slot=%d  log_index=%d",
-		c.self, msg.ReplicaIdx, replyRttUs, msg.RequestId, msg.BusSlotNum, msg.LogIndex)
+	// Per-reply lines are gated: at thousands of requests/s this is 3 log
+	// syscalls per request through the global log mutex, which the receive
+	// goroutines serialize on. COMMITTED (with total= gen->quorum latency) is
+	// always logged — it is what the stats aggregation parses.
+	if c.verbose {
+		Notice("[%s] REPLY from replica=%d  rtt=%dus  req=%d  bus_slot=%d  log_index=%d",
+			c.self, msg.ReplicaIdx, replyRttUs, msg.RequestId, msg.BusSlotNum, msg.LogIndex)
+	}
 	if justCommitted {
 		Notice("[%s] COMMITTED req=%d log_index=%d rtt=%dus total=%dus",
 			c.self, msg.RequestId, msg.LogIndex, rttUs, totalUs)
@@ -507,8 +515,10 @@ func (c *Client) handleBusReply(msg *BusReplyMessage) {
 	}
 	c.mu.Unlock()
 
-	Notice("[%s] REPLY from replica=%d  rtt=%dus  req=%d  slot=%d  post_quorum=%d",
-		c.self, msg.ReplicaIdx, replyRttUs, msg.RequestId, msg.LogSlotNum, postQuorum)
+	if c.verbose {
+		Notice("[%s] REPLY from replica=%d  rtt=%dus  req=%d  slot=%d  post_quorum=%d",
+			c.self, msg.ReplicaIdx, replyRttUs, msg.RequestId, msg.LogSlotNum, postQuorum)
+	}
 	if justCommitted {
 		Notice("[%s] COMMITTED req=%d slot=%d rtt=%dus total=%dus attempts=%d",
 			c.self, origReqId, msg.LogSlotNum, rttUs, totalUs, attempts)
