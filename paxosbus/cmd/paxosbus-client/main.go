@@ -17,6 +17,7 @@ func main() {
 	requestGen := flag.Bool("r", false, "request-generator mode: batch requests onto buses (two-layer log)")
 	genIntervalUs := flag.Uint64("g", 1, "request generation interval in microseconds (-r only)")
 	verbose := flag.Bool("v", false, "log every per-replica REPLY line (3 log writes per request at high rates; COMMITTED lines are always logged)")
+	startDelayMs := flag.Uint64("w", 5000, "delay in ms between sync and the data phase; every client must sync within this window")
 	flag.Parse()
 
 	idSet := false
@@ -40,7 +41,7 @@ func main() {
 	}
 
 	client := paxosbus.NewClient(config, *clientId, *intervalMs, *resendMs, *label,
-		*requestGen, *genIntervalUs, *verbose)
+		*requestGen, *genIntervalUs, *verbose, *startDelayMs)
 	if err := client.Connect(); err != nil {
 		fmt.Fprintf(os.Stderr, "cannot connect: %v\n", err)
 		os.Exit(1)

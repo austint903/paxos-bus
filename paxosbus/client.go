@@ -9,7 +9,7 @@ import (
 	"time"
 )
 
-const syncStartDelayMs = 5000
+const defaultStartDelayMs = 5000
 
 type inflightEntry struct {
 	sendTimeNs      int64
@@ -63,6 +63,8 @@ type Client struct {
 	genIntervalUs uint64
 	reqTimeoutNs  int64
 	verbose       bool
+	startDelayMs  uint64
+	syncWallNs    int64
 
 	conns   []net.Conn
 	readers []*bufio.Reader
@@ -92,10 +94,13 @@ type Client struct {
 }
 
 func NewClient(config *Config, clientId, intervalMs, resendMs uint64, label string,
-	requestGen bool, genIntervalUs uint64, verbose bool) *Client {
+	requestGen bool, genIntervalUs uint64, verbose bool, startDelayMs uint64) *Client {
 	self := "Client " + strconv.FormatUint(clientId, 10)
 	if label != "" {
 		self += " " + label
+	}
+	if startDelayMs == 0 {
+		startDelayMs = defaultStartDelayMs
 	}
 	c := &Client{
 		config:        config,
@@ -107,6 +112,7 @@ func NewClient(config *Config, clientId, intervalMs, resendMs uint64, label stri
 		genIntervalUs: genIntervalUs,
 		reqTimeoutNs:  int64(resendMs) * 1e6,
 		verbose:       verbose,
+		startDelayMs:  startDelayMs,
 		conns:         make([]net.Conn, config.N),
 		readers:       make([]*bufio.Reader, config.N),
 		writers:       make([]*lockedWriter, config.N),
@@ -156,11 +162,12 @@ func (c *Client) Connect() error {
 }
 
 func (c *Client) Run() {
+	c.syncWallNs = wallNs()
 	syncMsg := BusSyncMessage{
 		ClientId:     c.clientId,
-		SendTimeNs:   uint64(wallNs()),
+		SendTimeNs:   uint64(c.syncWallNs),
 		IntervalMs:   c.intervalMs,
-		StartDelayMs: syncStartDelayMs,
+		StartDelayMs: c.startDelayMs,
 	}
 	for i, lw := range c.writers {
 		lw.mu.Lock()
@@ -172,13 +179,20 @@ func (c *Client) Run() {
 			Panic("[%s] failed to send sync to replica %d: %v", c.self, i, err)
 		}
 	}
-	Notice("[%s] sync sent, waiting 5s before data phase", c.self)
+	Notice("[%s] sync sent, waiting %dms before data phase", c.self, c.startDelayMs)
 
 	for i := range c.readers {
 		go c.receiveLoop(i)
 	}
 
-	time.Sleep(syncStartDelayMs * time.Millisecond)
+	// Sleep until the promised data-phase start on the same wall clock the
+	// replicas use for expected arrival times: base = syncWallNs + startDelay.
+	// Sleeping a fixed duration from "after sync send" instead would shift every
+	// actual departure a few ms past the promised schedule, and with multiple
+	// clients each replica's in-order log append waits for the LATEST client.
+	if sleep := c.dataPhaseStartWallNs() - wallNs(); sleep > 0 {
+		time.Sleep(time.Duration(sleep))
+	}
 
 	if c.requestGen {
 		Notice("[%s] sync wait done, starting request-gen data phase (gen=%dus bus=%dms)",
@@ -230,23 +244,33 @@ func (c *Client) genLoop() {
 	}
 }
 
+// dataPhaseStartWallNs is the wall-clock instant promised to the replicas in
+// the sync message: bus/request n is expected at start + (n-1)*interval.
+func (c *Client) dataPhaseStartWallNs() int64 {
+	return c.syncWallNs + int64(c.startDelayMs)*1e6
+}
+
+// busLoop targets the promised wall-clock schedule directly (base + k*interval)
+// rather than free-running from whenever the start-delay sleep happened to
+// wake, so actual departures track the schedule the replicas order by to
+// within sleep jitter instead of drifting several ms late.
 func (c *Client) busLoop() {
 	intervalNs := int64(c.intervalMs) * 1e6
-	t0 := nowNs()
-	next := t0
+	base := c.dataPhaseStartWallNs()
+	next := base
 	curEpoch := int64(0)
 	for {
-		now := nowNs()
+		now := wallNs()
 		for now >= next {
 			c.sendBus()
 			next += intervalNs
-			if epoch := (next - t0) / int64(time.Second); epoch != curEpoch {
+			if epoch := (next - base) / int64(time.Second); epoch != curEpoch {
 				c.emitStats()
 				curEpoch = epoch
 			}
-			now = nowNs()
+			now = wallNs()
 		}
-		if sleep := next - nowNs(); sleep > 0 {
+		if sleep := next - wallNs(); sleep > 0 {
 			time.Sleep(time.Duration(sleep))
 		}
 	}
@@ -334,13 +358,15 @@ func (c *Client) reqTimeoutLoop() {
 	}
 }
 
+// sendLoop targets the promised wall-clock schedule for the same reason as
+// busLoop (see there).
 func (c *Client) sendLoop() {
 	intervalNs := int64(c.intervalMs) * 1e6
-	t0 := nowNs()
-	nextSendNs := t0
+	base := c.dataPhaseStartWallNs()
+	nextSendNs := base
 	curEpoch := int64(0)
 	for {
-		now := nowNs()
+		now := wallNs()
 		for now >= nextSendNs {
 			c.mu.Lock()
 			c.requestId++
@@ -349,13 +375,15 @@ func (c *Client) sendLoop() {
 			c.sendRequest(reqId, reqId, 0, 1)
 			nextSendNs += intervalNs
 
-			if epoch := (nextSendNs - t0) / int64(time.Second); epoch != curEpoch {
+			if epoch := (nextSendNs - base) / int64(time.Second); epoch != curEpoch {
 				c.emitStats()
 				curEpoch = epoch
 			}
-			now = nowNs()
+			now = wallNs()
 		}
-		time.Sleep(time.Duration(nextSendNs - now))
+		if sleep := nextSendNs - wallNs(); sleep > 0 {
+			time.Sleep(time.Duration(sleep))
+		}
 	}
 }
 
