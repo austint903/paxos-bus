@@ -199,7 +199,7 @@ type Replica struct {
 	pendingBuses []*BusMessage
 
 	cwMu           sync.Mutex
-	clientWriters  map[uint64]*lockedWriter
+	replySenders   map[uint64]*replySender
 	pendingReplies []pendingReply // guarded by r.mu; drained by replyLoop off-lock so a slow client can't freeze r.mu
 	replyWake      chan struct{}  // cap-1 signal that pendingReplies is non-empty
 
@@ -235,22 +235,22 @@ func NewReplica(config *Config, idx int, label, logDir string, mode dropMode, ev
 		self += " " + label
 	}
 	r := &Replica{
-		config:        config,
-		idx:           idx,
-		viewId:        0,
-		self:          self,
-		clients:       make(map[uint64]*clientLine),
-		globalLog:     make(map[uint64]*globalEntry),
-		dedup:         make(map[reqKey]uint64),
-		clientWriters: make(map[uint64]*lockedWriter),
-		replyWake:     make(chan struct{}, 1),
-		cursorNextN:   make(map[uint64]uint64),
-		slotMeta:      make(map[uint64]slotMetaEntry),
-		peerWriters:   make([]*lockedWriter, config.N),
-		gaps:          make(map[gapKey]*gapState),
-		logDir:        logDir,
-		dropMode:      mode,
-		dropEvery:     every,
+		config:       config,
+		idx:          idx,
+		viewId:       0,
+		self:         self,
+		clients:      make(map[uint64]*clientLine),
+		globalLog:    make(map[uint64]*globalEntry),
+		dedup:        make(map[reqKey]uint64),
+		replySenders: make(map[uint64]*replySender),
+		replyWake:    make(chan struct{}, 1),
+		cursorNextN:  make(map[uint64]uint64),
+		slotMeta:     make(map[uint64]slotMetaEntry),
+		peerWriters:  make([]*lockedWriter, config.N),
+		gaps:         make(map[gapKey]*gapState),
+		logDir:       logDir,
+		dropMode:     mode,
+		dropEvery:    every,
 	}
 	if logDir != "" {
 		if err := os.MkdirAll(logDir, 0o755); err != nil {
@@ -499,7 +499,13 @@ func (r *Replica) handleRequest(msg *BusRequestMessage) (uint64, bool) {
 func (r *Replica) handleBus(msg *BusMessage, lw *lockedWriter) {
 	actualNs := wallNs()
 	r.cwMu.Lock()
-	r.clientWriters[msg.ClientId] = lw
+	rs := r.replySenders[msg.ClientId]
+	if rs == nil {
+		rs = newReplySender(r, lw)
+		r.replySenders[msg.ClientId] = rs
+	} else {
+		rs.setWriter(lw)
+	}
 	r.cwMu.Unlock()
 
 	r.mu.Lock()
@@ -789,6 +795,10 @@ func (r *Replica) enqueueReply(clientId, requestId, busSlot, logIndex uint64) {
 	}
 }
 
+// replyLoop drains pendingReplies off r.mu and dispatches each reply to its
+// client's replySender. It never touches the network itself, so one stalled
+// client connection can only back up that client's own sender buffer — not
+// replies to every other client (cross-client head-of-line blocking).
 func (r *Replica) replyLoop() {
 	for range r.replyWake {
 		for {
@@ -802,22 +812,91 @@ func (r *Replica) replyLoop() {
 			for i := range batch {
 				pr := &batch[i]
 				r.cwMu.Lock()
-				lw := r.clientWriters[pr.clientId]
+				rs := r.replySenders[pr.clientId]
 				r.cwMu.Unlock()
-				if lw == nil {
+				if rs == nil {
 					continue
 				}
-				msg := &RequestReplyMessage{
+				rs.enqueue(*pr)
+			}
+		}
+	}
+}
+
+// replySender owns reply delivery to one client connection. Its goroutine
+// writes each drained batch under a single writer lock with one flush at the
+// end, collapsing a flush syscall per reply into one per batch.
+type replySender struct {
+	r *Replica
+
+	mu        sync.Mutex
+	lw        *lockedWriter
+	buf       []pendingReply
+	errLogged bool
+	wake      chan struct{} // cap-1 signal that buf is non-empty
+}
+
+func newReplySender(r *Replica, lw *lockedWriter) *replySender {
+	rs := &replySender{r: r, lw: lw, wake: make(chan struct{}, 1)}
+	go rs.loop()
+	return rs
+}
+
+// setWriter swaps in the connection a reconnected client now talks on.
+func (rs *replySender) setWriter(lw *lockedWriter) {
+	rs.mu.Lock()
+	if rs.lw != lw {
+		rs.lw = lw
+		rs.errLogged = false
+	}
+	rs.mu.Unlock()
+}
+
+func (rs *replySender) enqueue(pr pendingReply) {
+	rs.mu.Lock()
+	rs.buf = append(rs.buf, pr)
+	rs.mu.Unlock()
+	select {
+	case rs.wake <- struct{}{}:
+	default:
+	}
+}
+
+func (rs *replySender) loop() {
+	for range rs.wake {
+		for {
+			rs.mu.Lock()
+			batch := rs.buf
+			rs.buf = nil
+			lw := rs.lw
+			rs.mu.Unlock()
+			if len(batch) == 0 {
+				break
+			}
+			lw.mu.Lock()
+			for i := range batch {
+				pr := &batch[i]
+				msg := RequestReplyMessage{
 					ClientId:   pr.clientId,
 					RequestId:  pr.requestId,
 					BusSlotNum: pr.busSlot,
 					LogIndex:   pr.logIndex,
 					ViewId:     pr.viewId,
-					ReplicaIdx: uint32(r.idx),
+					ReplicaIdx: uint32(rs.r.idx),
 				}
-				if err := lw.sendMsg(MsgRequestReply, msg); err != nil {
-					Warning("[%s] failed to send request reply to client %d: %v",
-						r.self, pr.clientId, err)
+				lw.w.WriteByte(MsgRequestReply)
+				msg.Marshal(lw.w)
+			}
+			err := lw.w.Flush()
+			lw.mu.Unlock()
+			if err != nil {
+				rs.mu.Lock()
+				logIt := !rs.errLogged
+				rs.errLogged = true
+				rs.mu.Unlock()
+				if logIt {
+					Warning("[%s] failed to send request replies to client %d: %v",
+						rs.r.self, batch[0].clientId, err)
 				}
 			}
 		}
