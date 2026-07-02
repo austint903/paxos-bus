@@ -53,12 +53,6 @@ type reqKey struct {
 	requestId uint64
 }
 
-type logEntry struct {
-	clientId  uint64
-	requestId uint64
-	op        []byte
-}
-
 type pendingReply struct {
 	clientId  uint64
 	requestId uint64
@@ -192,9 +186,13 @@ type Replica struct {
 	maxSlotSeen  uint64
 	haveMax      bool
 
-	logList []logEntry
-	dedup   map[reqKey]uint64
-	busMode bool
+	// nextLogIndex is the length of the request log list. The in-memory list
+	// itself was write-only (payloads live in requestlist.log, indexes in
+	// dedup), so only the counter is kept — the slice grew ~50MB/min at high
+	// request rates for nothing.
+	nextLogIndex uint64
+	dedup        map[reqKey]uint64
+	busMode      bool
 
 	pendingBuses []*BusMessage
 
@@ -760,8 +758,8 @@ func (r *Replica) appendBusToLogListLocked(slot uint64) []uint64 {
 		key := reqKey{req.ClientId, req.RequestId}
 		li, ok := r.dedup[key]
 		if !ok {
-			li = uint64(len(r.logList))
-			r.logList = append(r.logList, logEntry{req.ClientId, req.RequestId, req.Op})
+			li = r.nextLogIndex
+			r.nextLogIndex++
 			r.dedup[key] = li
 			if r.reqListLog != nil {
 				r.reqListLog.recordReq(li, req.ClientId, req.RequestId, req.Op)
