@@ -36,15 +36,31 @@ set -euo pipefail
 # the profile on boot, or re-run here if missing).
 #
 # Usage:
-#   ./run-cloudlab.sh                 # full run (auto transport)
-#   ./run-cloudlab.sh probe           # just the firewall reachability probe
-#   ./run-cloudlab.sh setup           # (re)run setup.sh on all nodes, then exit
+#   ./run-cloudlab.sh                        # small-scale run (auto transport)
+#   ./run-cloudlab.sh --scale small          # 1 client on a NON-leader replica's
+#                                            #   cluster (CLIENT_REPLICA), the
+#                                            #   original benchmark topology
+#   ./run-cloudlab.sh --scale large          # 9 clients / 3 replicas: 3 clients
+#                                            #   on EVERY replica's cluster,
+#                                            #   including the leader's
+#   ./run-cloudlab.sh probe                  # just the firewall reachability probe
+#   ./run-cloudlab.sh setup                  # (re)run setup.sh on all nodes, then exit
 #
 # Env knobs (mirror run-gcp.sh):
 #   INTERVAL_MS DURATION_S DROP_MODE DROP_EVERY REQUEST_GEN GEN_INTERVAL_US
-#   NUM_CLIENTS                 number of clients on the client cluster (default 1)
-#   CLIENT_REPLICA              which replica's cluster runs the clients; must be
-#                               a non-leader (1 or 2, default 1)
+#   SCALE=small|large           same as --scale (flag wins)
+#   NUM_CLIENTS                 [small] clients on the client cluster (default 1)
+#   CLIENTS_PER_HOST            [large] clients on EACH replica cluster (default 3)
+#   CLIENT_REPLICA              [small] which replica's cluster runs the clients;
+#                               must be a non-leader (1 or 2, default 1)
+#   RESEND_MS                   per-request no-quorum re-board timeout, ms
+#                               (default 5000 — deliberately large, drops are rare)
+#   START_DELAY_MS              client sync->data-phase delay (default 5000 small /
+#                               10000 large). EVERY client must sync inside this
+#                               window at ALL replicas or the slot mapping diverges,
+#                               so large keeps a bigger cushion for 9 ssh launches.
+#   COLLECT_DURABLE=0|1         scp back /tmp/paxosbus-durable (default 1 small /
+#                               0 large — ~0.5GB at 18k req/s x 60s)
 #   TRANSPORT=direct|auto|tunnel  (default direct: public IP:$PORT, never SSH
 #                               tunnels; use 'auto' to probe-then-pick, or
 #                               'tunnel' to force the SSH-tunnel mesh)
@@ -55,9 +71,12 @@ INTERVAL_MS="${INTERVAL_MS:-1}"
 DURATION_S="${DURATION_S:-60}"
 DROP_MODE="${DROP_MODE:-none}"
 DROP_EVERY="${DROP_EVERY:-0}"
-REQUEST_GEN="${REQUEST_GEN:-0}"
-GEN_INTERVAL_US="${GEN_INTERVAL_US:-1}"
+REQUEST_GEN="${REQUEST_GEN:-1}"
+GEN_INTERVAL_US="${GEN_INTERVAL_US:-500}"
 NUM_CLIENTS="${NUM_CLIENTS:-1}"
+CLIENTS_PER_HOST="${CLIENTS_PER_HOST:-3}"
+RESEND_MS="${RESEND_MS:-5000}"
+SCALE="${SCALE:-small}"
 TRANSPORT="${TRANSPORT:-direct}"
 REPO_URL="${REPO_URL:-https://github.com/austint903/paxos-bus.git}"
 
@@ -69,7 +88,27 @@ CONF=/tmp/paxosbus.conf              # pushed to each node
 PORT="${PORT:-7000}"                 # direct-transport port (override with PORT=NNNN)
 TUN_BASE=17000                       # tunnel: local fwd port for replica j = TUN_BASE+j
 
-SUBCMD="${1:-run}"
+SUBCMD=run
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        run|probe|setup) SUBCMD="$1" ;;
+        small|large)     SCALE="$1" ;;
+        --scale)         SCALE="${2:?--scale needs small|large}"; shift ;;
+        --scale=*)       SCALE="${1#--scale=}" ;;
+        *) echo "usage: $0 [run|probe|setup] [--scale small|large]"; exit 1 ;;
+    esac
+    shift
+done
+[[ "$SCALE" =~ ^(small|large)$ ]] || { echo "ERROR: bad SCALE '$SCALE' (want small|large)"; exit 1; }
+
+# START_DELAY_MS / COLLECT_DURABLE default differently per scale (see header).
+if [[ "$SCALE" == "large" ]]; then
+    START_DELAY_MS="${START_DELAY_MS:-10000}"
+    COLLECT_DURABLE="${COLLECT_DURABLE:-0}"
+else
+    START_DELAY_MS="${START_DELAY_MS:-5000}"
+    COLLECT_DURABLE="${COLLECT_DURABLE:-1}"
+fi
 
 [[ -f "$NODES_FILE" ]] || { echo "ERROR: $NODES_FILE not found (copy cloudlab/nodes.env.example)"; exit 1; }
 # shellcheck disable=SC1090
@@ -81,15 +120,48 @@ RHOST=("$REPLICA0_HOST" "$REPLICA1_HOST" "$REPLICA2_HOST")
 RLABEL=("${REPLICA0_LABEL:-utah}" "${REPLICA1_LABEL:-wisc}" "${REPLICA2_LABEL:-clemson}")
 RIP=("" "" "")
 
-# Replica 0 is the initial Paxos leader. With only three clusters there is no
-# dedicated client node, so the closed-loop clients run ON one replica's
-# cluster — per the request, a NON-leader one (CLIENT_REPLICA, default 1). The
-# client co-locates with that replica and inherits its host + latency label.
+# Replica 0 is the initial Paxos leader. There is no dedicated client node, so
+# clients run ON replica clusters:
+#   small: all clients on ONE non-leader cluster (CLIENT_REPLICA, default 1) —
+#          the original topology where the client must not share the leader's
+#          cluster;
+#   large: CLIENTS_PER_HOST clients on EVERY cluster, leader's included (the
+#          non-co-location requirement is explicitly waived at this scale).
+# Client IDs must be GLOBALLY unique — the slot mapping keys on them — so in
+# large mode host i owns ids i*CLIENTS_PER_HOST+1 .. (i+1)*CLIENTS_PER_HOST.
 LEADER_IDX=0
 CLIENT_REPLICA="${CLIENT_REPLICA:-1}"
 [[ "$CLIENT_REPLICA" =~ ^[12]$ ]] || { echo "ERROR: CLIENT_REPLICA must be 1 or 2 (a non-leader cluster), got '$CLIENT_REPLICA'"; exit 1; }
-CLIENT_HOST="${RHOST[$CLIENT_REPLICA]}"
-CLIENT_LABEL="${RLABEL[$CLIENT_REPLICA]}"
+
+if [[ "$SCALE" == "large" ]]; then
+    CLIENT_HOST_IDXS=(0 1 2)
+    TOTAL_CLIENTS=$((3 * CLIENTS_PER_HOST))
+else
+    CLIENT_HOST_IDXS=("$CLIENT_REPLICA")
+    TOTAL_CLIENTS="$NUM_CLIENTS"
+fi
+
+# ids_on_host <position-in-CLIENT_HOST_IDXS> -> that host's client ids
+ids_on_host() {
+    local pos="$1"
+    if [[ "$SCALE" == "large" ]]; then
+        seq $((pos * CLIENTS_PER_HOST + 1)) $(((pos + 1) * CLIENTS_PER_HOST))
+    else
+        seq 1 "$NUM_CLIENTS"
+    fi
+}
+
+# clients_on_replica <replica-idx> -> how many clients that replica's host runs
+clients_on_replica() {
+    local ridx="$1" pos
+    for pos in "${!CLIENT_HOST_IDXS[@]}"; do
+        if [[ "${CLIENT_HOST_IDXS[$pos]}" == "$ridx" ]]; then
+            ids_on_host "$pos" | wc -l | tr -d ' '
+            return
+        fi
+    done
+    echo 0
+}
 
 SSH_OPTS=(-o StrictHostKeyChecking=accept-new -o ConnectTimeout=15 -o BatchMode=yes)
 ssh_to()   { ssh "${SSH_OPTS[@]}" "$SSH_USER@$1" "$2"; }
@@ -148,9 +220,10 @@ preflight() {
     for i in 0 1 2; do
         RIP[$i]="$(tr -d '[:space:]' < "$ipd/$i")"
         [[ -n "${RIP[$i]}" ]] || { echo "  could not resolve control IP for ${RHOST[$i]}"; exit 1; }
-        local tag="${RLABEL[$i]}"
-        [[ "$i" == "$LEADER_IDX" ]]     && tag="$tag, leader"
-        [[ "$i" == "$CLIENT_REPLICA" ]] && tag="$tag, +${NUM_CLIENTS} client(s)"
+        local tag="${RLABEL[$i]}" nc
+        [[ "$i" == "$LEADER_IDX" ]] && tag="$tag, leader"
+        nc="$(clients_on_replica "$i")"
+        [[ "$nc" != 0 ]] && tag="$tag, +${nc} client(s)"
         printf "  R%d  %-32s %s  (%s)\n" "$i" "${RHOST[$i]}" "${RIP[$i]}" "$tag"
     done
     rm -rf "$ipd"
@@ -287,8 +360,9 @@ launch() {
     STARTED_REMOTE=1     # replicas/clients about to run -> teardown must run
     echo "==> Killing stale processes (parallel)"
     local p kpids=()
-    for i in 0 1 2; do ssh_to "${RHOST[$i]}" "pkill -f '[p]axosbus-replica' || true" & kpids+=($!); done
-    ssh_to "$CLIENT_HOST" "pkill -f '[p]axosbus-client' || true" & kpids+=($!)
+    for i in 0 1 2; do
+        ssh_to "${RHOST[$i]}" "pkill -f '[p]axosbus-replica' || true; pkill -f '[p]axosbus-client' || true" & kpids+=($!)
+    done
     for p in "${kpids[@]}"; do wait "$p" || true; done
     sleep 2
 
@@ -312,34 +386,58 @@ launch() {
     for p in "${lpids[@]}"; do wait "$p" || true; done
     sleep 3
 
-    echo "==> Launching $NUM_CLIENTS client(s) on replica $CLIENT_REPLICA's host $CLIENT_HOST ($CLIENT_LABEL)"
+    echo "==> Launching $TOTAL_CLIENTS client(s), scale=$SCALE (parallel, one ssh per host)"
+    # All of a host's clients go up in ONE ssh, and the hosts launch in
+    # parallel: every client must send its sync inside every other client's
+    # START_DELAY_MS window (slot mapping diverges otherwise), so the launch
+    # spread has to stay well under it — sequential ssh per client did not.
     local extra=""
     [[ "$REQUEST_GEN" == "1" ]] && extra="-r -g $GEN_INTERVAL_US"
-    for id in $(seq 1 "$NUM_CLIENTS"); do
-        ssh_to "$CLIENT_HOST" "
-            rm -f /tmp/paxosbus-client-$id.log
-            nohup $BIN/paxosbus-client \
-              -c $CONF -I $id -p $INTERVAL_MS -l $CLIENT_LABEL $extra \
-              </dev/null >/tmp/paxosbus-client-$id.log 2>&1 &
+    [[ "$RESEND_MS" != "0" ]] && extra="$extra -t $RESEND_MS"
+    local pos cpids=()
+    for pos in "${!CLIENT_HOST_IDXS[@]}"; do
+        local ridx="${CLIENT_HOST_IDXS[$pos]}"
+        local chost="${RHOST[$ridx]}" clabel="${RLABEL[$ridx]}"
+        local ids; ids="$(ids_on_host "$pos" | tr '\n' ' ')"
+        ssh_to "$chost" "
+            for id in $ids; do
+              rm -f /tmp/paxosbus-client-\$id.log
+              nohup $BIN/paxosbus-client \
+                -c $CONF -I \$id -p $INTERVAL_MS -l $clabel -w $START_DELAY_MS $extra \
+                </dev/null >/tmp/paxosbus-client-\$id.log 2>&1 &
+            done
             sleep 1
-            if pgrep -f '[p]axosbus-client.*-I $id' >/dev/null; then echo '  [client $id] running'
-            else echo '  [client $id] NOT RUNNING — startup log:'; cat /tmp/paxosbus-client-$id.log 2>/dev/null || true; fi"
+            for id in $ids; do
+              if pgrep -f \"[p]axosbus-client.*-I \$id -p\" >/dev/null; then
+                echo \"  [client \$id @ $clabel] running\"
+              else
+                echo \"  [client \$id @ $clabel] NOT RUNNING — startup log:\"
+                cat /tmp/paxosbus-client-\$id.log 2>/dev/null || true
+              fi
+            done" & cpids+=($!)
     done
+    for p in "${cpids[@]}"; do wait "$p" || true; done
 }
 
 tail_logs() {
+    # Data phase starts START_DELAY_MS after the syncs, so keep the run alive
+    # for delay + duration + slack.
+    local run_for=$((DURATION_S + START_DELAY_MS / 1000 + 6))
     echo ""
-    echo "==> Live tail (running for $((DURATION_S + 6))s)"
+    echo "==> Live tail (running for ${run_for}s; tailing replicas + first client per host)"
     echo "----------------------------------------------------------------"
-    local pids=()
+    local pos pids=()
     for i in 0 1 2; do
         ssh "${SSH_OPTS[@]}" "$SSH_USER@${RHOST[$i]}" "tail -f /tmp/paxosbus.log | sed -u 's/^/[r$i] /'" & pids+=($!)
     done
-    for id in $(seq 1 "$NUM_CLIENTS"); do
-        ssh "${SSH_OPTS[@]}" "$SSH_USER@$CLIENT_HOST" "tail -f /tmp/paxosbus-client-$id.log | sed -u 's/^/[c$id] /'" & pids+=($!)
+    for pos in "${!CLIENT_HOST_IDXS[@]}"; do
+        local ridx="${CLIENT_HOST_IDXS[$pos]}"
+        local first; first="$(ids_on_host "$pos" | head -n1)"
+        ssh "${SSH_OPTS[@]}" "$SSH_USER@${RHOST[$ridx]}" \
+            "tail -f /tmp/paxosbus-client-$first.log | sed -u 's/^/[c$first] /'" & pids+=($!)
     done
     LOCAL_BG_PIDS+=("${pids[@]}")     # so cleanup() kills these tails on Ctrl-C
-    sleep $((DURATION_S + 6))
+    sleep "$run_for"
     for p in "${pids[@]}"; do kill "$p" 2>/dev/null || true; done
     wait 2>/dev/null || true
     echo "----------------------------------------------------------------"
@@ -348,26 +446,34 @@ tail_logs() {
 collect() {
     echo "==> Stopping replicas + clients (parallel)"
     local p sp=()
-    for i in 0 1 2; do ssh_to "${RHOST[$i]}" "pkill -f '[p]axosbus-replica' || true" & sp+=($!); done
-    ssh_to "$CLIENT_HOST" "pkill -f '[p]axosbus-client' || true" & sp+=($!)
+    for i in 0 1 2; do
+        ssh_to "${RHOST[$i]}" "pkill -f '[p]axosbus-replica' || true; pkill -f '[p]axosbus-client' || true" & sp+=($!)
+    done
     for p in "${sp[@]}"; do wait "$p" || true; done
 
     local ts run_dir durable_dir
     ts=$(date +%Y%m%d-%H%M%S)
     run_dir="$SCRIPT_DIR/paxosbus/logs/cloudlab/cloudlab-run-$ts"
     durable_dir="$SCRIPT_DIR/paxosbus/logs/durable/cloudlab/cloudlab-run-$ts"
-    mkdir -p "$run_dir" "$durable_dir"
+    mkdir -p "$run_dir"
 
     echo "==> Collecting logs -> $run_dir"
     for i in 0 1 2; do
         scp_from "${RHOST[$i]}" "/tmp/paxosbus.log" "$run_dir/replica-$i.log" \
             || echo "  WARN: no /tmp/paxosbus.log on ${RHOST[$i]}"
-        scp "${SSH_OPTS[@]}" -r "$SSH_USER@${RHOST[$i]}:/tmp/paxosbus-durable" "$durable_dir/replica-$i" \
-            || echo "  WARN: no durable logs on ${RHOST[$i]}"
+        if [[ "$COLLECT_DURABLE" == "1" ]]; then
+            mkdir -p "$durable_dir"
+            scp "${SSH_OPTS[@]}" -r "$SSH_USER@${RHOST[$i]}:/tmp/paxosbus-durable" "$durable_dir/replica-$i" \
+                || echo "  WARN: no durable logs on ${RHOST[$i]}"
+        fi
     done
-    for id in $(seq 1 "$NUM_CLIENTS"); do
-        scp_from "$CLIENT_HOST" "/tmp/paxosbus-client-$id.log" "$run_dir/paxosbus-client-$id.log" \
-            || echo "  WARN: no client-$id log"
+    local pos
+    for pos in "${!CLIENT_HOST_IDXS[@]}"; do
+        local ridx="${CLIENT_HOST_IDXS[$pos]}"
+        for id in $(ids_on_host "$pos"); do
+            scp_from "${RHOST[$ridx]}" "/tmp/paxosbus-client-$id.log" "$run_dir/paxosbus-client-$id.log" \
+                || echo "  WARN: no client-$id log on ${RHOST[$ridx]}"
+        done
     done
 
     {
@@ -375,38 +481,31 @@ collect() {
         echo "git_commit=$(git -C "$SCRIPT_DIR" rev-parse --short HEAD 2>/dev/null || echo unknown)"
         echo "platform=cloudlab"
         echo "transport=$MODE"
+        echo "scale=$SCALE"
         echo "interval_ms=$INTERVAL_MS"
         echo "duration_s=$DURATION_S"
-        echo "num_clients=$NUM_CLIENTS"
+        echo "total_clients=$TOTAL_CLIENTS"
+        echo "clients_per_host=$([[ "$SCALE" == "large" ]] && echo "$CLIENTS_PER_HOST" || echo "-")"
+        echo "start_delay_ms=$START_DELAY_MS"
+        echo "resend_ms=$RESEND_MS"
         echo "drop_mode=$DROP_MODE"
         echo "drop_every=$DROP_EVERY"
         echo "request_gen=$REQUEST_GEN"
         echo "gen_interval_us=$GEN_INTERVAL_US"
-        echo "client=$CLIENT_LABEL replicas=${RLABEL[*]}"
+        echo "client_hosts=$(for pos in "${!CLIENT_HOST_IDXS[@]}"; do printf '%s ' "${RLABEL[${CLIENT_HOST_IDXS[$pos]}]}"; done)"
+        echo "replicas=${RLABEL[*]}"
         if [[ "$DROP_MODE" != "none" && "$DROP_EVERY" -gt 0 ]]; then echo "mode=drop-$DROP_MODE"; else echo "mode=normal"; fi
     } > "$run_dir/run-meta.txt"
 
     echo ""
-    echo "==> Per-replica RTT summary (from client logs)"
-    for id in $(seq 1 "$NUM_CLIENTS"); do
-        echo "=== client $id ==="
-        for r in 0 1 2; do
-            # extract ONLY the rtt number (not the replica index) and sort -n so the
-            # awk below stays portable (macOS awk has no asort)
-            grep -oE "REPLY from replica=$r  rtt=[0-9]+us" "$run_dir/paxosbus-client-$id.log" 2>/dev/null \
-                | sed -E 's/.*rtt=([0-9]+)us.*/\1/' | sort -n \
-                | awk -v r=$r '
-                    NF { a[++n]=$1; s+=$1 }
-                    END {
-                        if (!n) { printf "  replica=%d  no data\n", r; exit }
-                        i50=int((n+1)*0.50); if (i50<1) i50=1; if (i50>n) i50=n
-                        i99=int((n+1)*0.99); if (i99<1) i99=1; if (i99>n) i99=n
-                        printf "  replica=%d  n=%d  avg=%.0fus  p50=%dus  p99=%dus\n",
-                               r, n, s/n, a[i50], a[i99] }'
-        done
-    done
+    python3 "$SCRIPT_DIR/cloudlab/aggregate-stats.py" "$run_dir" \
+        || echo "  WARN: aggregate-stats.py failed"
     echo ""
-    echo "==> Done. Logs: $run_dir  (durable: $durable_dir)"
+    if [[ "$COLLECT_DURABLE" == "1" ]]; then
+        echo "==> Done. Logs: $run_dir  (durable: $durable_dir)"
+    else
+        echo "==> Done. Logs: $run_dir  (durable logs left on nodes; COLLECT_DURABLE=0)"
+    fi
 }
 
 # ── Teardown (runs on EVERY exit, including Ctrl-C / errors) ──────────────────
