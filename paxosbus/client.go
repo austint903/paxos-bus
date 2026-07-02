@@ -2,6 +2,7 @@ package paxosbus
 
 import (
 	"bufio"
+	"bytes"
 	"math/bits"
 	"net"
 	"strconv"
@@ -52,6 +53,77 @@ func (lw *lockedWriter) sendMsg(code uint8, msg wireMsg) error {
 	return lw.w.Flush()
 }
 
+func (lw *lockedWriter) sendRawBatch(bufs [][]byte) error {
+	lw.mu.Lock()
+	defer lw.mu.Unlock()
+	for _, b := range bufs {
+		if _, err := lw.w.Write(b); err != nil {
+			return err
+		}
+	}
+	return lw.w.Flush()
+}
+
+// connSender decouples the bus loop from one replica connection: sendBus
+// enqueues the pre-marshaled bus and never blocks on the network, so TCP
+// backpressure from one stalled replica cannot delay buses to the healthy
+// ones. A per-connection goroutine drains the buffer in FIFO order; a send
+// error kills the sender (the TCP stream is broken anyway — receiveLoop dies
+// on the same conn) and further buses to it are dropped.
+type connSender struct {
+	lw   *lockedWriter
+	self string
+	idx  int
+
+	mu   sync.Mutex
+	buf  [][]byte
+	dead bool
+	wake chan struct{}
+}
+
+func newConnSender(lw *lockedWriter, self string, idx int) *connSender {
+	s := &connSender{lw: lw, self: self, idx: idx, wake: make(chan struct{}, 1)}
+	go s.loop()
+	return s
+}
+
+func (s *connSender) enqueue(b []byte) {
+	s.mu.Lock()
+	if s.dead {
+		s.mu.Unlock()
+		return
+	}
+	s.buf = append(s.buf, b)
+	s.mu.Unlock()
+	select {
+	case s.wake <- struct{}{}:
+	default:
+	}
+}
+
+func (s *connSender) loop() {
+	for range s.wake {
+		for {
+			s.mu.Lock()
+			batch := s.buf
+			s.buf = nil
+			s.mu.Unlock()
+			if len(batch) == 0 {
+				break
+			}
+			if err := s.lw.sendRawBatch(batch); err != nil {
+				Warning("[%s] send bus to replica %d failed: %v (dropping further buses on this conn)",
+					s.self, s.idx, err)
+				s.mu.Lock()
+				s.dead = true
+				s.buf = nil
+				s.mu.Unlock()
+				return
+			}
+		}
+	}
+}
+
 type Client struct {
 	config     *Config
 	clientId   uint64
@@ -66,9 +138,10 @@ type Client struct {
 	startDelayMs  uint64
 	syncWallNs    int64
 
-	conns   []net.Conn
-	readers []*bufio.Reader
-	writers []*lockedWriter
+	conns      []net.Conn
+	readers    []*bufio.Reader
+	writers    []*lockedWriter
+	busSenders []*connSender
 
 	mu        sync.Mutex
 	inflight  map[uint64]*inflightEntry
@@ -116,6 +189,7 @@ func NewClient(config *Config, clientId, intervalMs, resendMs uint64, label stri
 		conns:         make([]net.Conn, config.N),
 		readers:       make([]*bufio.Reader, config.N),
 		writers:       make([]*lockedWriter, config.N),
+		busSenders:    make([]*connSender, config.N),
 		inflight:      make(map[uint64]*inflightEntry),
 		rInflight:     make(map[uint64]*reqInflight),
 	}
@@ -156,6 +230,7 @@ func (c *Client) Connect() error {
 		}
 		c.readers[i] = bufio.NewReader(c.conns[i])
 		c.writers[i] = &lockedWriter{w: bufio.NewWriter(c.conns[i])}
+		c.busSenders[i] = newConnSender(c.writers[i], c.self, i)
 		Notice("[%s] connected to replica %d (%s)", c.self, i, addr)
 	}
 	return nil
@@ -251,9 +326,9 @@ func (c *Client) dataPhaseStartWallNs() int64 {
 }
 
 // busLoop targets the promised wall-clock schedule directly (base + k*interval)
-// rather than free-running from whenever the start-delay sleep happened to
-// wake, so actual departures track the schedule the replicas order by to
-// within sleep jitter instead of drifting several ms late.
+// rather than free-running from whenever the 5s sleep happened to wake, so
+// actual departures track the schedule the replicas order by to within sleep
+// jitter instead of drifting several ms late.
 func (c *Client) busLoop() {
 	intervalNs := int64(c.intervalMs) * 1e6
 	base := c.dataPhaseStartWallNs()
@@ -320,10 +395,13 @@ func (c *Client) sendBus() {
 		SendTimeNs: uint64(now),
 		Requests:   reqs,
 	}
-	for i, lw := range c.writers {
-		if err := lw.sendMsg(MsgBus, &msg); err != nil {
-			Warning("[%s] send bus to replica %d failed: %v", c.self, i, err)
-		}
+	// Marshal once; every sender reads the same byte slice (never mutated).
+	var wire bytes.Buffer
+	wire.WriteByte(MsgBus)
+	msg.Marshal(&wire)
+	b := wire.Bytes()
+	for i := range c.busSenders {
+		c.busSenders[i].enqueue(b)
 	}
 }
 
