@@ -3,3 +3,4 @@ paxosbus/logs/
 prev/
 *.MD
 *.env 
+.venv/
