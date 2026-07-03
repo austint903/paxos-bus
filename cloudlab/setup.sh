@@ -84,6 +84,12 @@ $SUDO env PATH="/usr/local/go/bin:$PATH" GOCACHE=/local/.gocache CGO_ENABLED=0 \
 $SUDO env PATH="/usr/local/go/bin:$PATH" GOCACHE=/local/.gocache CGO_ENABLED=0 \
     "$GO" build -C "$SRC" -o "$BIN/paxosbus-client"  ./paxosbus/cmd/paxosbus-client
 
+# Root swiftpaxos binary (paxos/epaxos master+server+client, one binary — used
+# by run-swiftpaxos-cloudlab.sh; mirrors Dockerfile.swiftpaxos's build).
+log "building swiftpaxos -> $BIN"
+$SUDO env PATH="/usr/local/go/bin:$PATH" GOCACHE=/local/.gocache CGO_ENABLED=0 \
+    "$GO" build -C "$SRC" -o "$BIN/swiftpaxos" .
+
 # World-readable/executable so your user can run them even though root built them.
 $SUDO chmod -R a+rX "$WORK"
 $SUDO touch "$WORK/setup.done"
