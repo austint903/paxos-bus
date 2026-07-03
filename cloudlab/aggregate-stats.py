@@ -7,6 +7,12 @@ Parses:
   paxosbus-client-*.log  COMMITTED lines -> request RTT (total= gen->quorum,
                          includes the wait to board a bus) + committed
                          throughput, per client / per region / aggregated.
+                         Throughput counts only commits inside each client's
+                         fixed duration_s window (from run-meta.txt), anchored
+                         at its first generated request, divided by duration_s
+                         -- so it can never exceed the offered load. Requests
+                         in flight at the cutoff or generated after it don't
+                         count. Latency stats still use every commit.
   replica-*.log          per-second "1s: received=" lines -> bus-message
                          delivery rate per replica + gap/noop/backlog health.
 
@@ -47,7 +53,10 @@ def fmt_lat(vals):
 
 
 def parse_clients(run_dir):
-    clients = {}  # cid -> {"label": str, "lat": [us], "t0": s, "t1": s}
+    # cid -> {"label": str, "lat": [us], "commits": [s], "gen0": s, "t1": s}
+    # gen0 = first request-generation time (commit time minus total latency);
+    # the throughput window is [gen0, gen0 + duration_s] in the client's clock.
+    clients = {}
     for path in sorted(glob.glob(os.path.join(run_dir, "*client-*.log"))):
         with open(path, errors="replace") as f:
             for line in f:
@@ -58,11 +67,25 @@ def parse_clients(run_dir):
                 # log timestamps: day + HHMMSS + 4 frac digits of 100us units
                 t = (int(day) * 86400 + int(hh) * 3600 + int(mm) * 60
                      + int(ss) + int(frac) / 10000.0)
+                total = int(total)
                 c = clients.setdefault(int(cid), {
-                    "label": label or "?", "lat": [], "t0": t, "t1": t})
-                c["lat"].append(int(total))
+                    "label": label or "?", "lat": [], "commits": [],
+                    "gen0": t - total / 1e6, "t1": t})
+                c["lat"].append(total)
+                c["commits"].append(t)
+                c["gen0"] = min(c["gen0"], t - total / 1e6)
                 c["t1"] = t
     return clients
+
+
+def read_duration_s(run_dir):
+    path = os.path.join(run_dir, "run-meta.txt")
+    if os.path.exists(path):
+        with open(path) as f:
+            meta = dict(line.strip().split("=", 1) for line in f if "=" in line)
+        if "duration_s" in meta:
+            return float(meta["duration_s"])
+    return None
 
 
 def parse_replicas(run_dir):
@@ -102,13 +125,21 @@ def main():
     if not clients:
         print("  no COMMITTED lines found in client logs")
     else:
+        duration = read_duration_s(run_dir)
+        if duration is None:
+            print("  (no run-meta.txt duration_s; throughput window = first "
+                  "generation -> last commit)")
         print("\n-- per client (request RTT = generation -> quorum commit) --")
         total_tput = 0.0
         by_region = {}
         for cid in sorted(clients):
             c = clients[cid]
-            span = max(c["t1"] - c["t0"], 1e-9)
-            tput = (len(c["lat"]) - 1) / span if len(c["lat"]) > 1 else 0.0
+            if duration is not None:
+                cutoff = c["gen0"] + duration
+                tput = sum(1 for t in c["commits"] if t <= cutoff) / duration
+            else:
+                span = max(c["t1"] - c["gen0"], 1e-9)
+                tput = len(c["commits"]) / span
             total_tput += tput
             by_region.setdefault(c["label"], []).extend(c["lat"])
             print(f"  client {cid:2d} [{c['label']:8s}]  committed/s={tput:7.1f}  {fmt_lat(c['lat'])}")
