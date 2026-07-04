@@ -129,10 +129,13 @@ func (gs *gapState) snapshotAskers() []uint32 {
 	return out
 }
 
-const (
-	gapDelta           = 5 * time.Second
-	gapProtocolTimeout = 3 * time.Second
-)
+// defaultGapDeltaMs is the default Δ: how far past a slot's expected arrival
+// time a replica waits before treating it as a gap. The client announces its
+// first-send instant as the line's base, so Δ must stay ≥ the max one-way
+// delay plus prediction error — keep it generous, msgs are rarely dropped.
+const defaultGapDeltaMs = 5000
+
+const gapProtocolTimeout = 3 * time.Second
 
 type dropMode uint8
 
@@ -213,8 +216,9 @@ type Replica struct {
 	durable    *durableLog // BusMessage Log: slot -> bus (replica.log)
 	reqListLog *durableLog // Request Log List: log_index -> deduped request (requestlist.log)
 
-	dropMode  dropMode
-	dropEvery uint64
+	dropMode   dropMode
+	dropEvery  uint64
+	gapDeltaNs int64
 
 	winRecv       uint64
 	winDeltaSumUs int64
@@ -227,16 +231,20 @@ type Replica struct {
 	winReplyMax   int
 }
 
-func NewReplica(config *Config, idx int, label, logDir string, mode dropMode, every uint64) *Replica {
+func NewReplica(config *Config, idx int, label, logDir string, mode dropMode, every uint64, gapDeltaMs uint64) *Replica {
 	self := "Replica " + strconv.Itoa(idx)
 	if label != "" {
 		self += " " + label
+	}
+	if gapDeltaMs == 0 {
+		gapDeltaMs = defaultGapDeltaMs
 	}
 	r := &Replica{
 		config:       config,
 		idx:          idx,
 		viewId:       0,
 		self:         self,
+		gapDeltaNs:   int64(gapDeltaMs) * 1e6,
 		clients:      make(map[uint64]*clientLine),
 		globalLog:    make(map[uint64]*globalEntry),
 		dedup:        make(map[reqKey]uint64),
@@ -271,8 +279,8 @@ func NewReplica(config *Config, idx int, label, logDir string, mode dropMode, ev
 	if r.AmLeader() {
 		leader = "yes"
 	}
-	Notice("[%s] started (view=0, f=%d, quorum=%d, leader=%s)",
-		r.self, config.F, config.QuorumSize(), leader)
+	Notice("[%s] started (view=0, f=%d, quorum=%d, leader=%s, gap_delta=%dms)",
+		r.self, config.F, config.QuorumSize(), leader, r.gapDeltaNs/1e6)
 	if r.dropMode != dropNone && r.dropEvery > 0 {
 		Notice("[%s] artificial drop enabled: mode=%s every=%d (drop slot when reqId%%%d==0)",
 			r.self, r.dropMode, r.dropEvery, r.dropEvery)
@@ -435,13 +443,13 @@ func (r *Replica) clientListener(conn net.Conn) {
 func (r *Replica) handleSync(msg *BusSyncMessage) {
 	r.mu.Lock()
 	r.clients[msg.ClientId] = &clientLine{
-		baseNs:     int64(msg.SendTimeNs) + int64(msg.StartDelayMs)*1e6,
+		baseNs:     int64(msg.FirstMsgNs),
 		intervalNs: int64(msg.IntervalMs) * 1e6,
 	}
 	r.resetCursorLocked()
 	r.mu.Unlock()
-	Notice("[%s] sync from client %d: interval=%dms",
-		r.self, msg.ClientId, msg.IntervalMs)
+	Notice("[%s] sync from client %d: first msg expected at %dns (in %dms), interval=%dms",
+		r.self, msg.ClientId, msg.FirstMsgNs, (int64(msg.FirstMsgNs)-wallNs())/1e6, msg.IntervalMs)
 }
 
 func (r *Replica) resetCursorLocked() {
@@ -707,7 +715,7 @@ func (r *Replica) advanceNextExpectedLocked() {
 // in memory (globalLog/slotMeta) below nextExpected. Without this these maps grow
 // ~one entry per request forever, and the rising GC pressure is the leading
 // suspect for the mid-run stall. The window stays well above the gap-recovery
-// window (gapDelta 5s + gapProtocolTimeout 3s ≈ 8s of traffic, ~16k slots at the
+// window (gap Δ default 5s + gapProtocolTimeout 3s ≈ 8s of traffic, ~16k slots at the
 // benchmark's ~2k/s) so a lagging peer's gap request is still answerable from
 // memory; older slots live only in the durable log. drop-mode none never gaps,
 // so this is a pure memory win for the current runs.
@@ -1057,7 +1065,7 @@ func (r *Replica) gapDetectLoop() {
 				if !ok {
 					continue
 				}
-				if wallNow <= meta.expectedNs+int64(gapDelta) {
+				if wallNow <= meta.expectedNs+r.gapDeltaNs {
 					continue
 				}
 				key := gapKey{slot}

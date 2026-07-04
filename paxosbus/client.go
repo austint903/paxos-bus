@@ -237,12 +237,15 @@ func (c *Client) Connect() error {
 }
 
 func (c *Client) Run() {
+	// The sync message announces the arrival-prediction line the replicas order
+	// by: expect this client's msg n at FirstMsgNs + (n-1)*interval. FirstMsgNs
+	// is our first-send instant; the replica-side Δ absorbs the one-way delay
+	// and any prediction error on top of it.
 	c.syncWallNs = wallNs()
 	syncMsg := BusSyncMessage{
-		ClientId:     c.clientId,
-		SendTimeNs:   uint64(c.syncWallNs),
-		IntervalMs:   c.intervalMs,
-		StartDelayMs: c.startDelayMs,
+		ClientId:   c.clientId,
+		FirstMsgNs: uint64(c.dataPhaseStartWallNs()),
+		IntervalMs: c.intervalMs,
 	}
 	for i, lw := range c.writers {
 		lw.mu.Lock()
@@ -260,11 +263,11 @@ func (c *Client) Run() {
 		go c.receiveLoop(i)
 	}
 
-	// Sleep until the promised data-phase start on the same wall clock the
-	// replicas use for expected arrival times: base = syncWallNs + startDelay.
-	// Sleeping a fixed duration from "after sync send" instead would shift every
-	// actual departure a few ms past the promised schedule, and with multiple
-	// clients each replica's in-order log append waits for the LATEST client.
+	// Sleep until the FirstMsgNs instant announced in the sync message, on the
+	// same wall clock the replicas use for expected arrival times. Sleeping a
+	// fixed duration from "after sync send" instead would shift every actual
+	// departure a few ms past the announced schedule, and with multiple clients
+	// each replica's in-order log append waits for the LATEST client.
 	if sleep := c.dataPhaseStartWallNs() - wallNs(); sleep > 0 {
 		time.Sleep(time.Duration(sleep))
 	}

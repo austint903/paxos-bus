@@ -17,6 +17,8 @@ func main() {
 		"artificial drop scenario: none|leader|followers|all (gap-agreement testing)")
 	dropEvery := flag.Uint64("drop-every", 0,
 		"drop a slot when requestId %% drop-every == 0 (0 = disabled)")
+	gapDeltaMs := flag.Uint64("gap-delta-ms", 5000,
+		"how long past a slot's expected arrival before it is treated as a gap; must exceed max one-way delay + prediction error")
 	flag.Parse()
 
 	if *configPath == "" || *index < 0 {
@@ -41,7 +43,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	replica := paxosbus.NewReplica(config, *index, *label, *logDir, mode, *dropEvery)
+	replica := paxosbus.NewReplica(config, *index, *label, *logDir, mode, *dropEvery, *gapDeltaMs)
 	if err := replica.Run(); err != nil {
 		fmt.Fprintf(os.Stderr, "replica failed: %v\n", err)
 		os.Exit(1)

@@ -52,10 +52,9 @@ type wireMsg interface {
 }
 
 type BusSyncMessage struct {
-	ClientId     uint64
-	SendTimeNs   uint64
-	IntervalMs   uint64
-	StartDelayMs uint64
+	ClientId   uint64
+	FirstMsgNs uint64 // wall-clock ns when the replica should expect this client's first bus
+	IntervalMs uint64 // bus interval; expect msg n at FirstMsgNs + (n-1)*IntervalMs
 }
 
 type BusRequestMessage struct {
@@ -79,23 +78,21 @@ func (m *BusSyncMessage) New() fastrpc.Serializable {
 }
 
 func (m *BusSyncMessage) Marshal(wire io.Writer) {
-	var b [32]byte
+	var b [24]byte
 	binary.LittleEndian.PutUint64(b[0:8], m.ClientId)
-	binary.LittleEndian.PutUint64(b[8:16], m.SendTimeNs)
+	binary.LittleEndian.PutUint64(b[8:16], m.FirstMsgNs)
 	binary.LittleEndian.PutUint64(b[16:24], m.IntervalMs)
-	binary.LittleEndian.PutUint64(b[24:32], m.StartDelayMs)
 	wire.Write(b[:])
 }
 
 func (m *BusSyncMessage) Unmarshal(wire io.Reader) error {
-	var b [32]byte
+	var b [24]byte
 	if _, err := io.ReadFull(wire, b[:]); err != nil {
 		return err
 	}
 	m.ClientId = binary.LittleEndian.Uint64(b[0:8])
-	m.SendTimeNs = binary.LittleEndian.Uint64(b[8:16])
+	m.FirstMsgNs = binary.LittleEndian.Uint64(b[8:16])
 	m.IntervalMs = binary.LittleEndian.Uint64(b[16:24])
-	m.StartDelayMs = binary.LittleEndian.Uint64(b[24:32])
 	return nil
 }
 
