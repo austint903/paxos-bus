@@ -130,9 +130,9 @@ func (gs *gapState) snapshotAskers() []uint32 {
 }
 
 // defaultGapDeltaMs is the default Δ: how far past a slot's expected arrival
-// time a replica waits before treating it as a gap. The client announces its
-// first-send instant as the line's base, so Δ must stay ≥ the max one-way
-// delay plus prediction error — keep it generous, msgs are rarely dropped.
+// time a replica waits before treating it as a gap. The line's base is a true
+// arrival instant (the client departs maxOWD early), so Δ only has to absorb
+// jitter around the line — it stays generous anyway, msgs are rarely dropped.
 const defaultGapDeltaMs = 5000
 
 const gapProtocolTimeout = 3 * time.Second

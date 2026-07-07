@@ -53,7 +53,7 @@ type wireMsg interface {
 
 type BusSyncMessage struct {
 	ClientId   uint64
-	FirstMsgNs uint64 // wall-clock ns when the replica should expect this client's first bus
+	FirstMsgNs uint64 // wall-clock ns when this client's first bus ARRIVES (it departs maxOWD earlier)
 	IntervalMs uint64 // bus interval; expect msg n at FirstMsgNs + (n-1)*IntervalMs
 }
 

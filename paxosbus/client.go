@@ -138,6 +138,15 @@ type Client struct {
 	startDelayMs  uint64
 	syncWallNs    int64
 
+	// maxOwdNs is the worst one-way delay from this client to any replica.
+	// The sync message announces an ARRIVAL schedule, so every bus departs
+	// maxOwdNs before its announced line instant — by that instant it has
+	// reached even the farthest replica. 0 until Connect() measures it (or a
+	// -owd override is given); replicas ordering on the same lines then stop
+	// paying this client's inbound delay before appending later slots.
+	maxOwdNs int64
+	owdAuto  bool
+
 	conns      []net.Conn
 	readers    []*bufio.Reader
 	writers    []*lockedWriter
@@ -167,7 +176,8 @@ type Client struct {
 }
 
 func NewClient(config *Config, clientId, intervalMs, resendMs uint64, label string,
-	requestGen bool, genIntervalUs uint64, verbose bool, startDelayMs uint64) *Client {
+	requestGen bool, genIntervalUs uint64, verbose bool, startDelayMs uint64,
+	maxOwdMs float64) *Client {
 	self := "Client " + strconv.FormatUint(clientId, 10)
 	if label != "" {
 		self += " " + label
@@ -186,6 +196,8 @@ func NewClient(config *Config, clientId, intervalMs, resendMs uint64, label stri
 		reqTimeoutNs:  int64(resendMs) * 1e6,
 		verbose:       verbose,
 		startDelayMs:  startDelayMs,
+		maxOwdNs:      int64(maxOwdMs * 1e6),
+		owdAuto:       maxOwdMs == 0,
 		conns:         make([]net.Conn, config.N),
 		readers:       make([]*bufio.Reader, config.N),
 		writers:       make([]*lockedWriter, config.N),
@@ -214,10 +226,14 @@ func NewClient(config *Config, clientId, intervalMs, resendMs uint64, label stri
 }
 
 func (c *Client) Connect() error {
+	var maxDialRtt time.Duration
 	for i, addr := range c.config.Replicas {
+		var dialRtt time.Duration
 		for {
+			t0 := time.Now()
 			conn, err := net.DialTimeout("tcp", addr, 3*time.Second)
 			if err == nil {
+				dialRtt = time.Since(t0)
 				c.conns[i] = conn
 				break
 			}
@@ -225,22 +241,41 @@ func (c *Client) Connect() error {
 				c.self, i, addr, err)
 			time.Sleep(time.Second)
 		}
+		if dialRtt > maxDialRtt {
+			maxDialRtt = dialRtt
+		}
 		if tc, ok := c.conns[i].(*net.TCPConn); ok {
 			tc.SetNoDelay(true)
 		}
 		c.readers[i] = bufio.NewReader(c.conns[i])
 		c.writers[i] = &lockedWriter{w: bufio.NewWriter(c.conns[i])}
 		c.busSenders[i] = newConnSender(c.writers[i], c.self, i)
-		Notice("[%s] connected to replica %d (%s)", c.self, i, addr)
+		Notice("[%s] connected to replica %d (%s)  dial_rtt=%.2fms",
+			c.self, i, addr, float64(dialRtt)/1e6)
 	}
+	// The TCP handshake (SYN -> SYN-ACK) is one round trip, so the slowest
+	// dial estimates the worst RTT to any replica without extra protocol.
+	if c.owdAuto {
+		c.maxOwdNs = int64(maxDialRtt) / 2
+	}
+	src := "-owd override"
+	if c.owdAuto {
+		src = "max dial RTT / 2"
+	}
+	Notice("[%s] max one-way delay %.2fms (%s): buses depart that far ahead of the announced arrival schedule",
+		c.self, float64(c.maxOwdNs)/1e6, src)
 	return nil
 }
 
 func (c *Client) Run() {
 	// The sync message announces the arrival-prediction line the replicas order
 	// by: expect this client's msg n at FirstMsgNs + (n-1)*interval. FirstMsgNs
-	// is our first-send instant; the replica-side Δ absorbs the one-way delay
-	// and any prediction error on top of it.
+	// is a true ARRIVAL instant: msg n departs maxOwdNs earlier (see
+	// firstSendWallNs), so it reaches the farthest replica right on its line
+	// and nearer replicas early. Ordering by send instants instead made every
+	// in-order append (and thus every reply) wait out the slowest inbound
+	// region's one-way delay past the line — the straggler penalty; now the
+	// replica-side Δ only has to absorb jitter around the line, not the delay.
 	c.syncWallNs = wallNs()
 	syncMsg := BusSyncMessage{
 		ClientId:   c.clientId,
@@ -263,12 +298,12 @@ func (c *Client) Run() {
 		go c.receiveLoop(i)
 	}
 
-	// Sleep until the FirstMsgNs instant announced in the sync message, on the
-	// same wall clock the replicas use for expected arrival times. Sleeping a
-	// fixed duration from "after sync send" instead would shift every actual
-	// departure a few ms past the announced schedule, and with multiple clients
-	// each replica's in-order log append waits for the LATEST client.
-	if sleep := c.dataPhaseStartWallNs() - wallNs(); sleep > 0 {
+	// Sleep until maxOwdNs BEFORE the FirstMsgNs instant announced in the sync
+	// message, on the same wall clock the replicas use for expected arrival
+	// times. Sleeping a fixed duration from "after sync send" instead would
+	// shift every actual arrival past the announced schedule, and with multiple
+	// clients each replica's in-order log append waits for the LATEST client.
+	if sleep := c.firstSendWallNs() - wallNs(); sleep > 0 {
 		time.Sleep(time.Duration(sleep))
 	}
 
@@ -323,18 +358,25 @@ func (c *Client) genLoop() {
 }
 
 // dataPhaseStartWallNs is the wall-clock instant promised to the replicas in
-// the sync message: bus/request n is expected at start + (n-1)*interval.
+// the sync message: bus/request n is expected to ARRIVE at start + (n-1)*interval.
 func (c *Client) dataPhaseStartWallNs() int64 {
 	return c.syncWallNs + int64(c.startDelayMs)*1e6
 }
 
-// busLoop targets the promised wall-clock schedule directly (base + k*interval)
-// rather than free-running from whenever the 5s sleep happened to wake, so
-// actual departures track the schedule the replicas order by to within sleep
-// jitter instead of drifting several ms late.
+// firstSendWallNs is when buses actually start departing: maxOwdNs before the
+// announced arrival line, so bus n reaches even the farthest replica by its
+// line instant instead of one one-way delay after it.
+func (c *Client) firstSendWallNs() int64 {
+	return c.dataPhaseStartWallNs() - c.maxOwdNs
+}
+
+// busLoop targets the promised wall-clock schedule (shifted maxOwdNs early,
+// base + k*interval) rather than free-running from whenever the 5s sleep
+// happened to wake, so actual arrivals track the schedule the replicas order
+// by to within sleep jitter instead of drifting several ms late.
 func (c *Client) busLoop() {
 	intervalNs := int64(c.intervalMs) * 1e6
-	base := c.dataPhaseStartWallNs()
+	base := c.firstSendWallNs()
 	next := base
 	curEpoch := int64(0)
 	for {
@@ -443,7 +485,7 @@ func (c *Client) reqTimeoutLoop() {
 // busLoop (see there).
 func (c *Client) sendLoop() {
 	intervalNs := int64(c.intervalMs) * 1e6
-	base := c.dataPhaseStartWallNs()
+	base := c.firstSendWallNs()
 	nextSendNs := base
 	curEpoch := int64(0)
 	for {
