@@ -3,6 +3,7 @@ package paxosbus
 import (
 	"bufio"
 	"bytes"
+	crand "crypto/rand"
 	"math/bits"
 	"net"
 	"strconv"
@@ -11,6 +12,17 @@ import (
 )
 
 const defaultStartDelayMs = 5000
+
+// requestOp is the per-request payload: "hello" plus 12 random pad bytes so
+// the on-wire request (28-byte header + 17-byte op = 45 bytes) matches the
+// 45-byte swiftpaxos Propose that the paxos/epaxos baselines send
+// (commandsize 16). Shared across requests; never mutated after init.
+var requestOp = func() []byte {
+	op := make([]byte, 17)
+	copy(op, "hello")
+	crand.Read(op[5:])
+	return op
+}()
 
 type inflightEntry struct {
 	sendTimeNs      int64
@@ -345,7 +357,7 @@ func (c *Client) genLoop() {
 				ClientId:   c.clientId,
 				RequestId:  rid,
 				SendTimeNs: uint64(now), // generation time; per-request latency clock starts here
-				Op:         []byte("hello"),
+				Op:         requestOp,
 			})
 			c.pendingMu.Unlock()
 			next += intervalNs
@@ -529,7 +541,7 @@ func (c *Client) sendRequest(reqId, origReqId uint64, firstSendNs int64, attempt
 		ClientId:   c.clientId,
 		RequestId:  reqId,
 		SendTimeNs: uint64(now),
-		Op:         []byte("hello"),
+		Op:         requestOp,
 	}
 	for i, lw := range c.writers {
 		if err := lw.send(MsgBusRequest, &msg); err != nil {
