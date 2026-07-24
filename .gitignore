@@ -1,3 +1,8 @@
+# Generated per-run configs (rewritten by the run scripts each invocation)
+config-cloudlab/
+config-paxosbus/
+config-swiftpaxos/
+
 # Per-run log archives written by run-paxosbus.sh / run-gcp.sh
 paxosbus/logs/
 prev/
