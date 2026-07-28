@@ -341,8 +341,7 @@ func (c *Client) Run() {
 	c.sendLoop()
 }
 
-// genLoop produces requests at a fixed rate into c.pending. SendTimeNs is
-// stamped here, so latency counts each request's wait for a bus.
+// genLoop produces requests at a fixed rate into c.pending. SendTimeNs isstamped , so latency counts each request wait for a bus.
 func (c *Client) genLoop() {
 	intervalNs := int64(c.genIntervalUs) * 1000
 	if intervalNs <= 0 {
@@ -371,22 +370,17 @@ func (c *Client) genLoop() {
 	}
 }
 
-// dataPhaseStartWallNs is the wall-clock instant promised to the replicas in
-// the sync message: bus/request n is expected to ARRIVE at start + (n-1)*interval.
+// dataPhaseStartWallNs is the wall-clock instant to the replicas in the sync message: bus n is expected to ARRIVE at start + (n-1)*interval.
 func (c *Client) dataPhaseStartWallNs() int64 {
 	return c.syncWallNs + int64(c.startDelayMs)*1e6
 }
 
-// firstSendWallNs is when buses actually start departing: maxOwdNs before the
-// announced arrival line, so bus n reaches even the farthest replica by its
-// line instant instead of one one-way delay after it.
+// firstSendWallNs is when buses actually start departing: bus n reaches even the farthest replica by its line  instead of one one-way delay after it.
 func (c *Client) firstSendWallNs() int64 {
 	return c.dataPhaseStartWallNs() - c.maxOwdNs
 }
 
-// runOnSchedule fires tick at base, base+interval, base+2*interval, ... Aiming
-// at absolute instants rather than sleeping for interval keeps departures on
-// the line the replicas order by: sleep jitter cannot accumulate into drift.
+// runOnSchedule fires at base, base+interval, base+2*interval,
 func (c *Client) runOnSchedule(base, intervalNs int64, tick func()) {
 	next := base
 	curEpoch := int64(0)
@@ -407,13 +401,12 @@ func (c *Client) runOnSchedule(base, intervalNs int64, tick func()) {
 	}
 }
 
-// busLoop departs one bus per interval on the announced schedule.
+// busLoop departs one bus per interval on schedule.
 func (c *Client) busLoop() {
 	c.runOnSchedule(c.firstSendWallNs(), int64(c.intervalMs)*1e6, c.sendBus)
 }
 
-// sendBus drains the pending and retry buffers into one bus, marshals it once,
-// and hands the same byte slice to every replica's sender.
+// sendBus drains the pending and retry buffers into one bus, marshals it once, and hands to every replica's sender.
 func (c *Client) sendBus() {
 	c.pendingMu.Lock()
 	batch := c.pending
@@ -437,8 +430,7 @@ func (c *Client) sendBus() {
 		rid := reqs[i].RequestId
 		e := c.rInflight[rid]
 		if e == nil {
-			// firstSendNs = generation time (stamped in genLoop) so per-request
-			// latency includes the wait in c.pending before boarding this bus.
+			// firstSendNs = generation time
 			genNs := int64(reqs[i].SendTimeNs)
 			if genNs == 0 {
 				genNs = now
@@ -458,7 +450,7 @@ func (c *Client) sendBus() {
 		SendTimeNs: uint64(now),
 		Requests:   reqs,
 	}
-	// Marshal once; every sender reads the same byte slice (never mutated).
+	// Marshal once
 	var wire bytes.Buffer
 	wire.WriteByte(MsgBus)
 	msg.Marshal(&wire)
@@ -468,8 +460,8 @@ func (c *Client) sendBus() {
 	}
 }
 
-// reqTimeoutLoop re-boards requests that missed quorum onto the next bus. The
-// request id is kept, so the replica's dedup returns the log index it had.
+// reqTimeoutLoop reboard requests that missed quorum onto next bus
+// request id s kept, so dedup returns the log index
 func (c *Client) reqTimeoutLoop() {
 	tick := time.Duration(c.resendMs) * time.Millisecond / 4
 	if tick < time.Millisecond {
@@ -501,8 +493,7 @@ func (c *Client) reqTimeoutLoop() {
 	}
 }
 
-// sendLoop is the open-loop mode: one unbatched request per interval, on the
-// same schedule busLoop uses.
+// sendLoop is open-loop mode, one unbatched request per interval, on the same schedule busLoop uses.
 func (c *Client) sendLoop() {
 	c.runOnSchedule(c.firstSendWallNs(), int64(c.intervalMs)*1e6, func() {
 		c.mu.Lock()
@@ -513,8 +504,7 @@ func (c *Client) sendLoop() {
 	})
 }
 
-// sendRequest sends one request to every replica. origReqId and attempts carry
-// across resends, so latency is still measured from the first attempt.
+// sendRequest sends one request to every replica. origReqId and attempts same across resends, so latency is still from the first attempt.
 func (c *Client) sendRequest(reqId, origReqId uint64, firstSendNs int64, attempts uint32) {
 	now := nowNs()
 	if firstSendNs == 0 {
@@ -543,8 +533,7 @@ func (c *Client) sendRequest(reqId, origReqId uint64, firstSendNs int64, attempt
 	}
 }
 
-// receiveLoop reads replies from one replica; one goroutine per connection, so
-// a slow replica cannot delay another's votes.
+// receiveLoop reads replies from one replica, one goroutine per connection
 func (c *Client) receiveLoop(rid int) {
 	reader := c.readers[rid]
 	var (
@@ -578,15 +567,13 @@ func (c *Client) receiveLoop(rid int) {
 	}
 }
 
-// quorumReached reports whether mask holds a quorum including the leader of
-// viewId. A bare majority is not enough — the leader's vote is what commits.
+// quorumReached reports whether mask holds quorum including the leader of viewId
 func (c *Client) quorumReached(mask uint32, viewId uint64) bool {
 	return bits.OnesCount32(mask) >= c.config.QuorumSize() &&
 		mask&(uint32(1)<<c.config.LeaderIndex(viewId)) != 0
 }
 
-// recordCommitLocked folds one commit's latency into the cumulative and
-// per-second counters.
+// recordCommitLocked puts a commit latency into the cumulative and per-second counters
 func (c *Client) recordCommitLocked(latencyUs int64) {
 	c.committedCount++
 	c.totalRttUs += uint64(latencyUs)
@@ -594,9 +581,7 @@ func (c *Client) recordCommitLocked(latencyUs int64) {
 	c.winRttSumUs += uint64(latencyUs)
 }
 
-// handleRequestReply counts one replica's vote. Votes are keyed by log index,
-// not by request: a re-boarded request can land at different indexes on
-// different replicas, and a quorum only counts if it agrees on one.
+// handleRequestReply counts one replicas vote. keyed by log index, a re-boarded request can land at different indexes on different replicas
 func (c *Client) handleRequestReply(msg *RequestReplyMessage) {
 	now := nowNs()
 
@@ -626,10 +611,6 @@ func (c *Client) handleRequestReply(msg *RequestReplyMessage) {
 	}
 	c.mu.Unlock()
 
-	// Per-reply lines are gated: at thousands of requests/s this is 3 log
-	// syscalls per request through the global log mutex, which the receive
-	// goroutines serialize on. COMMITTED (with total= gen->quorum latency) is
-	// always logged — it is what the stats aggregation parses.
 	if c.verbose {
 		Notice("[%s] REPLY from replica=%d  rtt=%dus  req=%d  bus_slot=%d  log_index=%d",
 			c.self, msg.ReplicaIdx, replyRttUs, msg.RequestId, msg.BusSlotNum, msg.LogIndex)
@@ -640,8 +621,7 @@ func (c *Client) handleRequestReply(msg *RequestReplyMessage) {
 	}
 }
 
-// handleBusReply counts one replica's vote for a bus. The bitmask makes
-// duplicate replies idempotent; the entry is retired once every replica answers.
+// handleBusReply counts one replica's vote for a bus bitmask makes op idemotent
 func (c *Client) handleBusReply(msg *BusReplyMessage) {
 	now := nowNs()
 
