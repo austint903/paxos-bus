@@ -341,7 +341,8 @@ func (c *Client) Run() {
 	c.sendLoop()
 }
 
-// genLoop produces requests at a fixed rate into c.pending. SendTimeNs isstamped , so latency counts each request wait for a bus.
+// genLoop produces requests at a fixed rate into c.pending, stamping SendTimeNs
+// so that latency counts each request's wait for a bus
 func (c *Client) genLoop() {
 	intervalNs := int64(c.genIntervalUs) * 1000
 	if intervalNs <= 0 {
@@ -370,17 +371,20 @@ func (c *Client) genLoop() {
 	}
 }
 
-// dataPhaseStartWallNs is the wall-clock instant to the replicas in the sync message: bus n is expected to ARRIVE at start + (n-1)*interval.
+// dataPhaseStartWallNs is the wall-clock instant announced to the replicas in
+// the sync message, where bus n is expected to arrive at start + (n-1)*interval
 func (c *Client) dataPhaseStartWallNs() int64 {
 	return c.syncWallNs + int64(c.startDelayMs)*1e6
 }
 
-// firstSendWallNs is when buses actually start departing: bus n reaches even the farthest replica by its line  instead of one one-way delay after it.
+// firstSendWallNs is when buses actually start departing, early enough that bus
+// n reaches even the farthest replica by its line instant instead of one one-way
+// delay after it
 func (c *Client) firstSendWallNs() int64 {
 	return c.dataPhaseStartWallNs() - c.maxOwdNs
 }
 
-// runOnSchedule fires at base, base+interval, base+2*interval,
+// runOnSchedule fires tick at base, base+interval, base+2*interval, and so on
 func (c *Client) runOnSchedule(base, intervalNs int64, tick func()) {
 	next := base
 	curEpoch := int64(0)
@@ -401,12 +405,13 @@ func (c *Client) runOnSchedule(base, intervalNs int64, tick func()) {
 	}
 }
 
-// busLoop departs one bus per interval on schedule.
+// busLoop departs one bus per interval on the announced schedule
 func (c *Client) busLoop() {
 	c.runOnSchedule(c.firstSendWallNs(), int64(c.intervalMs)*1e6, c.sendBus)
 }
 
-// sendBus drains the pending and retry buffers into one bus, marshals it once, and hands to every replica's sender.
+// sendBus drains the pending and retry buffers into one bus, marshals it once,
+// and hands the same bytes to every replica's sender
 func (c *Client) sendBus() {
 	c.pendingMu.Lock()
 	batch := c.pending
@@ -430,7 +435,7 @@ func (c *Client) sendBus() {
 		rid := reqs[i].RequestId
 		e := c.rInflight[rid]
 		if e == nil {
-			// firstSendNs = generation time
+			// firstSendNs is the generation time
 			genNs := int64(reqs[i].SendTimeNs)
 			if genNs == 0 {
 				genNs = now
@@ -450,7 +455,7 @@ func (c *Client) sendBus() {
 		SendTimeNs: uint64(now),
 		Requests:   reqs,
 	}
-	// Marshal once
+	// The bus is marshaled once, since every sender reads the same bytes
 	var wire bytes.Buffer
 	wire.WriteByte(MsgBus)
 	msg.Marshal(&wire)
@@ -460,8 +465,8 @@ func (c *Client) sendBus() {
 	}
 }
 
-// reqTimeoutLoop reboard requests that missed quorum onto next bus
-// request id s kept, so dedup returns the log index
+// reqTimeoutLoop re-boards requests that missed quorum onto the next bus, and
+// the request id is kept so that dedup returns the log index it already had
 func (c *Client) reqTimeoutLoop() {
 	tick := time.Duration(c.resendMs) * time.Millisecond / 4
 	if tick < time.Millisecond {
@@ -493,7 +498,8 @@ func (c *Client) reqTimeoutLoop() {
 	}
 }
 
-// sendLoop is open-loop mode, one unbatched request per interval, on the same schedule busLoop uses.
+// sendLoop is the open-loop mode, sending one unbatched request per interval on
+// the same schedule busLoop uses
 func (c *Client) sendLoop() {
 	c.runOnSchedule(c.firstSendWallNs(), int64(c.intervalMs)*1e6, func() {
 		c.mu.Lock()
@@ -504,7 +510,8 @@ func (c *Client) sendLoop() {
 	})
 }
 
-// sendRequest sends one request to every replica. origReqId and attempts same across resends, so latency is still from the first attempt.
+// sendRequest sends one request to every replica, keeping origReqId and attempts
+// across resends so that latency is still measured from the first attempt
 func (c *Client) sendRequest(reqId, origReqId uint64, firstSendNs int64, attempts uint32) {
 	now := nowNs()
 	if firstSendNs == 0 {
@@ -533,7 +540,7 @@ func (c *Client) sendRequest(reqId, origReqId uint64, firstSendNs int64, attempt
 	}
 }
 
-// receiveLoop reads replies from one replica, one goroutine per connection
+// receiveLoop reads replies from one replica, with one goroutine per connection
 func (c *Client) receiveLoop(rid int) {
 	reader := c.readers[rid]
 	var (
@@ -567,13 +574,15 @@ func (c *Client) receiveLoop(rid int) {
 	}
 }
 
-// quorumReached reports whether mask holds quorum including the leader of viewId
+// quorumReached reports whether mask holds a quorum that includes the leader of
+// viewId
 func (c *Client) quorumReached(mask uint32, viewId uint64) bool {
 	return bits.OnesCount32(mask) >= c.config.QuorumSize() &&
 		mask&(uint32(1)<<c.config.LeaderIndex(viewId)) != 0
 }
 
-// recordCommitLocked puts a commit latency into the cumulative and per-second counters
+// recordCommitLocked adds one commit's latency to the cumulative and per-second
+// counters
 func (c *Client) recordCommitLocked(latencyUs int64) {
 	c.committedCount++
 	c.totalRttUs += uint64(latencyUs)
@@ -581,7 +590,8 @@ func (c *Client) recordCommitLocked(latencyUs int64) {
 	c.winRttSumUs += uint64(latencyUs)
 }
 
-// handleRequestReply counts one replicas vote. keyed by log index, a re-boarded request can land at different indexes on different replicas
+// handleRequestReply counts one replica's vote, keyed by log index because a
+// re-boarded request can land at different indexes on different replicas
 func (c *Client) handleRequestReply(msg *RequestReplyMessage) {
 	now := nowNs()
 
@@ -621,7 +631,8 @@ func (c *Client) handleRequestReply(msg *RequestReplyMessage) {
 	}
 }
 
-// handleBusReply counts one replica's vote for a bus bitmask makes op idemotent
+// handleBusReply counts one replica's vote for a bus, where the bitmask makes
+// duplicate replies idempotent
 func (c *Client) handleBusReply(msg *BusReplyMessage) {
 	now := nowNs()
 
