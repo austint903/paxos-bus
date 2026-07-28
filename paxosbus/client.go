@@ -341,6 +341,8 @@ func (c *Client) Run() {
 	c.sendLoop()
 }
 
+// genLoop produces requests at a fixed rate into c.pending. SendTimeNs is
+// stamped here, so latency counts each request's wait for a bus.
 func (c *Client) genLoop() {
 	intervalNs := int64(c.genIntervalUs) * 1000
 	if intervalNs <= 0 {
@@ -382,19 +384,16 @@ func (c *Client) firstSendWallNs() int64 {
 	return c.dataPhaseStartWallNs() - c.maxOwdNs
 }
 
-// busLoop targets the promised wall-clock schedule (shifted maxOwdNs early,
-// base + k*interval) rather than free-running from whenever the 5s sleep
-// happened to wake, so actual arrivals track the schedule the replicas order
-// by to within sleep jitter instead of drifting several ms late.
-func (c *Client) busLoop() {
-	intervalNs := int64(c.intervalMs) * 1e6
-	base := c.firstSendWallNs()
+// runOnSchedule fires tick at base, base+interval, base+2*interval, ... Aiming
+// at absolute instants rather than sleeping for interval keeps departures on
+// the line the replicas order by: sleep jitter cannot accumulate into drift.
+func (c *Client) runOnSchedule(base, intervalNs int64, tick func()) {
 	next := base
 	curEpoch := int64(0)
 	for {
 		now := wallNs()
 		for now >= next {
-			c.sendBus()
+			tick()
 			next += intervalNs
 			if epoch := (next - base) / int64(time.Second); epoch != curEpoch {
 				c.emitStats()
@@ -408,6 +407,13 @@ func (c *Client) busLoop() {
 	}
 }
 
+// busLoop departs one bus per interval on the announced schedule.
+func (c *Client) busLoop() {
+	c.runOnSchedule(c.firstSendWallNs(), int64(c.intervalMs)*1e6, c.sendBus)
+}
+
+// sendBus drains the pending and retry buffers into one bus, marshals it once,
+// and hands the same byte slice to every replica's sender.
 func (c *Client) sendBus() {
 	c.pendingMu.Lock()
 	batch := c.pending
@@ -462,6 +468,8 @@ func (c *Client) sendBus() {
 	}
 }
 
+// reqTimeoutLoop re-boards requests that missed quorum onto the next bus. The
+// request id is kept, so the replica's dedup returns the log index it had.
 func (c *Client) reqTimeoutLoop() {
 	tick := time.Duration(c.resendMs) * time.Millisecond / 4
 	if tick < time.Millisecond {
@@ -493,35 +501,20 @@ func (c *Client) reqTimeoutLoop() {
 	}
 }
 
-// sendLoop targets the promised wall-clock schedule for the same reason as
-// busLoop (see there).
+// sendLoop is the open-loop mode: one unbatched request per interval, on the
+// same schedule busLoop uses.
 func (c *Client) sendLoop() {
-	intervalNs := int64(c.intervalMs) * 1e6
-	base := c.firstSendWallNs()
-	nextSendNs := base
-	curEpoch := int64(0)
-	for {
-		now := wallNs()
-		for now >= nextSendNs {
-			c.mu.Lock()
-			c.requestId++
-			reqId := c.requestId
-			c.mu.Unlock()
-			c.sendRequest(reqId, reqId, 0, 1)
-			nextSendNs += intervalNs
-
-			if epoch := (nextSendNs - base) / int64(time.Second); epoch != curEpoch {
-				c.emitStats()
-				curEpoch = epoch
-			}
-			now = wallNs()
-		}
-		if sleep := nextSendNs - wallNs(); sleep > 0 {
-			time.Sleep(time.Duration(sleep))
-		}
-	}
+	c.runOnSchedule(c.firstSendWallNs(), int64(c.intervalMs)*1e6, func() {
+		c.mu.Lock()
+		c.requestId++
+		reqId := c.requestId
+		c.mu.Unlock()
+		c.sendRequest(reqId, reqId, 0, 1)
+	})
 }
 
+// sendRequest sends one request to every replica. origReqId and attempts carry
+// across resends, so latency is still measured from the first attempt.
 func (c *Client) sendRequest(reqId, origReqId uint64, firstSendNs int64, attempts uint32) {
 	now := nowNs()
 	if firstSendNs == 0 {
@@ -550,6 +543,8 @@ func (c *Client) sendRequest(reqId, origReqId uint64, firstSendNs int64, attempt
 	}
 }
 
+// receiveLoop reads replies from one replica; one goroutine per connection, so
+// a slow replica cannot delay another's votes.
 func (c *Client) receiveLoop(rid int) {
 	reader := c.readers[rid]
 	var (
@@ -583,6 +578,25 @@ func (c *Client) receiveLoop(rid int) {
 	}
 }
 
+// quorumReached reports whether mask holds a quorum including the leader of
+// viewId. A bare majority is not enough — the leader's vote is what commits.
+func (c *Client) quorumReached(mask uint32, viewId uint64) bool {
+	return bits.OnesCount32(mask) >= c.config.QuorumSize() &&
+		mask&(uint32(1)<<c.config.LeaderIndex(viewId)) != 0
+}
+
+// recordCommitLocked folds one commit's latency into the cumulative and
+// per-second counters.
+func (c *Client) recordCommitLocked(latencyUs int64) {
+	c.committedCount++
+	c.totalRttUs += uint64(latencyUs)
+	c.winCommitted++
+	c.winRttSumUs += uint64(latencyUs)
+}
+
+// handleRequestReply counts one replica's vote. Votes are keyed by log index,
+// not by request: a re-boarded request can land at different indexes on
+// different replicas, and a quorum only counts if it agrees on one.
 func (c *Client) handleRequestReply(msg *RequestReplyMessage) {
 	now := nowNs()
 
@@ -602,20 +616,13 @@ func (c *Client) handleRequestReply(msg *RequestReplyMessage) {
 	e.votes[msg.LogIndex] = mask
 	replyRttUs := (now - e.sendTimeNs) / 1000
 
-	leaderIdx := c.config.LeaderIndex(msg.ViewId)
-	justCommitted := !e.committed &&
-		bits.OnesCount32(mask) >= c.config.QuorumSize() &&
-		mask&(uint32(1)<<leaderIdx) != 0
-
+	justCommitted := !e.committed && c.quorumReached(mask, msg.ViewId)
 	var rttUs, totalUs int64
 	if justCommitted {
 		e.committed = true
 		rttUs = (now - e.sendTimeNs) / 1000
 		totalUs = (now - e.firstSendNs) / 1000 // generation -> commit
-		c.committedCount++
-		c.totalRttUs += uint64(totalUs)
-		c.winCommitted++
-		c.winRttSumUs += uint64(totalUs)
+		c.recordCommitLocked(totalUs)
 	}
 	c.mu.Unlock()
 
@@ -633,6 +640,8 @@ func (c *Client) handleRequestReply(msg *RequestReplyMessage) {
 	}
 }
 
+// handleBusReply counts one replica's vote for a bus. The bitmask makes
+// duplicate replies idempotent; the entry is retired once every replica answers.
 func (c *Client) handleBusReply(msg *BusReplyMessage) {
 	now := nowNs()
 
@@ -651,11 +660,7 @@ func (c *Client) handleBusReply(msg *BusReplyMessage) {
 	e.replyCount++
 	replyRttUs := (now - e.sendTimeNs) / 1000
 
-	leaderIdx := c.config.LeaderIndex(msg.ViewId)
-	justCommitted := !e.committed &&
-		e.replyCount >= c.config.QuorumSize() &&
-		e.replicaMask&(uint32(1)<<leaderIdx) != 0
-
+	justCommitted := !e.committed && c.quorumReached(e.replicaMask, msg.ViewId)
 	var rttUs, totalUs int64
 	var origReqId uint64
 	var attempts uint32
@@ -664,10 +669,7 @@ func (c *Client) handleBusReply(msg *BusReplyMessage) {
 		rttUs = (now - e.sendTimeNs) / 1000
 		totalUs = (now - e.firstSendTimeNs) / 1000
 		origReqId, attempts = e.origReqId, e.attempts
-		c.committedCount++
-		c.totalRttUs += uint64(rttUs)
-		c.winCommitted++
-		c.winRttSumUs += uint64(rttUs)
+		c.recordCommitLocked(rttUs)
 	}
 	postQuorum := 0
 	if e.committed && !justCommitted {
