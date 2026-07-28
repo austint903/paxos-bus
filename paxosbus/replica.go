@@ -440,6 +440,8 @@ func (r *Replica) clientListener(conn net.Conn) {
 	}
 }
 
+// handleSync installs a client's arrival line — the only coordination the
+// common path needs, since every replica derives the same order from it.
 func (r *Replica) handleSync(msg *BusSyncMessage) {
 	r.mu.Lock()
 	r.clients[msg.ClientId] = &clientLine{
@@ -452,32 +454,46 @@ func (r *Replica) handleSync(msg *BusSyncMessage) {
 		r.self, msg.ClientId, msg.FirstMsgNs, (int64(msg.FirstMsgNs)-wallNs())/1e6, msg.IntervalMs)
 }
 
+// resetCursorLocked discards the memoized slot-to-owner inverse: a new line
+// changes the merge, so previously generated owners no longer hold.
 func (r *Replica) resetCursorLocked() {
 	r.cursorSlot = 0
 	r.cursorNextN = make(map[uint64]uint64)
 	r.slotMeta = make(map[uint64]slotMetaEntry)
 }
 
-func (r *Replica) handleRequest(msg *BusRequestMessage) (uint64, bool) {
-	actualNs := wallNs()
-	r.mu.Lock()
-	line, ok := r.clients[msg.ClientId]
-	if !ok {
-		r.mu.Unlock()
-		Warning("[%s] request from unsynced client %d, ignoring", r.self, msg.ClientId)
-		return 0, false
-	}
-	if r.shouldDropLocked(msg.RequestId) {
-		r.winDropped++
-		r.mu.Unlock()
-		return 0, false
-	}
-	if msg.RequestId > line.maxSeqSeen {
-		line.maxSeqSeen = msg.RequestId
-	}
+// admission is why an arriving message was or was not accepted. The reason
+// travels back to the caller so the log call happens off r.mu.
+type admission uint8
 
-	expectedNs := line.expectedNs(msg.RequestId)
-	deltaUs := (actualNs - expectedNs) / 1000
+const (
+	admitted      admission = iota
+	admitUnsynced           // sender never announced an arrival line
+	admitDropped            // swallowed by the fault injector
+)
+
+// admitLocked vets an arriving message and, when it is to be ordered, folds its
+// arrival into this second's schedule-tracking statistics.
+func (r *Replica) admitLocked(clientId, seq uint64, actualNs int64) admission {
+	line, ok := r.clients[clientId]
+	if !ok {
+		return admitUnsynced
+	}
+	if r.shouldDropLocked(seq) {
+		r.winDropped++
+		return admitDropped
+	}
+	if seq > line.maxSeqSeen {
+		line.maxSeqSeen = seq
+	}
+	r.observeArrivalLocked(line, seq, actualNs)
+	return admitted
+}
+
+// observeArrivalLocked accumulates how far this arrival fell from where the
+// client's line said it would land.
+func (r *Replica) observeArrivalLocked(line *clientLine, seq uint64, actualNs int64) {
+	deltaUs := (actualNs - line.expectedNs(seq)) / 1000
 	if r.winRecv == 0 {
 		r.winDeltaMinUs, r.winDeltaMaxUs = deltaUs, deltaUs
 	} else {
@@ -490,89 +506,101 @@ func (r *Replica) handleRequest(msg *BusRequestMessage) (uint64, bool) {
 	}
 	r.winDeltaSumUs += deltaUs
 	r.winRecv++
+}
 
-	slot := computeGlobalSlot(r.clients, msg.ClientId, msg.RequestId)
+// handleRequest orders one unbatched request. It contacts no peer and waits on
+// nothing — the slot is a local computation.
+func (r *Replica) handleRequest(msg *BusRequestMessage) (slot uint64, ok bool) {
+	actualNs := wallNs()
+
+	r.mu.Lock()
+	switch r.admitLocked(msg.ClientId, msg.RequestId, actualNs) {
+	case admitUnsynced:
+		r.mu.Unlock()
+		Warning("[%s] request from unsynced client %d, ignoring", r.self, msg.ClientId)
+		return 0, false
+	case admitDropped:
+		r.mu.Unlock()
+		return 0, false
+	}
+	slot = computeGlobalSlot(r.clients, msg.ClientId, msg.RequestId)
 	stored := r.recordReceivedLocked(slot, msg.ClientId, msg.RequestId, msg.Op)
 	r.advanceNextExpectedLocked()
 	r.mu.Unlock()
 
+	// Off r.mu: no disk-facing call runs under the ordering lock.
 	if stored && r.durable != nil {
 		r.durable.record(slot, msg.ClientId, msg.RequestId, msg.Op, false)
 	}
 	return slot, true
 }
 
+// handleBus orders a whole bus of requests. lw is the connection it arrived on,
+// which doubles as the route for replies to that client.
 func (r *Replica) handleBus(msg *BusMessage, lw *lockedWriter) {
 	actualNs := wallNs()
-	r.cwMu.Lock()
-	rs := r.replySenders[msg.ClientId]
-	if rs == nil {
-		rs = newReplySender(r, lw)
-		r.replySenders[msg.ClientId] = rs
-	} else {
-		rs.setWriter(lw)
-	}
-	r.cwMu.Unlock()
+	r.bindReplySender(msg.ClientId, lw)
 
 	r.mu.Lock()
-	line, ok := r.clients[msg.ClientId]
-	if !ok {
+	switch r.admitLocked(msg.ClientId, msg.BusSeqNum, actualNs) {
+	case admitUnsynced:
 		r.mu.Unlock()
 		Warning("[%s] bus from unsynced client %d, ignoring", r.self, msg.ClientId)
 		return
-	}
-	if r.shouldDropLocked(msg.BusSeqNum) {
-		r.winDropped++
+	case admitDropped:
 		r.mu.Unlock()
 		return
 	}
-	if msg.BusSeqNum > line.maxSeqSeen {
-		line.maxSeqSeen = msg.BusSeqNum
-	}
-
-	expectedNs := line.expectedNs(msg.BusSeqNum)
-	deltaUs := (actualNs - expectedNs) / 1000
-	if r.winRecv == 0 {
-		r.winDeltaMinUs, r.winDeltaMaxUs = deltaUs, deltaUs
-	} else {
-		if deltaUs < r.winDeltaMinUs {
-			r.winDeltaMinUs = deltaUs
-		}
-		if deltaUs > r.winDeltaMaxUs {
-			r.winDeltaMaxUs = deltaUs
-		}
-	}
-	r.winDeltaSumUs += deltaUs
-	r.winRecv++
-
 	r.busMode = true
 
 	if len(r.gaps) > 0 {
+		r.applyDuringRecoveryLocked(msg)
+	} else {
 		slot := computeGlobalSlot(r.clients, msg.ClientId, msg.BusSeqNum)
-		if gs, isGap := r.gaps[gapKey{slot}]; isGap {
-			r.recordBusReceivedLocked(slot, msg.ClientId, msg.BusSeqNum, msg.Requests)
-			r.advanceNextExpectedLocked()
-			if gs != nil {
-				select {
-				case gs.doneCh <- struct{}{}:
-				default:
-				}
-			}
-			r.mu.Unlock()
-			return
-		}
-		cp := *msg
-		r.pendingBuses = append(r.pendingBuses, &cp)
-		r.mu.Unlock()
-		return
+		r.recordBusReceivedLocked(slot, msg.ClientId, msg.BusSeqNum, msg.Requests)
+		r.advanceNextExpectedLocked()
 	}
-
-	slot := computeGlobalSlot(r.clients, msg.ClientId, msg.BusSeqNum)
-	r.recordBusReceivedLocked(slot, msg.ClientId, msg.BusSeqNum, msg.Requests)
-	r.advanceNextExpectedLocked()
 	r.mu.Unlock()
 }
 
+// bindReplySender points this client's reply sender at the connection its bus
+// arrived on, creating the sender on first contact.
+func (r *Replica) bindReplySender(clientId uint64, lw *lockedWriter) {
+	r.cwMu.Lock()
+	defer r.cwMu.Unlock()
+	if rs := r.replySenders[clientId]; rs != nil {
+		rs.setWriter(lw)
+		return
+	}
+	r.replySenders[clientId] = newReplySender(r, lw)
+}
+
+// applyDuringRecoveryLocked handles a bus arriving while an earlier slot is
+// still being agreed on: apply it if it is that slot, else buffer it so the
+// commit prefix cannot run past the hole under negotiation.
+func (r *Replica) applyDuringRecoveryLocked(msg *BusMessage) {
+	slot := computeGlobalSlot(r.clients, msg.ClientId, msg.BusSeqNum)
+	gs, isGap := r.gaps[gapKey{slot}]
+	if !isGap {
+		// The read loop reuses msg; a shallow copy suffices because Unmarshal
+		// allocates a fresh Requests slice each time.
+		cp := *msg
+		r.pendingBuses = append(r.pendingBuses, &cp)
+		return
+	}
+	r.recordBusReceivedLocked(slot, msg.ClientId, msg.BusSeqNum, msg.Requests)
+	r.advanceNextExpectedLocked()
+	if gs != nil {
+		// Non-blocking: the waiter may already have timed out.
+		select {
+		case gs.doneCh <- struct{}{}:
+		default:
+		}
+	}
+}
+
+// finishGapLocked retires a resolved gap, releasing the buffered buses once the
+// last one is done.
 func (r *Replica) finishGapLocked(key gapKey) {
 	delete(r.gaps, key)
 	if len(r.gaps) == 0 {
@@ -580,6 +608,9 @@ func (r *Replica) finishGapLocked(key gapKey) {
 	}
 }
 
+// drainPendingBusesLocked replays the buffered buses. Their slots come from
+// their clients' lines, not arrival order, so replaying them late cannot
+// reorder them.
 func (r *Replica) drainPendingBusesLocked() {
 	if len(r.pendingBuses) == 0 {
 		return
@@ -594,23 +625,24 @@ func (r *Replica) drainPendingBusesLocked() {
 }
 
 func (r *Replica) recordBusReceivedLocked(slot, clientId, busSeq uint64, reqs []RequestMessage) bool {
-	r.observeSlotLocked(slot)
-	e := r.slotEntryLocked(slot)
-	switch e.state {
-	case slotNoOp, slotReceived:
+	e := r.claimSlotLocked(slot)
+	if e == nil {
 		return false
-	default:
-		e.state = slotReceived
-		e.clientId = clientId
-		e.reqId = busSeq
-		e.requests = reqs
-		e.isBus = true
-		e.ownerSet = true
-		return true
 	}
+	*e = globalEntry{
+		clientId: clientId,
+		reqId:    busSeq,
+		state:    slotReceived,
+		requests: reqs,
+		isBus:    true,
+		ownerSet: true,
+	}
+	return true
 }
 
-func (r *Replica) slotGapPayloadLocked(slot uint64) ([]byte, bool) {
+// slotGapPayloadLocked returns what to hand a peer missing this slot, and
+// whether that payload is a marshaled bus rather than a bare request op.
+func (r *Replica) slotGapPayloadLocked(slot uint64) (payload []byte, isBus bool) {
 	e := r.globalLog[slot]
 	if e == nil {
 		return nil, false
@@ -621,16 +653,18 @@ func (r *Replica) slotGapPayloadLocked(slot uint64) ([]byte, bool) {
 	return e.op, false
 }
 
+// storeRecoveredLocked installs a copy obtained from a peer, through the same
+// first-writer-wins path as a live arrival.
 func (r *Replica) storeRecoveredLocked(slot, clientId, reqId uint64, payload []byte, isBus bool) bool {
-	if isBus {
-		reqs, err := unmarshalRequests(payload)
-		if err != nil {
-			Warning("[%s] cannot decode recovered bus for slot=%d: %v", r.self, slot, err)
-			return false
-		}
-		return r.recordBusReceivedLocked(slot, clientId, reqId, reqs)
+	if !isBus {
+		return r.recordReceivedLocked(slot, clientId, reqId, payload)
 	}
-	return r.recordReceivedLocked(slot, clientId, reqId, payload)
+	reqs, err := unmarshalRequests(payload)
+	if err != nil {
+		Warning("[%s] cannot decode recovered bus for slot=%d: %v", r.self, slot, err)
+		return false
+	}
+	return r.recordBusReceivedLocked(slot, clientId, reqId, reqs)
 }
 
 func (r *Replica) slotEntryLocked(slot uint64) *globalEntry {
@@ -649,22 +683,36 @@ func (r *Replica) observeSlotLocked(slot uint64) {
 	}
 }
 
-func (r *Replica) recordReceivedLocked(slot, clientId, reqId uint64, op []byte) bool {
+// claimSlotLocked returns the entry for slot if it is still unfilled, nil if
+// some other path got there first — which is how a late or duplicate arrival
+// loses to an already-agreed no-op, identically at every replica.
+func (r *Replica) claimSlotLocked(slot uint64) *globalEntry {
 	r.observeSlotLocked(slot)
 	e := r.slotEntryLocked(slot)
-	switch e.state {
-	case slotNoOp, slotReceived:
-		return false
-	default:
-		e.state = slotReceived
-		e.clientId = clientId
-		e.reqId = reqId
-		e.op = op
-		e.ownerSet = true
-		return true
+	if e.state != slotEmpty {
+		return nil
 	}
+	return e
 }
 
+func (r *Replica) recordReceivedLocked(slot, clientId, reqId uint64, op []byte) bool {
+	e := r.claimSlotLocked(slot)
+	if e == nil {
+		return false
+	}
+	*e = globalEntry{
+		clientId: clientId,
+		reqId:    reqId,
+		state:    slotReceived,
+		op:       op,
+		ownerSet: true,
+	}
+	return true
+}
+
+// setNoOpLocked deliberately overwrites an existing entry: a no-op is an agreed
+// decision, so a replica that has since received the real message must discard
+// it. The owner comes from the lazy inverse, naming whose message was lost.
 func (r *Replica) setNoOpLocked(slot uint64) bool {
 	r.observeSlotLocked(slot)
 	e := r.slotEntryLocked(slot)
@@ -695,6 +743,8 @@ func (r *Replica) slotOpLocked(slot uint64) []byte {
 	return nil
 }
 
+// advanceNextExpectedLocked walks the contiguous filled prefix forward. Slots
+// fill out of order, so this is where a run of them commits at once.
 func (r *Replica) advanceNextExpectedLocked() {
 	for {
 		slot := r.nextExpected
