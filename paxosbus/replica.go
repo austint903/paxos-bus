@@ -7,6 +7,7 @@ import (
 	"os"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -46,6 +47,28 @@ type globalEntry struct {
 	requests []RequestMessage
 	isBus    bool
 	ownerSet bool // clientId/reqId hold this slot's real owner (client id 0 is valid)
+
+	// [logIdxLo, logIdxHi) are the request-log-list indexes this slot was the
+	// first to assign, filled in when the cursor executes it. Reclaiming the
+	// slot releases exactly those dedup entries, and no others — a passenger
+	// that had already been given an index by an earlier bus keeps it.
+	logIdxLo uint64
+	logIdxHi uint64
+
+	sizeBytes uint64 // this slot's share of residentBytes
+}
+
+// requestOverheadBytes is the fixed heap cost of one retained RequestMessage,
+// on top of its op. Only used to size the retain window, so an estimate is
+// enough — it just has to move with the real footprint.
+const requestOverheadBytes = 48
+
+func busSizeBytes(reqs []RequestMessage) uint64 {
+	n := uint64(len(reqs)) * requestOverheadBytes
+	for i := range reqs {
+		n += uint64(len(reqs[i].Op))
+	}
+	return n
 }
 
 type reqKey struct {
@@ -174,20 +197,66 @@ func (m dropMode) String() string {
 	}
 }
 
+// replicaStatus gates the cursor. In ViewChange the replica still records
+// arriving buses into their slots — a bus's position comes from its client's
+// line, not from any leader — but nothing is decomposed into the request log
+// list and no client hears back until the new view is installed.
+type replicaStatus uint8
+
+const (
+	statusNormal replicaStatus = iota
+	statusViewChange
+)
+
+func (s replicaStatus) String() string {
+	if s == statusViewChange {
+		return "view-change"
+	}
+	return "normal"
+}
+
 type Replica struct {
 	config *Config
 	idx    int
-	viewId uint64
+	// viewId is read off r.mu on the reply hot path, so it is atomic; every
+	// write still happens under r.mu alongside the rest of the view state.
+	viewId atomic.Uint64
 	self   string
 
-	mu      sync.Mutex
-	clients map[uint64]*clientLine
+	mu             sync.Mutex
+	clients        map[uint64]*clientLine
+	status         replicaStatus
+	lastNormalView uint64
 
 	globalLog    map[uint64]*globalEntry
 	nextExpected uint64
 	prunedBelow  uint64
 	maxSlotSeen  uint64
 	haveMax      bool
+
+	// stableSlot is the commit point: on and below it the log is durable at a
+	// quorum, so it is both the floor for memory reclamation and the point a
+	// lagging replica may safely rewind to.
+	stableSlot uint64
+	haveStable bool
+
+	// prefixHash is the rolling hash of the executed prefix [0, nextExpected).
+	// hashRing/logIdxRing remember its value, and the value of nextLogIndex,
+	// after each of the last ringSize executed slots — enough to answer "your
+	// hash at slot S" and to rewind exactly, with no per-request history. The
+	// rings run two slots deeper than the prune window so that the slot being
+	// evicted, and the one below it, can still be looked up as it goes.
+	prefixHash  uint64
+	hashRing    []uint64
+	logIdxRing  []uint64
+	retainSlots uint64
+	ringSize    uint64
+
+	// A slot window alone is a poor memory bound, because a slot is one bus and
+	// a bus can carry one request or a thousand. residentBytes tracks the actual
+	// retained payload so the window can also close on size.
+	residentBytes uint64
+	retainBytes   uint64
 
 	// nextLogIndex is the length of the request log list. The in-memory list
 	// itself was write-only (payloads live in requestlist.log, indexes in
@@ -209,8 +278,22 @@ type Replica struct {
 	slotMeta    map[uint64]slotMetaEntry
 
 	peerWriters []*lockedWriter
+	peerRedial  []chan struct{} // cap-1 wake for dialPeer after a send failure
+	leaderLost  bool            // peer connection to the leader broke; suspicionLoop acts on it
 
 	gaps map[gapKey]*gapState
+
+	// Failure recovery.
+	syncInterval      time.Duration
+	suspectTimeout    time.Duration
+	viewChangeTimeout time.Duration
+	lastHeartbeatNs   int64
+	sync              *syncRound
+	vc                *vcState
+	fetchQ            chan fetchReq
+	serveQ            chan *BusGetState
+	newStateCh        chan *BusNewState
+	startViewQ        chan *BusStartView
 
 	logDir     string
 	durable    *durableLog // BusMessage Log: slot -> bus (replica.log)
@@ -231,7 +314,46 @@ type Replica struct {
 	winReplyMax   int
 }
 
-func NewReplica(config *Config, idx int, label, logDir string, mode dropMode, every uint64, gapDeltaMs uint64) *Replica {
+// RecoveryOptions tunes failure detection and the memory window. The timeouts
+// are deliberately slack: a spurious view change costs far more than noticing a
+// dead leader a second later.
+type RecoveryOptions struct {
+	SyncIntervalMs      uint64
+	SuspectTimeoutMs    uint64
+	ViewChangeTimeoutMs uint64
+	RetainSlots         uint64
+	RetainBytes         uint64
+}
+
+const (
+	defaultSyncIntervalMs      = 500
+	defaultSuspectTimeoutMs    = 5000
+	defaultViewChangeTimeoutMs = 15000
+	defaultRetainBytes         = 256 << 20
+)
+
+func (o *RecoveryOptions) withDefaults() RecoveryOptions {
+	out := *o
+	if out.SyncIntervalMs == 0 {
+		out.SyncIntervalMs = defaultSyncIntervalMs
+	}
+	if out.SuspectTimeoutMs == 0 {
+		out.SuspectTimeoutMs = defaultSuspectTimeoutMs
+	}
+	if out.ViewChangeTimeoutMs == 0 {
+		out.ViewChangeTimeoutMs = defaultViewChangeTimeoutMs
+	}
+	if out.RetainSlots == 0 {
+		out.RetainSlots = defaultRetainSlots
+	}
+	if out.RetainBytes == 0 {
+		out.RetainBytes = defaultRetainBytes
+	}
+	return out
+}
+
+func NewReplica(config *Config, idx int, label, logDir string, mode dropMode, every uint64,
+	gapDeltaMs uint64, opts RecoveryOptions) *Replica {
 	self := "Replica " + strconv.Itoa(idx)
 	if label != "" {
 		self += " " + label
@@ -239,24 +361,42 @@ func NewReplica(config *Config, idx int, label, logDir string, mode dropMode, ev
 	if gapDeltaMs == 0 {
 		gapDeltaMs = defaultGapDeltaMs
 	}
+	opts = opts.withDefaults()
+	redial := make([]chan struct{}, config.N)
+	for i := range redial {
+		redial[i] = make(chan struct{}, 1)
+	}
 	r := &Replica{
-		config:       config,
-		idx:          idx,
-		viewId:       0,
-		self:         self,
-		gapDeltaNs:   int64(gapDeltaMs) * 1e6,
-		clients:      make(map[uint64]*clientLine),
-		globalLog:    make(map[uint64]*globalEntry),
-		dedup:        make(map[reqKey]uint64),
-		replySenders: make(map[uint64]*replySender),
-		replyWake:    make(chan struct{}, 1),
-		cursorNextN:  make(map[uint64]uint64),
-		slotMeta:     make(map[uint64]slotMetaEntry),
-		peerWriters:  make([]*lockedWriter, config.N),
-		gaps:         make(map[gapKey]*gapState),
-		logDir:       logDir,
-		dropMode:     mode,
-		dropEvery:    every,
+		config:            config,
+		idx:               idx,
+		self:              self,
+		gapDeltaNs:        int64(gapDeltaMs) * 1e6,
+		clients:           make(map[uint64]*clientLine),
+		globalLog:         make(map[uint64]*globalEntry),
+		dedup:             make(map[reqKey]uint64),
+		replySenders:      make(map[uint64]*replySender),
+		replyWake:         make(chan struct{}, 1),
+		cursorNextN:       make(map[uint64]uint64),
+		slotMeta:          make(map[uint64]slotMetaEntry),
+		peerWriters:       make([]*lockedWriter, config.N),
+		peerRedial:        redial,
+		gaps:              make(map[gapKey]*gapState),
+		logDir:            logDir,
+		dropMode:          mode,
+		dropEvery:         every,
+		retainSlots:       opts.RetainSlots,
+		retainBytes:       opts.RetainBytes,
+		ringSize:          opts.RetainSlots + 2,
+		hashRing:          make([]uint64, opts.RetainSlots+2),
+		logIdxRing:        make([]uint64, opts.RetainSlots+2),
+		prefixHash:        fnvOffset64,
+		syncInterval:      time.Duration(opts.SyncIntervalMs) * time.Millisecond,
+		suspectTimeout:    time.Duration(opts.SuspectTimeoutMs) * time.Millisecond,
+		viewChangeTimeout: time.Duration(opts.ViewChangeTimeoutMs) * time.Millisecond,
+		fetchQ:            make(chan fetchReq, 64),
+		serveQ:            make(chan *BusGetState, 64),
+		newStateCh:        make(chan *BusNewState, 8),
+		startViewQ:        make(chan *BusStartView, 8),
 	}
 	if logDir != "" {
 		if err := os.MkdirAll(logDir, 0o755); err != nil {
@@ -281,6 +421,8 @@ func NewReplica(config *Config, idx int, label, logDir string, mode dropMode, ev
 	}
 	Notice("[%s] started (view=0, f=%d, quorum=%d, leader=%s, gap_delta=%dms)",
 		r.self, config.F, config.QuorumSize(), leader, r.gapDeltaNs/1e6)
+	Notice("[%s] recovery: sync=%v suspect=%v view_change_timeout=%v retain_slots=%d",
+		r.self, r.syncInterval, r.suspectTimeout, r.viewChangeTimeout, r.retainSlots)
 	if r.dropMode != dropNone && r.dropEvery > 0 {
 		Notice("[%s] artificial drop enabled: mode=%s every=%d (drop slot when reqId%%%d==0)",
 			r.self, r.dropMode, r.dropEvery, r.dropEvery)
@@ -288,12 +430,95 @@ func NewReplica(config *Config, idx int, label, logDir string, mode dropMode, ev
 	return r
 }
 
+func (r *Replica) view() uint64 { return r.viewId.Load() }
+
+func (r *Replica) leaderIdx() int { return r.config.LeaderIndex(r.view()) }
+
 func (r *Replica) AmLeader() bool {
-	return r.config.LeaderIndex(r.viewId) == r.idx
+	return r.leaderIdx() == r.idx
+}
+
+// ── Prefix hash ─────────────────────────────────────────────────────────────
+
+const (
+	fnvOffset64 = 14695981039346656037
+	fnvPrime64  = 1099511628211
+)
+
+func fnvMix(h, v uint64) uint64 {
+	for i := 0; i < 8; i++ {
+		h ^= v & 0xff
+		h *= fnvPrime64
+		v >>= 8
+	}
+	return h
+}
+
+// foldSlot extends the rolling prefix hash with one executed slot. Only the
+// slot's identity is hashed, never its passengers: which requests ride a bus is
+// fully determined by (clientId, busSeq), so an O(1) fold says everything an
+// O(requests) one would while staying off the hot path's budget.
+func foldSlot(h, slot uint64, st slotState, clientId, reqId uint64) uint64 {
+	h = fnvMix(h, slot)
+	h = fnvMix(h, uint64(st))
+	h = fnvMix(h, clientId)
+	return fnvMix(h, reqId)
+}
+
+// foldExecutedLocked records the prefix hash and request-log-list length as of
+// just after slot was executed, so both can be recovered exactly on rewind.
+func (r *Replica) foldExecutedLocked(slot uint64, e *globalEntry) {
+	clientId, reqId := e.clientId, e.reqId
+	if !e.ownerSet {
+		m := r.slotOwnerLocked(slot)
+		clientId, reqId = m.clientId, m.reqId
+	}
+	r.prefixHash = foldSlot(r.prefixHash, slot, e.state, clientId, reqId)
+	i := slot % r.ringSize
+	r.hashRing[i] = r.prefixHash
+	r.logIdxRing[i] = r.nextLogIndex
+}
+
+// ringValidLocked reports whether the rings still remember slot. Slots are
+// executed in strictly increasing order, so an entry survives exactly until
+// ringSize later slots have overwritten it.
+func (r *Replica) ringValidLocked(slot uint64) bool {
+	if slot >= r.nextExpected {
+		return false
+	}
+	return slot+r.ringSize >= r.nextExpected
+}
+
+// prefixHashAtLocked is the hash of the executed prefix [0, slot].
+func (r *Replica) prefixHashAtLocked(slot uint64) (uint64, bool) {
+	if !r.ringValidLocked(slot) {
+		return 0, false
+	}
+	return r.hashRing[slot%r.ringSize], true
+}
+
+// logIndexAfterLocked is what nextLogIndex was once slot had been executed —
+// the request-log-list length to restore when rewinding to slot+1.
+func (r *Replica) logIndexAfterLocked(slot uint64) (uint64, bool) {
+	if !r.ringValidLocked(slot) {
+		return 0, false
+	}
+	return r.logIdxRing[slot%r.ringSize], true
+}
+
+// prefixStateAtLocked is the (hash, request-log-list length) pair to restore
+// when rewinding the cursor to slot. Rewinding to 0 needs no history.
+func (r *Replica) prefixStateAtLocked(slot uint64) (hash, logIdx uint64, ok bool) {
+	if slot == 0 {
+		return fnvOffset64, 0, true
+	}
+	h, ok1 := r.prefixHashAtLocked(slot - 1)
+	li, ok2 := r.logIndexAfterLocked(slot - 1)
+	return h, li, ok1 && ok2
 }
 
 func (r *Replica) followerRankLocked() int {
-	leader := r.config.LeaderIndex(r.viewId)
+	leader := r.leaderIdx()
 	rank := 0
 	for j := 0; j < r.idx; j++ {
 		if j != leader {
@@ -327,10 +552,23 @@ func (r *Replica) Run() error {
 	if err != nil {
 		return err
 	}
+	// Suspicion runs off the clock from here, so a leader that never comes up at
+	// all is noticed the same way one that dies mid-run is.
+	r.mu.Lock()
+	r.lastHeartbeatNs = nowNs()
+	r.mu.Unlock()
 	go r.statsLoop()
 	go r.connectPeers()
 	go r.gapDetectLoop()
 	go r.replyLoop()
+	go r.syncLoop()
+	go r.suspicionLoop()
+	// State transfer gets its own goroutines at both ends: serving reads the
+	// durable log and marshals megabytes, and neither may happen on a connection
+	// reader or under r.mu.
+	go r.stateServeLoop()
+	go r.stateFetchLoop()
+	go r.viewInstallLoop()
 	for {
 		conn, err := l.Accept()
 		if err != nil {
@@ -348,6 +586,17 @@ func (r *Replica) clientListener(conn net.Conn) {
 	defer conn.Close()
 	reader := bufio.NewReader(conn)
 	lw := &lockedWriter{w: bufio.NewWriter(conn)}
+
+	// Peer messages name their sender, so this connection identifies itself the
+	// first time one arrives. When it then closes we know exactly which replica
+	// went away — a far stronger and faster signal than the heartbeat timeout,
+	// which is what turns a killed leader into a view change in milliseconds.
+	peerIdx := -1
+	defer func() {
+		if peerIdx >= 0 {
+			r.peerConnLost(peerIdx)
+		}
+	}()
 
 	var (
 		syncMsg BusSyncMessage
@@ -384,7 +633,7 @@ func (r *Replica) clientListener(conn net.Conn) {
 				ClientId:   reqMsg.ClientId,
 				RequestId:  reqMsg.RequestId,
 				LogSlotNum: slot,
-				ViewId:     r.viewId,
+				ViewId:     r.view(),
 				ReplicaIdx: uint32(r.idx),
 				Result:     nil,
 			}
@@ -407,6 +656,7 @@ func (r *Replica) clientListener(conn net.Conn) {
 				Warning("[%s] bad gap request: %v", r.self, err)
 				return
 			}
+			peerIdx = int(m.SenderIdx)
 			r.handleGapRequest(&m)
 
 		case MsgBusGapReply:
@@ -415,6 +665,7 @@ func (r *Replica) clientListener(conn net.Conn) {
 				Warning("[%s] bad gap reply: %v", r.self, err)
 				return
 			}
+			peerIdx = int(m.SenderIdx)
 			r.handleGapReply(&m)
 
 		case MsgBusGapCommit:
@@ -423,6 +674,7 @@ func (r *Replica) clientListener(conn net.Conn) {
 				Warning("[%s] bad gap commit: %v", r.self, err)
 				return
 			}
+			peerIdx = int(m.SenderIdx)
 			r.handleGapCommit(&m)
 
 		case MsgBusGapCommitReply:
@@ -431,7 +683,89 @@ func (r *Replica) clientListener(conn net.Conn) {
 				Warning("[%s] bad gap commit reply: %v", r.self, err)
 				return
 			}
+			peerIdx = int(m.SenderIdx)
 			r.handleGapCommitReply(&m)
+
+		case MsgBusSyncPrepare:
+			var m BusSyncPrepare
+			if err := m.Unmarshal(reader); err != nil {
+				Warning("[%s] bad sync prepare: %v", r.self, err)
+				return
+			}
+			peerIdx = int(m.SenderIdx)
+			r.handleSyncPrepare(&m)
+
+		case MsgBusSyncReply:
+			var m BusSyncReply
+			if err := m.Unmarshal(reader); err != nil {
+				Warning("[%s] bad sync reply: %v", r.self, err)
+				return
+			}
+			peerIdx = int(m.SenderIdx)
+			r.handleSyncReply(&m)
+
+		case MsgBusSyncCommit:
+			var m BusSyncCommit
+			if err := m.Unmarshal(reader); err != nil {
+				Warning("[%s] bad sync commit: %v", r.self, err)
+				return
+			}
+			peerIdx = int(m.SenderIdx)
+			r.handleSyncCommit(&m)
+
+		case MsgBusViewChangeRequest:
+			var m BusViewChangeRequest
+			if err := m.Unmarshal(reader); err != nil {
+				Warning("[%s] bad view change request: %v", r.self, err)
+				return
+			}
+			peerIdx = int(m.SenderIdx)
+			r.handleViewChangeRequest(&m)
+
+		case MsgBusViewChange:
+			var m BusViewChange
+			if err := m.Unmarshal(reader); err != nil {
+				Warning("[%s] bad view change: %v", r.self, err)
+				return
+			}
+			peerIdx = int(m.SenderIdx)
+			r.handleViewChange(&m)
+
+		case MsgBusStartView:
+			var m BusStartView
+			if err := m.Unmarshal(reader); err != nil {
+				Warning("[%s] bad start view: %v", r.self, err)
+				return
+			}
+			peerIdx = int(m.SenderIdx)
+			r.handleStartView(&m)
+
+		case MsgBusStateQuery:
+			var m BusStateQuery
+			if err := m.Unmarshal(reader); err != nil {
+				Warning("[%s] bad state query: %v", r.self, err)
+				return
+			}
+			peerIdx = int(m.SenderIdx)
+			r.handleStateQuery(&m)
+
+		case MsgBusGetState:
+			var m BusGetState
+			if err := m.Unmarshal(reader); err != nil {
+				Warning("[%s] bad get state: %v", r.self, err)
+				return
+			}
+			peerIdx = int(m.SenderIdx)
+			r.handleGetState(&m)
+
+		case MsgBusNewState:
+			var m BusNewState
+			if err := m.Unmarshal(reader); err != nil {
+				Warning("[%s] bad new state: %v", r.self, err)
+				return
+			}
+			peerIdx = int(m.SenderIdx)
+			r.handleNewState(&m)
 
 		default:
 			Warning("[%s] unknown message type %d", r.self, msgType)
@@ -629,14 +963,17 @@ func (r *Replica) recordBusReceivedLocked(slot, clientId, busSeq uint64, reqs []
 	if e == nil {
 		return false
 	}
+	sz := busSizeBytes(reqs)
 	*e = globalEntry{
-		clientId: clientId,
-		reqId:    busSeq,
-		state:    slotReceived,
-		requests: reqs,
-		isBus:    true,
-		ownerSet: true,
+		clientId:  clientId,
+		reqId:     busSeq,
+		state:     slotReceived,
+		requests:  reqs,
+		isBus:     true,
+		ownerSet:  true,
+		sizeBytes: sz,
 	}
+	r.residentBytes += sz
 	return true
 }
 
@@ -700,13 +1037,16 @@ func (r *Replica) recordReceivedLocked(slot, clientId, reqId uint64, op []byte) 
 	if e == nil {
 		return false
 	}
+	sz := uint64(len(op)) + requestOverheadBytes
 	*e = globalEntry{
-		clientId: clientId,
-		reqId:    reqId,
-		state:    slotReceived,
-		op:       op,
-		ownerSet: true,
+		clientId:  clientId,
+		reqId:     reqId,
+		state:     slotReceived,
+		op:        op,
+		ownerSet:  true,
+		sizeBytes: sz,
 	}
+	r.residentBytes += sz
 	return true
 }
 
@@ -725,8 +1065,23 @@ func (r *Replica) setNoOpLocked(slot uint64) bool {
 		e.ownerSet = true
 	}
 	e.state = slotNoOp
+	// A no-op slot carries nothing: its passengers are dropped by the agreement
+	// itself and the client re-boards them, so holding the payload would keep
+	// memory for data no one will ever be served.
 	e.op = nil
+	e.requests = nil
+	e.isBus = false
+	r.releaseEntryBytesLocked(e)
 	return true
+}
+
+func (r *Replica) releaseEntryBytesLocked(e *globalEntry) {
+	if e.sizeBytes > r.residentBytes {
+		r.residentBytes = 0
+	} else {
+		r.residentBytes -= e.sizeBytes
+	}
+	e.sizeBytes = 0
 }
 
 func (r *Replica) slotStateLocked(slot uint64) slotState {
@@ -745,7 +1100,16 @@ func (r *Replica) slotOpLocked(slot uint64) []byte {
 
 // advanceNextExpectedLocked walks the contiguous filled prefix forward. Slots
 // fill out of order, so this is where a run of them commits at once.
+//
+// Outside statusNormal the cursor is frozen: buses arriving during a view change
+// are still recorded into their slots (their position comes from the client's
+// line, not from any leader), they are just not decomposed into the request log
+// list and no reply is sent, since nothing may be committed without a leader.
 func (r *Replica) advanceNextExpectedLocked() {
+	if r.status != statusNormal {
+		r.pruneCommittedLocked()
+		return
+	}
 	for {
 		slot := r.nextExpected
 		e := r.globalLog[slot]
@@ -757,35 +1121,92 @@ func (r *Replica) advanceNextExpectedLocked() {
 			r.durableRecordCursorLocked(slot, e, logIdxs)
 		}
 		r.nextExpected++
+		r.foldExecutedLocked(slot, e)
 	}
 	r.pruneCommittedLocked()
 }
 
-// committedRetainSlots bounds how many already-committed slots the replica keeps
-// in memory (globalLog/slotMeta) below nextExpected. Without this these maps grow
-// ~one entry per request forever, and the rising GC pressure is the leading
-// suspect for the mid-run stall. The window stays well above the gap-recovery
-// window (gap Δ default 5s + gapProtocolTimeout 3s ≈ 8s of traffic, ~16k slots at the
-// benchmark's ~2k/s) so a lagging peer's gap request is still answerable from
-// memory; older slots live only in the durable log. drop-mode none never gaps,
-// so this is a pure memory win for the current runs.
-const committedRetainSlots = 1 << 14
+// defaultRetainSlots bounds how many already-committed slots the replica keeps
+// in memory (globalLog/slotMeta/dedup) below nextExpected. Without this these
+// maps grow ~one entry per request forever, and the rising GC pressure is the
+// leading suspect for the mid-run stall. The window stays well above the
+// gap-recovery window (gap Δ default 5s + gapProtocolTimeout 3s ≈ 8s of traffic,
+// ~16k slots at the benchmark's ~2k/s) so a lagging peer's gap request is still
+// answerable from memory; older slots are served from the durable log instead
+// (see logreader.go), so shrinking this trades memory for a disk read on the
+// rare deep catch-up rather than making one impossible.
+const defaultRetainSlots = 1 << 14
 
 // pruneCommittedLocked drops fully-committed slots that sit far enough below
 // nextExpected that no in-flight gap recovery can still need them, bounding the
 // heap. Slots are contiguous and monotonic, so prunedBelow lets each slot be
 // visited exactly once (amortized O(1) per committed slot).
+//
+// The floor never rises above the commit point: rewinding on view change reads
+// globalLog[s].requests for every slot back to stableSlot, so those must stay
+// resident even if the window would otherwise release them.
 func (r *Replica) pruneCommittedLocked() {
-	if r.nextExpected <= committedRetainSlots {
-		return
+	// Nothing at or above the commit point may go, whatever the pressure.
+	limit := r.nextExpected
+	if r.haveStable && r.stableSlot < limit {
+		limit = r.stableSlot
 	}
-	target := r.nextExpected - committedRetainSlots
+
+	var target uint64
+	if r.nextExpected > r.retainSlots {
+		target = r.nextExpected - r.retainSlots
+	}
+	if target > limit {
+		target = limit
+	}
 	for s := r.prunedBelow; s < target; s++ {
-		delete(r.globalLog, s)
-		delete(r.slotMeta, s)
+		r.pruneSlotLocked(s)
 	}
 	if target > r.prunedBelow {
 		r.prunedBelow = target
+	}
+
+	// A slot is one bus, and a bus carries anywhere from one request to a
+	// thousand — so the slot window alone can mean tens of megabytes or a
+	// gigabyte. Keep reclaiming past it while the retained payload is over
+	// budget, still stopping at the commit point.
+	for r.retainBytes > 0 && r.residentBytes > r.retainBytes && r.prunedBelow < limit {
+		r.pruneSlotLocked(r.prunedBelow)
+		r.prunedBelow++
+	}
+}
+
+func (r *Replica) pruneSlotLocked(slot uint64) {
+	r.pruneDedupForSlotLocked(slot)
+	if e := r.globalLog[slot]; e != nil {
+		r.releaseEntryBytesLocked(e)
+	}
+	delete(r.globalLog, slot)
+	delete(r.slotMeta, slot)
+}
+
+// pruneDedupForSlotLocked releases the dedup entries whose log index was first
+// assigned at this slot. Without it dedup is the one map that grows forever —
+// one entry per unique request for the life of the process. Dropping them is
+// safe below the commit point: a request in a stable bus has committed at a
+// quorum, so the client has stopped re-boarding it and will never need its index
+// handed back.
+//
+// The range comes off the entry rather than the log-index ring. The cursor
+// commits a whole run of slots at once whenever a hole fills, so by the time
+// prune sees them most are already further back than the ring reaches — reading
+// it here silently skipped them, and the map kept growing.
+func (r *Replica) pruneDedupForSlotLocked(slot uint64) {
+	e := r.globalLog[slot]
+	if e == nil || len(e.requests) == 0 {
+		return
+	}
+	for i := range e.requests {
+		req := &e.requests[i]
+		key := reqKey{req.ClientId, req.RequestId}
+		if li, seen := r.dedup[key]; seen && li >= e.logIdxLo && li < e.logIdxHi {
+			delete(r.dedup, key)
+		}
 	}
 }
 
@@ -811,6 +1232,7 @@ func (r *Replica) appendBusToLogListLocked(slot uint64) []uint64 {
 		return nil
 	}
 	logIdxs := make([]uint64, 0, len(e.requests))
+	e.logIdxLo = r.nextLogIndex
 	for i := range e.requests {
 		req := &e.requests[i]
 		key := reqKey{req.ClientId, req.RequestId}
@@ -826,6 +1248,7 @@ func (r *Replica) appendBusToLogListLocked(slot uint64) []uint64 {
 		logIdxs = append(logIdxs, li)
 		r.enqueueReply(req.ClientId, req.RequestId, slot, li)
 	}
+	e.logIdxHi = r.nextLogIndex
 	return logIdxs
 }
 
@@ -840,7 +1263,7 @@ func (r *Replica) enqueueReply(clientId, requestId, busSlot, logIndex uint64) {
 		requestId: requestId,
 		busSlot:   busSlot,
 		logIndex:  logIndex,
-		viewId:    r.viewId,
+		viewId:    r.view(),
 	})
 	if n := len(r.pendingReplies); n > r.winReplyMax {
 		r.winReplyMax = n
@@ -1018,6 +1441,9 @@ func (r *Replica) statsLoop() {
 		r.winGaps, r.winRecovered, r.winNoops = 0, 0, 0
 		r.winDropped = 0
 		r.winReplyMax = 0
+		status, stable, haveStable := r.status, r.stableSlot, r.haveStable
+		executed, resident, dedupSize := r.nextExpected, len(r.globalLog), len(r.dedup)
+		residentMB := r.residentBytes >> 20
 		r.mu.Unlock()
 		// durable logs carry their own mutex, so sample their backlog off r.mu.
 		durMax := 0
@@ -1038,8 +1464,14 @@ func (r *Replica) statsLoop() {
 		if recv > 0 {
 			avg = sum / int64(recv)
 		}
+		stableStr := "none"
+		if haveStable {
+			stableStr = strconv.FormatUint(stable, 10)
+		}
 		Notice("[%s] 1s: received=%d dropped=%d delta_avg=%+dus delta_min=%+dus delta_max=%+dus gaps=%d recovered=%d noops=%d reply_backlog_max=%d durable_backlog_max=%d",
 			r.self, recv, dropped, avg, min, max, gaps, recovered, noops, replyMax, durMax)
+		Notice("[%s] 1s: view=%d status=%s executed=%d stable=%s resident_slots=%d resident_mb=%d dedup=%d",
+			r.self, r.view(), status, executed, stableStr, resident, residentMB, dedupSize)
 	}
 }
 
@@ -1052,24 +1484,33 @@ func (r *Replica) connectPeers() {
 	}
 }
 
+// dialPeer keeps one outbound connection to peer j alive for the life of the
+// process. It parks after each successful dial and redials when the connection
+// is retired: a replica that never reconnects cannot be led by, or lead, anyone
+// who restarts a socket, which is the whole point of failure recovery.
 func (r *Replica) dialPeer(j int) {
 	addr := r.config.Replicas[j]
 	for {
 		conn, err := net.DialTimeout("tcp", addr, 3*time.Second)
-		if err == nil {
-			if tc, ok := conn.(*net.TCPConn); ok {
-				tc.SetNoDelay(true)
-			}
-			lw := &lockedWriter{w: bufio.NewWriter(conn)}
-			r.mu.Lock()
-			r.peerWriters[j] = lw
-			r.mu.Unlock()
-			Notice("[%s] connected to peer replica %d (%s)", r.self, j, addr)
-			return
+		if err != nil {
+			Warning("[%s] cannot connect to peer replica %d (%s): %v, retrying",
+				r.self, j, addr, err)
+			time.Sleep(time.Second)
+			continue
 		}
-		Warning("[%s] cannot connect to peer replica %d (%s): %v, retrying",
-			r.self, j, addr, err)
-		time.Sleep(time.Second)
+		if tc, ok := conn.(*net.TCPConn); ok {
+			tc.SetNoDelay(true)
+		}
+		lw := &lockedWriter{w: bufio.NewWriter(conn)}
+		r.mu.Lock()
+		r.peerWriters[j] = lw
+		r.mu.Unlock()
+		Notice("[%s] connected to peer replica %d (%s)", r.self, j, addr)
+
+		<-r.peerRedial[j]
+		conn.Close()
+		Notice("[%s] peer replica %d connection retired, redialing", r.self, j)
+		time.Sleep(200 * time.Millisecond)
 	}
 }
 
@@ -1078,12 +1519,46 @@ func (r *Replica) sendToPeer(j int, code uint8, msg wireMsg) {
 	lw := r.peerWriters[j]
 	r.mu.Unlock()
 	if lw == nil {
-		Warning("[%s] no peer connection to replica %d yet, dropping message", r.self, j)
-		return
+		return // dialPeer is already retrying; logging here would just spam
 	}
 	if err := lw.sendMsg(code, msg); err != nil {
 		Warning("[%s] send to peer %d failed: %v", r.self, j, err)
+		r.retirePeer(j, lw)
 	}
+}
+
+// retirePeer drops a broken peer writer and wakes its dialer. Passing lw guards
+// against retiring a connection that has already been replaced; peerConnLost
+// passes nil to retire whatever is current.
+func (r *Replica) retirePeer(j int, lw *lockedWriter) {
+	r.mu.Lock()
+	cleared := false
+	if lw == nil || r.peerWriters[j] == lw {
+		cleared = r.peerWriters[j] != nil
+		r.peerWriters[j] = nil
+	}
+	// A closed socket says the leader is gone far more definitively than silence
+	// does, so it trips suspicion at once instead of waiting out the heartbeat.
+	if j != r.idx && j == r.leaderIdx() {
+		r.leaderLost = true
+	}
+	r.mu.Unlock()
+	if cleared {
+		select {
+		case r.peerRedial[j] <- struct{}{}:
+		default:
+		}
+	}
+}
+
+// peerConnLost is called when the inbound connection from peer j closes, which
+// is what a killed peer looks like from here.
+func (r *Replica) peerConnLost(j int) {
+	if j < 0 || j >= r.config.N || j == r.idx {
+		return
+	}
+	Notice("[%s] lost inbound connection from peer replica %d", r.self, j)
+	r.retirePeer(j, nil)
 }
 
 func (r *Replica) broadcastToPeers(code uint8, msg wireMsg) {
@@ -1105,7 +1580,9 @@ func (r *Replica) gapDetectLoop() {
 		monoNow := nowNs()
 		var spawn []spawnInfo
 		r.mu.Lock()
-		if r.haveMax && len(r.clients) > 0 {
+		// With the cursor frozen every slot above nextExpected looks like a gap,
+		// and there is no leader to agree a no-op with anyway.
+		if r.status == statusNormal && r.haveMax && len(r.clients) > 0 {
 			r.genCursorUpToLocked(r.maxSlotSeen)
 			for slot := r.nextExpected; slot <= r.maxSlotSeen; slot++ {
 				if e := r.globalLog[slot]; e != nil && e.state != slotEmpty {
@@ -1161,7 +1638,7 @@ func (r *Replica) ownerLog(slot uint64) (uint64, uint64) {
 }
 
 func (r *Replica) followerRecover(slot uint64, gs *gapState) {
-	leader := r.config.LeaderIndex(r.viewId)
+	leader := r.leaderIdx()
 	r.sendToPeer(leader, MsgBusGapRequest,
 		&BusGapRequest{Slot: slot, SenderIdx: uint32(r.idx)})
 
@@ -1258,7 +1735,7 @@ probe:
 	r.mu.Unlock()
 
 	r.broadcastToPeers(MsgBusGapCommit,
-		&BusGapCommit{Slot: slot, SenderIdx: uint32(r.idx), ViewId: r.viewId})
+		&BusGapCommit{Slot: slot, SenderIdx: uint32(r.idx), ViewId: r.view()})
 	acks := 1
 	timeout = time.After(gapProtocolTimeout)
 collect:
@@ -1290,6 +1767,10 @@ func (r *Replica) answerAskers(slot uint64, askers []uint32, op []byte, isBus bo
 func (r *Replica) handleGapRequest(msg *BusGapRequest) {
 	slot := msg.Slot
 	r.mu.Lock()
+	if r.status != statusNormal {
+		r.mu.Unlock()
+		return
+	}
 	st := r.slotStateLocked(slot)
 	op, isBus := r.slotGapPayloadLocked(slot)
 	r.mu.Unlock()
@@ -1310,7 +1791,7 @@ func (r *Replica) handleGapRequest(msg *BusGapRequest) {
 			&BusGapReply{Slot: slot, SenderIdx: uint32(r.idx), Found: true, Bus: isBus, Op: op})
 	case slotNoOp:
 		r.sendToPeer(int(msg.SenderIdx), MsgBusGapCommit,
-			&BusGapCommit{Slot: slot, SenderIdx: uint32(r.idx), ViewId: r.viewId})
+			&BusGapCommit{Slot: slot, SenderIdx: uint32(r.idx), ViewId: r.view()})
 	default:
 		r.ensureLeaderResolve(slot, msg.SenderIdx)
 	}
@@ -1340,8 +1821,9 @@ func (r *Replica) handleGapReply(msg *BusGapReply) {
 	key := gapKey{msg.Slot}
 	r.mu.Lock()
 	gs := r.gaps[key]
+	frozen := r.status != statusNormal
 	r.mu.Unlock()
-	if gs == nil {
+	if gs == nil || frozen {
 		return
 	}
 	if r.AmLeader() {
@@ -1370,6 +1852,13 @@ func (r *Replica) handleGapReply(msg *BusGapReply) {
 func (r *Replica) handleGapCommit(msg *BusGapCommit) {
 	key := gapKey{msg.Slot}
 	r.mu.Lock()
+	// A no-op is a decision of one view. Applying one announced by a leader we
+	// have already deposed would overwrite a slot the new view may have merged
+	// differently, so stale commits are dropped rather than obeyed.
+	if r.status != statusNormal || msg.ViewId != r.view() {
+		r.mu.Unlock()
+		return
+	}
 	if r.setNoOpLocked(msg.Slot) {
 		r.durableAppendLocked(msg.Slot, nil, true)
 		r.winNoops++

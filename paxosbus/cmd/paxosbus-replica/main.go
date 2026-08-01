@@ -19,6 +19,16 @@ func main() {
 		"drop a slot when requestId %% drop-every == 0 (0 = disabled)")
 	gapDeltaMs := flag.Uint64("gap-delta-ms", 5000,
 		"how long past a slot's expected arrival before it is treated as a gap; must exceed max one-way delay + prediction error")
+	syncIntervalMs := flag.Uint64("sync-interval-ms", 500,
+		"leader heartbeat / commit-point interval in ms")
+	suspectTimeoutMs := flag.Uint64("suspect-timeout-ms", 5000,
+		"how long without a leader heartbeat before suspecting it and starting a view change")
+	viewChangeTimeoutMs := flag.Uint64("view-change-timeout-ms", 15000,
+		"how long the new leader waits for a view-change quorum before moving to the next view")
+	retainSlots := flag.Uint64("retain-slots", 1<<14,
+		"how many committed slots stay in memory; older ones are served from the durable log instead")
+	retainMB := flag.Uint64("retain-mb", 256,
+		"cap on retained request payloads in MB; reclaims past -retain-slots when a bus carries many requests")
 	flag.Parse()
 
 	if *configPath == "" || *index < 0 {
@@ -43,7 +53,14 @@ func main() {
 		os.Exit(1)
 	}
 
-	replica := paxosbus.NewReplica(config, *index, *label, *logDir, mode, *dropEvery, *gapDeltaMs)
+	replica := paxosbus.NewReplica(config, *index, *label, *logDir, mode, *dropEvery, *gapDeltaMs,
+		paxosbus.RecoveryOptions{
+			SyncIntervalMs:      *syncIntervalMs,
+			SuspectTimeoutMs:    *suspectTimeoutMs,
+			ViewChangeTimeoutMs: *viewChangeTimeoutMs,
+			RetainSlots:         *retainSlots,
+			RetainBytes:         *retainMB << 20,
+		})
 	if err := replica.Run(); err != nil {
 		fmt.Fprintf(os.Stderr, "replica failed: %v\n", err)
 		os.Exit(1)
