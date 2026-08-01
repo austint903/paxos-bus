@@ -24,10 +24,23 @@ var requestOp = func() []byte {
 	return op
 }()
 
+// Votes are counted per view, never across them. A view change can hand a
+// replica an entry it had logged but never acknowledged, so it replies again in
+// the new view — and those replies must not be added to the ones the request
+// collected before the old leader died. Two half-quorums from two views are not
+// a quorum: the request simply has not committed, and the resend path re-boards
+// it (dedup hands back its original log index, so the votes it earns next are
+// for the same entry). Where a request really did commit in the old view, the
+// sticky committed flag makes the new view's extra replies a no-op.
+type voteKey struct {
+	logIndex uint64
+	viewId   uint64
+}
+
 type inflightEntry struct {
 	sendTimeNs      int64
 	firstSendTimeNs int64
-	replicaMask     uint32
+	masks           map[uint64]uint32 // viewId -> replicas that replied in it
 	replyCount      int
 	origReqId       uint64
 	attempts        uint32
@@ -38,7 +51,7 @@ type reqInflight struct {
 	sendTimeNs  int64
 	firstSendNs int64
 	op          []byte
-	votes       map[uint64]uint32
+	votes       map[voteKey]uint32
 	committed   bool
 }
 
@@ -440,7 +453,7 @@ func (c *Client) sendBus() {
 			if genNs == 0 {
 				genNs = now
 			}
-			e = &reqInflight{firstSendNs: genNs, op: reqs[i].Op, votes: make(map[uint64]uint32)}
+			e = &reqInflight{firstSendNs: genNs, op: reqs[i].Op, votes: make(map[voteKey]uint32)}
 			c.rInflight[rid] = e
 		}
 		e.sendTimeNs = now
@@ -521,6 +534,7 @@ func (c *Client) sendRequest(reqId, origReqId uint64, firstSendNs int64, attempt
 	c.inflight[reqId] = &inflightEntry{
 		sendTimeNs:      now,
 		firstSendTimeNs: firstSendNs,
+		masks:           make(map[uint64]uint32),
 		origReqId:       origReqId,
 		attempts:        attempts,
 	}
@@ -602,13 +616,14 @@ func (c *Client) handleRequestReply(msg *RequestReplyMessage) {
 		return
 	}
 	bit := uint32(1) << msg.ReplicaIdx
-	mask := e.votes[msg.LogIndex]
+	vk := voteKey{logIndex: msg.LogIndex, viewId: msg.ViewId}
+	mask := e.votes[vk]
 	if mask&bit != 0 {
 		c.mu.Unlock()
 		return
 	}
 	mask |= bit
-	e.votes[msg.LogIndex] = mask
+	e.votes[vk] = mask
 	replyRttUs := (now - e.sendTimeNs) / 1000
 
 	justCommitted := !e.committed && c.quorumReached(mask, msg.ViewId)
@@ -643,15 +658,17 @@ func (c *Client) handleBusReply(msg *BusReplyMessage) {
 		return
 	}
 	bit := uint32(1) << msg.ReplicaIdx
-	if e.replicaMask&bit != 0 {
+	mask := e.masks[msg.ViewId]
+	if mask&bit != 0 {
 		c.mu.Unlock()
 		return
 	}
-	e.replicaMask |= bit
+	mask |= bit
+	e.masks[msg.ViewId] = mask
 	e.replyCount++
 	replyRttUs := (now - e.sendTimeNs) / 1000
 
-	justCommitted := !e.committed && c.quorumReached(e.replicaMask, msg.ViewId)
+	justCommitted := !e.committed && c.quorumReached(mask, msg.ViewId)
 	var rttUs, totalUs int64
 	var origReqId uint64
 	var attempts uint32
