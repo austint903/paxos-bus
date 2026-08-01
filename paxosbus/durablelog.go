@@ -16,6 +16,29 @@ type durableLog struct {
 	f *os.File
 	w *bufio.Writer
 
+	// flushReq lets a reader ask writeLoop to push the buffer to the file
+	// before it looks at it. Reads are rare and never on the hot path, so this
+	// costs the writer nothing in the normal case.
+	flushReq chan chan struct{}
+
+	// Read side. rf is a second, read-only descriptor so a state transfer never
+	// disturbs the writer's position. offIdx is a sparse key -> offset table
+	// built as records are written (every offStride-th key), which is what makes
+	// a lookup a short forward scan instead of a walk from the start of the file.
+	// r* is a cursor: consecutive lookups walk forward in key order, so a range
+	// read of a thousand slots is one linear pass.
+	idxMu     sync.Mutex
+	offIdx    []int64
+	firstKey  uint64
+	haveFirst bool
+
+	readMu sync.Mutex
+	rf     *os.File
+	rbr    *bufio.Reader
+	rKey   uint64
+	rOff   int64
+	rValid bool
+
 	// pending is an unbounded in-memory hand-off to writeLoop. The hot path
 	// (record*) only appends under mu and never blocks on the disk goroutine, so
 	// a disk latency spike can't stall the caller's r.mu — it just grows this
@@ -46,6 +69,11 @@ const durableSyncInterval = time.Second
 
 const holeRecordWidth = 256
 
+// offStride is how many records separate two entries of the sparse offset
+// index: one int64 per 1024 records is negligible memory, and it bounds a
+// lookup's forward scan to at most that many lines.
+const offStride = 1024
+
 func openDurableLog(dir, name string) (*durableLog, error) {
 	path := filepath.Join(dir, name)
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY, 0o644)
@@ -57,13 +85,21 @@ func openDurableLog(dir, name string) (*durableLog, error) {
 		f.Close()
 		return nil, err
 	}
+	rf, err := os.Open(path)
+	if err != nil {
+		f.Close()
+		return nil, err
+	}
 	cl := &durableLog{
-		f:       f,
-		w:       bufio.NewWriterSize(f, durableLogBufBytes),
-		wake:    make(chan struct{}, 1),
-		closed:  make(chan struct{}),
-		tailOff: off,
-		holes:   make(map[uint64]int64),
+		f:        f,
+		w:        bufio.NewWriterSize(f, durableLogBufBytes),
+		wake:     make(chan struct{}, 1),
+		flushReq: make(chan chan struct{}, 4),
+		closed:   make(chan struct{}),
+		tailOff:  off,
+		holes:    make(map[uint64]int64),
+		rf:       rf,
+		rbr:      bufio.NewReaderSize(rf, 1<<15),
 	}
 	go cl.writeLoop()
 	return cl, nil
@@ -162,34 +198,62 @@ func (cl *durableLog) writeLoop() {
 	for {
 		select {
 		case <-cl.wake:
+		case ack := <-cl.flushReq:
+			// Drain before flushing: a reader wants everything recorded so far
+			// to be visible in the file, not just whatever had already been
+			// handed to the buffer.
+			cl.drain()
+			cl.w.Flush()
+			close(ack)
+			continue
 		case <-ticker.C:
 			cl.w.Flush()
 			cl.f.Sync()
 			continue
 		}
-		// Drain the whole pending buffer (swapped out under mu so the hot path
-		// keeps appending while we do disk I/O off-lock), then, if we were asked
-		// to close, flush+sync+close once it's empty.
-		for {
-			cl.mu.Lock()
-			batch := cl.pending
-			cl.pending = nil
-			closing := cl.closing
-			cl.mu.Unlock()
-			for i := range batch {
-				cl.apply(batch[i].slot, batch[i].body)
-			}
-			if len(batch) == 0 {
-				if closing {
-					cl.w.Flush()
-					cl.f.Sync()
-					cl.f.Close()
-					close(cl.closed)
-					return
-				}
-				break
-			}
+		if cl.drain() {
+			cl.w.Flush()
+			cl.f.Sync()
+			cl.f.Close()
+			cl.rf.Close()
+			close(cl.closed)
+			return
 		}
+	}
+}
+
+// drain writes out the whole pending buffer, swapped out under mu so the hot
+// path keeps appending while disk I/O happens off-lock. It reports whether a
+// close was requested once the buffer had emptied.
+func (cl *durableLog) drain() (closing bool) {
+	for {
+		cl.mu.Lock()
+		batch := cl.pending
+		cl.pending = nil
+		closing = cl.closing
+		cl.mu.Unlock()
+		for i := range batch {
+			cl.apply(batch[i].slot, batch[i].body)
+		}
+		if len(batch) == 0 {
+			return closing
+		}
+	}
+}
+
+// flushForRead makes every record pushed so far visible through the read
+// descriptor.
+func (cl *durableLog) flushForRead() {
+	ack := make(chan struct{})
+	select {
+	case cl.flushReq <- ack:
+	default:
+		return // a flush is already queued; its result is good enough
+	}
+	select {
+	case <-ack:
+	case <-time.After(2 * time.Second):
+		Warning("durable log flush for read timed out")
 	}
 }
 
@@ -205,11 +269,27 @@ func (cl *durableLog) apply(slot uint64, body string) {
 
 	for s := cl.nextSlot; s < slot; s++ {
 		off := cl.tailOff
+		cl.noteOffset(s)
 		cl.writeAtTail(padLine(placeholderBody(s)))
 		cl.holes[s] = off
 	}
+	cl.noteOffset(slot)
 	cl.writeAtTail([]byte(body + "\n"))
 	cl.nextSlot = slot + 1
+}
+
+// noteOffset extends the sparse offset index. Every key from the first one
+// written onwards gets a line (holes are filled with placeholders), so key
+// order and file order agree and a sampled offset is enough to find any key.
+func (cl *durableLog) noteOffset(key uint64) {
+	cl.idxMu.Lock()
+	if !cl.haveFirst {
+		cl.firstKey, cl.haveFirst = key, true
+	}
+	if key >= cl.firstKey && (key-cl.firstKey)%offStride == 0 {
+		cl.offIdx = append(cl.offIdx, cl.tailOff)
+	}
+	cl.idxMu.Unlock()
 }
 
 func (cl *durableLog) patchHole(slot uint64, body string) {
