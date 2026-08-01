@@ -15,12 +15,15 @@ DROP_MODE=none         # artificial drop scenario: none|leader|followers|all
 DROP_EVERY=0           # drop a slot when reqId % DROP_EVERY == 0 (0 = disabled)
 REQUEST_GEN=0          # 1 = request-generator mode (-r): batch requests onto buses
 GEN_INTERVAL_US=1      # request generation interval in µs (-r only; -g 1 -p 1 ≈ 1000 reqs/bus)
+KILL_AT_S=0            # kill the current leader this many seconds into the data phase (0 = never)
+KILL_COUNT=1           # how many successive leaders to kill (view 0 -> 1 -> 2 ...)
+RETAIN_SLOTS=16384     # committed slots kept in memory; smaller forces state transfer to read the durable log
 # ────────────────────────────────────────────────────────────────────────────
 
 FORCE_BUILD=0
 
 usage() {
-    echo "Usage: $0 [-b] [-r] [-g <gen_us>] [-p <interval_ms>] [-t <resend_ms>] [-d <seconds>] [-D <drop_mode>] [-F <drop_every>]"
+    echo "Usage: $0 [-b] [-r] [-g <gen_us>] [-p <interval_ms>] [-t <resend_ms>] [-d <seconds>] [-D <drop_mode>] [-F <drop_every>] [-K <seconds>] [-N <kills>]"
     echo "  -b            force rebuild of Docker image"
     echo "  -r            request-generator mode: batch requests onto buses (two-layer log)"
     echo "  -g <us>       request generation interval in µs (-r only; default: $GEN_INTERVAL_US)"
@@ -29,10 +32,14 @@ usage() {
     echo "  -d <seconds>  auto-stop after this many seconds of data phase (default: run until Ctrl+C)"
     echo "  -D <mode>     artificial drop scenario: none|leader|followers|all (default: $DROP_MODE)"
     echo "  -F <n>        drop a slot when reqId % n == 0 (default: $DROP_EVERY, 0=off)"
+    echo "  -K <seconds>  kill the leader this far into the data phase, to exercise view change (0=off)"
+    echo "  -N <kills>    how many successive leaders to kill (default: $KILL_COUNT; needs f spare replicas, so >1 wants -n 5)"
+    echo "  -n <count>    number of replicas (default: $NUM_REPLICAS; the config and f are generated to match)"
+    echo "  -R <slots>    committed slots kept in memory (default: $RETAIN_SLOTS; small values force disk-backed state transfer)"
     exit 1
 }
 
-while getopts "brg:p:t:d:D:F:h" opt; do
+while getopts "brg:p:t:d:D:F:K:N:n:R:h" opt; do
     case $opt in
         b) FORCE_BUILD=1 ;;
         r) REQUEST_GEN=1 ;;
@@ -42,6 +49,10 @@ while getopts "brg:p:t:d:D:F:h" opt; do
         d) DURATION_S=$OPTARG ;;
         D) DROP_MODE=$OPTARG ;;
         F) DROP_EVERY=$OPTARG ;;
+        K) KILL_AT_S=$OPTARG ;;
+        N) KILL_COUNT=$OPTARG ;;
+        n) NUM_REPLICAS=$OPTARG ;;
+        R) RETAIN_SLOTS=$OPTARG ;;
         h) usage ;;
         *) usage ;;
     esac
@@ -130,6 +141,8 @@ mkdir -p "$RUN_LOG_DIR"
     echo "drop_every=$DROP_EVERY"
     echo "request_gen=$REQUEST_GEN"
     echo "gen_interval_us=$GEN_INTERVAL_US"
+    echo "kill_at_s=$KILL_AT_S"
+    echo "kill_count=$KILL_COUNT"
 } > "$RUN_LOG_DIR/run-meta.txt"
 echo "Logs: $RUN_LOG_DIR"
 
@@ -159,6 +172,7 @@ for i in $(seq 0 $((NUM_REPLICAS - 1))); do
         "$IMAGE" \
         /paxosbus/paxosbus-replica -c /config/paxosbus.conf -i "$i" -d /durable \
             -drop-mode "$DROP_MODE" -drop-every "$DROP_EVERY" \
+            -retain-slots "$RETAIN_SLOTS" \
         > /dev/null
     CONTAINERS+=("$NAME")
 done
@@ -218,6 +232,26 @@ for i in $(seq 0 $((NUM_CLIENTS - 1))); do
         | sed "s/^/[client-$i]  /" &
     LOG_PIDS+=($!)
 done
+
+# ── Leader kill schedule (exercises view change) ────────────────────────────
+# The leader of view v is replica v % N, so killing replicas in index order
+# takes out each successive leader in turn.
+if [[ "$KILL_AT_S" -gt 0 ]]; then
+    KILL_GAP_S=25   # comfortably over suspect timeout (5s) + a view change
+    (
+        sleep $((SYNC_WARMUP_S + KILL_AT_S))
+        for k in $(seq 0 $((KILL_COUNT - 1))); do
+            VICTIM="paxosbus-replica-$((k % NUM_REPLICAS))"
+            echo ""
+            echo "══════ killing $VICTIM (leader of view $k) ══════"
+            docker kill "$VICTIM" &>/dev/null || true
+            if [[ $((k + 1)) -lt "$KILL_COUNT" ]]; then
+                sleep "$KILL_GAP_S"
+            fi
+        done
+    ) &
+    LOG_PIDS+=($!)
+fi
 
 if [[ "$DURATION_S" -gt 0 ]]; then
     # Bounded run: wait out the sync warmup + requested data-phase seconds, then
