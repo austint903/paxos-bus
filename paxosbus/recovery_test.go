@@ -514,3 +514,71 @@ func TestDurableLogReadBack(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// ── The view-change request quorum ──────────────────────────────────────────
+//
+// A replica must not send its BusViewChange on its own suspicion: it waits
+// until a quorum of replicas has asked for the view. testReplica has no peer
+// connections, and sendToPeer is a no-op without one, so these drive the gate
+// directly and read the decision off vcState.
+
+func vcRequestsSent(r *Replica) (n int, sent bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.vc == nil {
+		return 0, false
+	}
+	return len(r.vc.requests), r.vc.reportSent
+}
+
+func TestViewChangeReportWaitsForRequestQuorum(t *testing.T) {
+	r := testReplica(0) // view 1's leader is replica 1, so this one is a follower
+	r.startViewChange(1)
+
+	if n, sent := vcRequestsSent(r); n != 1 || sent {
+		t.Fatalf("after own suspicion: requests=%d sent=%v, want 1 and not sent", n, sent)
+	}
+	if r.status != statusViewChange || r.view() != 1 {
+		t.Fatalf("status=%v view=%d, want viewchange in view 1", r.status, r.view())
+	}
+
+	// The second request completes the quorum (f+1 = 2), and only now may the
+	// suffix report go out.
+	r.handleViewChangeRequest(&BusViewChangeRequest{ViewId: 1, SenderIdx: 2})
+	if n, sent := vcRequestsSent(r); n != 2 || !sent {
+		t.Fatalf("after peer request: requests=%d sent=%v, want 2 and sent", n, sent)
+	}
+}
+
+func TestViewChangeRequestFromPeerReachesQuorumImmediately(t *testing.T) {
+	// A replica woken by someone else's request already has two: its own and the
+	// waker's. It must not wait another half round trip for a third.
+	r := testReplica(0)
+	r.handleViewChangeRequest(&BusViewChangeRequest{ViewId: 1, SenderIdx: 2})
+
+	if n, sent := vcRequestsSent(r); n != 2 || !sent {
+		t.Fatalf("woken by peer: requests=%d sent=%v, want 2 and sent", n, sent)
+	}
+}
+
+func TestViewChangeReportSentOnlyOnce(t *testing.T) {
+	r := testReplica(0)
+	r.startViewChange(1)
+	r.handleViewChangeRequest(&BusViewChangeRequest{ViewId: 1, SenderIdx: 2})
+
+	// Re-delivery of the same request must neither inflate the quorum count nor
+	// clear the latch that stops a second report going out.
+	r.handleViewChangeRequest(&BusViewChangeRequest{ViewId: 1, SenderIdx: 2})
+	if n, sent := vcRequestsSent(r); n != 2 || !sent {
+		t.Fatalf("duplicate request: requests=%d sent=%v, want 2 and still sent", n, sent)
+	}
+}
+
+func TestStaleViewChangeRequestIgnored(t *testing.T) {
+	r := testReplica(0)
+	r.startViewChange(2)
+	r.handleViewChangeRequest(&BusViewChangeRequest{ViewId: 1, SenderIdx: 2})
+	if n, sent := vcRequestsSent(r); n != 1 || sent {
+		t.Fatalf("stale request counted: requests=%d sent=%v, want 1 and not sent", n, sent)
+	}
+}
