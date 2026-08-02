@@ -19,10 +19,16 @@ import (
 )
 
 const (
-	// suspicionTick is how often a follower checks the heartbeat clock. It is
-	// far finer than the suspect timeout so that the fast path — a peer socket
-	// closing — converts into a view change essentially immediately.
-	suspicionTick = 100 * time.Millisecond
+	// suspicionTick is how often a follower checks the heartbeat clock and the
+	// lost-connection flag. The flag is set the instant the leader's socket
+	// breaks, so this interval is pure added latency on the fast path, and it
+	// has to stay well under the spread in when replicas notice a failure
+	// (the difference in their one-way delay from the leader, ~10ms on our
+	// testbed). Otherwise replicas suspect at times set by their own tick
+	// phases rather than by the network, one wakes the others with its request
+	// instead of everyone multicasting together, and collecting a quorum of
+	// requests costs a full round trip instead of half.
+	suspicionTick = 5 * time.Millisecond
 
 	// stateChunkBytes caps a BusNewState by payload size rather than slot count:
 	// one bus can carry a thousand requests, so a fixed slot count would swing
