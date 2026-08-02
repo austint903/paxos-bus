@@ -254,18 +254,27 @@ func (r *Replica) suspicionLoop() {
 
 // ── View change ─────────────────────────────────────────────────────────────
 
-// vcState collects one view change's reports on the new leader.
+// vcState is one view change in progress. Every replica keeps one, because
+// every replica has to count BusViewChangeRequests before it may report; only
+// the new leader drains reports.
 type vcState struct {
 	view    uint64
 	reports chan *BusViewChange
 	abort   chan struct{}
+
+	// requests are the replicas that have asked for this view, including us.
+	// A replica sends its own BusViewChange only once a quorum of them has
+	// arrived, so no replica ships its suffix on one machine's suspicion alone.
+	requests   map[uint32]struct{}
+	reportSent bool
 }
 
 func newVCState(view uint64, n int) *vcState {
 	return &vcState{
-		view:    view,
-		reports: make(chan *BusViewChange, n),
-		abort:   make(chan struct{}),
+		view:     view,
+		reports:  make(chan *BusViewChange, n),
+		abort:    make(chan struct{}),
+		requests: make(map[uint32]struct{}, n),
 	}
 }
 
@@ -289,36 +298,72 @@ func (r *Replica) startViewChange(newView uint64) {
 	// merge is about to decide. They time out on their own.
 	r.gaps = make(map[gapKey]*gapState)
 	r.drainPendingBusesLocked()
-	report := r.buildViewChangeLocked(newView)
 	leader := r.config.LeaderIndex(newView)
-	var vc *vcState
-	if leader == r.idx {
-		vc = newVCState(newView, r.config.N)
-		r.vc = vc
-	}
+	vc := newVCState(newView, r.config.N)
+	vc.requests[uint32(r.idx)] = struct{}{} // our own suspicion is one request
+	r.vc = vc
+	stable, next, maxFilled := r.stableSlot, r.nextExpected, r.maxSlotSeen
 	r.mu.Unlock()
 
 	Notice("[%s] VIEW-CHANGE start view=%d new_leader=%d stable=%d executed=%d max_filled=%d",
-		r.self, newView, leader, report.StableSlot, report.NextExpected, report.MaxSlotFilled)
+		r.self, newView, leader, stable, next, maxFilled)
 
 	// Everyone who hears this joins the same view immediately instead of waiting
-	// out their own timer, so the new leader has its quorum in about half a round
-	// trip (the VR-revisited optimisation).
+	// out their own timer, so a quorum of requests forms in about half a round
+	// trip when replicas notice together (the VR-revisited optimisation).
 	r.broadcastToPeers(MsgBusViewChangeRequest,
 		&BusViewChangeRequest{ViewId: newView, SenderIdx: uint32(r.idx)})
 
 	if leader == r.idx {
 		go r.driveViewChange(vc)
+	}
+}
+
+// handleViewChangeRequest counts requests for this view and, on the f+1st,
+// sends our suffix report to the new leader. Anyone not already in the view
+// change joins it here, which is what makes the quorum form in half a round
+// trip: a replica that noticed on its own has already multicast its request, so
+// everyone holds the quorum one one-way delay after the earliest detection. It
+// costs a full round trip only when a single replica notices alone and the
+// others have to be woken by its request.
+func (r *Replica) handleViewChangeRequest(msg *BusViewChangeRequest) {
+	if msg.ViewId > r.view() {
+		r.startViewChange(msg.ViewId) // sets ViewChange status, multicasts our own
+	}
+	if msg.ViewId != r.view() {
+		return
+	}
+
+	r.mu.Lock()
+	vc := r.vc
+	if vc == nil || vc.view != msg.ViewId || vc.reportSent {
+		r.mu.Unlock()
+		return
+	}
+	vc.requests[msg.SenderIdx] = struct{}{}
+	// Our own suspicion is already in the set, so this is f+1 counting ourselves.
+	// Any configuration that can survive a failure has f >= 1, so the quorum is
+	// never reached before some peer's request arrives here.
+	if len(vc.requests) < r.config.QuorumSize() {
+		r.mu.Unlock()
+		return
+	}
+	vc.reportSent = true
+	nreq := len(vc.requests)
+	report := r.buildViewChangeLocked(msg.ViewId)
+	leader := r.config.LeaderIndex(msg.ViewId)
+	r.mu.Unlock()
+
+	Notice("[%s] view %d: %d view-change requests, sending report to leader %d "+
+		"(stable=%d executed=%d max_filled=%d)",
+		r.self, msg.ViewId, nreq, leader, report.StableSlot, report.NextExpected,
+		report.MaxSlotFilled)
+
+	if leader == r.idx {
 		r.deliverViewChange(report)
 		return
 	}
 	r.sendToPeer(leader, MsgBusViewChange, report)
-}
-
-func (r *Replica) handleViewChangeRequest(msg *BusViewChangeRequest) {
-	if msg.ViewId > r.view() {
-		r.startViewChange(msg.ViewId)
-	}
 }
 
 func (r *Replica) handleViewChange(msg *BusViewChange) {
