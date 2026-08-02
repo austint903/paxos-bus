@@ -264,6 +264,10 @@ def print_run(r):
     print(f"  latency (<1s)   {fmt_lat(r['lat_clean'])}")
     print(f"  recovery gap    max={r['gap_max']*1000:8.1f}ms  median={r['gap_med']*1000:8.1f}ms  "
           f"min={r['gap_min']*1000:8.1f}ms   (across {len(r['gaps'])} clients)")
+    n_str = len(r["lat_all"]) - len(r["lat_clean"])
+    worst = max(r["lat_all"]) / 1e6 if r["lat_all"] else 0.0
+    print(f"  stranded        {n_str} requests took >1s (worst {worst:.2f}s) — "
+          f"in flight across the kill, invisible to the gap above")
     if r["protocol_s"] is not None:
         print(f"  view change     {r['protocol_s']*1000:.1f}ms on replica {r['new_leader']} "
               f"(start -> done, its own clock)")
@@ -351,6 +355,7 @@ def main():
     # the worst client in that run.
     print(f"  recovery gap (med)  {stat([r['gap_med'] for r in results], 'ms', 1000, 1)}")
     print(f"  recovery gap (max)  {stat([r['gap_max'] for r in results], 'ms', 1000, 1)}")
+    print(f"  stranded reqs       {stat([len(r['lat_all']) - len(r['lat_clean']) for r in results], '', 1, 0)}")
     prot = [r["protocol_s"] for r in results if r["protocol_s"] is not None]
     if prot:
         print(f"  view change proper  {stat(prot, 'ms', 1000, 1)}  ({len(prot)}/{len(results)} runs)")
