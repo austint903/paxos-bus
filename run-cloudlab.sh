@@ -78,10 +78,24 @@ CLIENTS_PER_HOST="${CLIENTS_PER_HOST:-3}"
 RESEND_MS="${RESEND_MS:-5000}"
 SCALE="${SCALE:-small}"
 TRANSPORT="${TRANSPORT:-direct}"
+# Failure-recovery experiment: SIGKILL the leader replica this many seconds into
+# the DATA phase (0 = never). Clients keep running, so the recovery cost shows up
+# as a gap in their commit stream — see cloudlab/aggregate-viewchange-stats.py.
+KILL_LEADER_AT_S="${KILL_LEADER_AT_S:-0}"
+# Subdirectory under paxosbus/logs/cloudlab/ to collect into, so a view-change
+# campaign does not intermix with the throughput-latency runs.
+# Extra flags appended verbatim to every paxosbus-replica command line, e.g.
+# REPLICA_FLAGS="-sync-interval-ms 5000 -retain-slots 262144". Recorded in
+# run-meta.txt so a run's tuning is recoverable from its own log directory.
+REPLICA_FLAGS="${REPLICA_FLAGS:-}"
+RUN_SUBDIR="${RUN_SUBDIR:-}"
+RUN_TAG="${RUN_TAG:-}"
 REPO_URL="${REPO_URL:-https://github.com/austint903/paxos-bus.git}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 NODES_FILE="${NODES_FILE:-$SCRIPT_DIR/cloudlab/nodes.env}"
+
+KILL_INFO_FILE="$(mktemp -t paxosbus-kill)"   # written by kill_leader_after, collected into the run dir
 
 BIN=/local/paxosbus-cloudlab/bin     # built by cloudlab/setup.sh
 CONF=/tmp/paxosbus.conf              # pushed to each node
@@ -163,7 +177,12 @@ clients_on_replica() {
     echo 0
 }
 
-SSH_OPTS=(-o StrictHostKeyChecking=accept-new -o ConnectTimeout=15 -o BatchMode=yes)
+# Keepalives matter here: a long setup/tail ssh that dies mid-flight (the
+# laptop's socket layer hiccuping is enough) otherwise leaves that node holding
+# a STALE BINARY while the run proceeds and reports success. verify_binaries()
+# is the backstop; these just make the drop far less likely.
+SSH_OPTS=(-o StrictHostKeyChecking=accept-new -o ConnectTimeout=15 -o BatchMode=yes
+          -o ServerAliveInterval=15 -o ServerAliveCountMax=8)
 ssh_to()   { ssh "${SSH_OPTS[@]}" "$SSH_USER@$1" "$2"; }
 scp_from() { scp "${SSH_OPTS[@]}" "$SSH_USER@$1:$2" "$3"; }
 scp_to()   { scp "${SSH_OPTS[@]}" "$3" "$SSH_USER@$1:$2"; }
@@ -197,6 +216,32 @@ ensure_ready() {
         REPO_URL=$REPO_URL bash /local/paxos-bus/cloudlab/setup.sh'"
 }
 
+# ── Binary verification ──────────────────────────────────────────────────────
+# ensure_ready succeeding is NOT evidence the node rebuilt: an ssh that dies
+# mid-setup (a laptop socket hiccup will do it) leaves that node running the
+# PREVIOUS binary while the run proceeds and reports a clean exit. A whole
+# 60s x 9-client run then silently measures the wrong code. So check the
+# artefact, not the exit code: every node must report the same commit as
+# origin/master and a binary newer than that commit's checkout.
+verify_binaries() {
+    echo "==> Verifying every node built the expected commit"
+    local want ok=1 i sha built
+    want="$(git -C "$SCRIPT_DIR" rev-parse --short HEAD 2>/dev/null || echo '')"
+    for i in 0 1 2; do
+        read -r sha built <<<"$(ssh_to "${RHOST[$i]}" '
+            echo "$(sudo git -C /local/paxos-bus rev-parse --short HEAD 2>/dev/null || echo UNKNOWN) \
+                  $(( $(date +%s) - $(stat -c %Y /local/paxosbus-cloudlab/bin/paxosbus-replica 2>/dev/null || echo 0) ))"' 2>/dev/null)"
+        printf "  R%d %-10s sha=%s binary_age=%ss\n" "$i" "${RLABEL[$i]}" "${sha:-ERR}" "${built:-ERR}"
+        [[ -n "$want" && "$sha" != "$want" ]] && { echo "     ^ expected sha=$want"; ok=0; }
+        [[ -z "$sha" || "$sha" == UNKNOWN ]] && ok=0
+    done
+    [[ "$ok" == 1 ]] || {
+        echo "  ABORT: a node is not on the expected commit — re-run './run-cloudlab.sh setup' and retry."
+        echo "  (running anyway would produce numbers for the wrong code)"
+        exit 1
+    }
+}
+
 # ── Preflight: SSH reachable, binaries built, resolve control IPs ─────────────
 preflight() {
     echo "==> Preflight (SSH + setup) on all 3 nodes — one ssh process per node, in parallel"
@@ -211,6 +256,8 @@ preflight() {
     local rc=0
     for p in "${pids[@]}"; do wait "$p" || rc=1; done
     [[ "$rc" == 0 ]] || { echo "  preflight failed on at least one node (see above)"; exit 1; }
+
+    verify_binaries
 
     echo "==> Resolving public control IPs (parallel)"
     local ipd; ipd="$(mktemp -d)"
@@ -374,7 +421,7 @@ launch() {
             rm -rf /tmp/paxosbus-durable && mkdir -p /tmp/paxosbus-durable
             nohup $BIN/paxosbus-replica \
               -c $CONF -i $i -l ${RLABEL[$i]} -d /tmp/paxosbus-durable \
-              -drop-mode $DROP_MODE -drop-every $DROP_EVERY \
+              -drop-mode $DROP_MODE -drop-every $DROP_EVERY $REPLICA_FLAGS \
               </dev/null >/tmp/paxosbus.log 2>&1 &
             sleep 1
             if pgrep -f '[p]axosbus-replica' >/dev/null; then
@@ -419,10 +466,46 @@ launch() {
     for p in "${cpids[@]}"; do wait "$p" || true; done
 }
 
+# kill_leader_after backgrounds the failure injection: wait out the sync delay
+# plus KILL_LEADER_AT_S of data phase, then SIGKILL the leader replica.
+#
+# SIGKILL, not a graceful stop, because the point is to measure what a crash
+# costs — and it also exercises the fast detection path, where the peers notice
+# the socket close rather than waiting out the heartbeat timeout.
+#
+# The kill instant is recorded twice: once on the leader's own clock and once on
+# the laptop's. Neither is used to measure the recovery gap (that comes from a
+# single client's own commit stream, which needs no cross-node clock alignment)
+# — they are there to confirm the gap found is the one the kill caused.
+kill_leader_after() {
+    local wait_s=$((START_DELAY_MS / 1000 + KILL_LEADER_AT_S))
+    local lh="${RHOST[$LEADER_IDX]}"
+    (
+        sleep "$wait_s"
+        local remote_ts
+        remote_ts="$(ssh_to "$lh" "date +%s.%N; pkill -9 -f '[p]axosbus-replica' || true" 2>/dev/null | head -1)"
+        {
+            echo "kill_leader_idx=$LEADER_IDX"
+            echo "kill_leader_label=${RLABEL[$LEADER_IDX]}"
+            echo "kill_leader_host=$lh"
+            echo "kill_at_data_phase_s=$KILL_LEADER_AT_S"
+            echo "kill_wall_local=$(date +%s.%N)"
+            echo "kill_wall_leader=$remote_ts"
+        } > "$KILL_INFO_FILE"
+        echo ""
+        echo "══════ KILLED leader replica $LEADER_IDX (${RLABEL[$LEADER_IDX]}) at +${KILL_LEADER_AT_S}s of data phase ══════"
+    ) &
+    LOCAL_BG_PIDS+=($!)
+}
+
 tail_logs() {
     # Data phase starts START_DELAY_MS after the syncs, so keep the run alive
     # for delay + duration + slack.
     local run_for=$((DURATION_S + START_DELAY_MS / 1000 + 6))
+    if [[ "$KILL_LEADER_AT_S" != "0" ]]; then
+        echo "==> Leader kill armed: replica $LEADER_IDX (${RLABEL[$LEADER_IDX]}) at +${KILL_LEADER_AT_S}s into the data phase"
+        kill_leader_after
+    fi
     echo ""
     echo "==> Live tail (running for ${run_for}s; tailing replicas + first client per host)"
     echo "----------------------------------------------------------------"
@@ -451,11 +534,20 @@ collect() {
     done
     for p in "${sp[@]}"; do wait "$p" || true; done
 
-    local ts run_dir durable_dir
+    local ts run_dir durable_dir base name
     ts=$(date +%Y%m%d-%H%M%S)
-    run_dir="$SCRIPT_DIR/paxosbus/logs/cloudlab/cloudlab-run-$ts"
-    durable_dir="$SCRIPT_DIR/paxosbus/logs/durable/cloudlab/cloudlab-run-$ts"
+    name="cloudlab-run-$ts"
+    [[ -n "$RUN_TAG" ]] && name="$name-$RUN_TAG"
+    base="$SCRIPT_DIR/paxosbus/logs/cloudlab"
+    [[ -n "$RUN_SUBDIR" ]] && base="$base/$RUN_SUBDIR"
+    run_dir="$base/$name"
+    # Durable logs land WITH the run that produced them. The old parallel tree
+    # (logs/durable/cloudlab/) ignored RUN_SUBDIR, so a campaign run scattered its
+    # evidence across two directories; the durable log is only meaningful next to
+    # the replica log that says what the replica was doing when it wrote it.
+    durable_dir="$run_dir/durable"
     mkdir -p "$run_dir"
+    RUN_DIR_OUT="$run_dir"     # so a driver can find what this run produced
 
     echo "==> Collecting logs -> $run_dir"
     for i in 0 1 2; do
@@ -463,8 +555,14 @@ collect() {
             || echo "  WARN: no /tmp/paxosbus.log on ${RHOST[$i]}"
         if [[ "$COLLECT_DURABLE" == "1" ]]; then
             mkdir -p "$durable_dir"
-            scp "${SSH_OPTS[@]}" -r "$SSH_USER@${RHOST[$i]}:/tmp/paxosbus-durable" "$durable_dir/replica-$i" \
-                || echo "  WARN: no durable logs on ${RHOST[$i]}"
+            # -C: these are tens of MB of repetitive text per replica, and the
+            # next run deletes them on the node, so the copy has to succeed here.
+            if scp "${SSH_OPTS[@]}" -C -r "$SSH_USER@${RHOST[$i]}:/tmp/paxosbus-durable" \
+                   "$durable_dir/replica-$i"; then
+                echo "  durable r$i: $(du -sh "$durable_dir/replica-$i" 2>/dev/null | cut -f1) -> $durable_dir/replica-$i"
+            else
+                echo "  WARN: durable logs NOT collected from ${RHOST[$i]} — they will be erased by the next run"
+            fi
         fi
     done
     local pos
@@ -494,8 +592,16 @@ collect() {
         echo "gen_interval_us=$GEN_INTERVAL_US"
         echo "client_hosts=$(for pos in "${!CLIENT_HOST_IDXS[@]}"; do printf '%s ' "${RLABEL[${CLIENT_HOST_IDXS[$pos]}]}"; done)"
         echo "replicas=${RLABEL[*]}"
+        echo "kill_leader_at_s=$KILL_LEADER_AT_S"
+        echo "replica_flags=$REPLICA_FLAGS"
+        echo "leader_idx=$LEADER_IDX"
+        echo "leader_label=${RLABEL[$LEADER_IDX]}"
+        echo "commit=$(git -C "$SCRIPT_DIR" rev-parse --short HEAD 2>/dev/null || echo unknown)"
         if [[ "$DROP_MODE" != "none" && "$DROP_EVERY" -gt 0 ]]; then echo "mode=drop-$DROP_MODE"; else echo "mode=normal"; fi
     } > "$run_dir/run-meta.txt"
+
+    [[ -s "$KILL_INFO_FILE" ]] && cp "$KILL_INFO_FILE" "$run_dir/kill-info.txt"
+    echo "$run_dir" > "${RUN_DIR_POINTER:-/dev/null}"
 
     echo ""
     python3 "$SCRIPT_DIR/cloudlab/aggregate-stats.py" "$run_dir" \
