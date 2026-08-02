@@ -946,14 +946,72 @@ func (r *Replica) installViewLocked(view, stable uint64, hasStable bool,
 	r.status = statusNormal
 	r.lastHeartbeatNs = nowNs()
 	r.leaderLost = false
+	// A new view owes the client a reply for every slot above the commit point,
+	// in two ranges. What we had already executed was replied to under the old
+	// leader and has to be said again; what we had not is drained now and
+	// replied to for the first time. Both are stamped with the new view, since
+	// viewId is already stored.
+	replayFrom, replayTo := suffixBase(r.stableSlot, r.haveStable), r.nextExpected
+	if replayFrom < r.prunedBelow {
+		replayFrom = r.prunedBelow
+	}
 	// Unfrozen: this drains every slot recorded during the view change and, for
 	// entries the merge handed us that we had never executed, sends the client
 	// the reply it never got before the crash.
 	r.advanceNextExpectedLocked()
+	r.replayRepliesLocked(replayFrom, replayTo)
 	if hasStable {
 		r.setStableLocked(stable)
 	}
 	return rewound, didRewind
+}
+
+// replayRepliesLocked re-sends the replies for slots this replica had already
+// executed above the commit point, now stamped with the new view.
+//
+// A client counts a request committed on f+1 replies that agree, and requires
+// one of them to come from the leader of the view they were stamped with. A
+// replica goes on executing for as long as it takes to notice the leader is gone
+// — one one-way delay plus a suspicion tick, ~40ms on our testbed — and every
+// reply it sends in that window names a leader that is already dead, so those
+// replies can never add up. Without this the requests in them are stranded until
+// the client's own request timeout re-boards them seconds later, and that does
+// not show up in the recovery gap at all: the client is open-loop, so it goes on
+// committing newer requests while they wait.
+//
+// The commit point is the exact floor. A slot at or below it was acked by f+1
+// replicas, so the old leader had executed it, and a reply it enqueued before
+// dying is still delivered — the kernel flushes what was written before the FIN.
+// Above the commit point there is no such guarantee.
+//
+// Repeats are harmless: the client counts replies in a per-replica bitmask keyed
+// by log index and view, so a request that did commit just sees a duplicate.
+func (r *Replica) replayRepliesLocked(from, to uint64) {
+	if from >= to {
+		return
+	}
+	n := 0
+	for s := from; s < to; s++ {
+		e := r.globalLog[s]
+		if e == nil || e.state != slotReceived {
+			continue
+		}
+		for i := range e.requests {
+			req := &e.requests[i]
+			li, ok := r.dedup[reqKey{req.ClientId, req.RequestId}]
+			if !ok {
+				// First assigned below the prune floor, which never rises past the
+				// commit point: the request committed long ago.
+				continue
+			}
+			r.enqueueReply(req.ClientId, req.RequestId, s, li)
+			n++
+		}
+	}
+	if n > 0 {
+		Notice("[%s] view %d: replayed %d replies for executed slots [%d,%d)",
+			r.self, r.view(), n, from, to)
+	}
 }
 
 // rewindToLocked moves the cursor back to target, undoing speculative execution

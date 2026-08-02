@@ -316,6 +316,105 @@ func TestInstallViewConservativeRewindsToOwnCommitPoint(t *testing.T) {
 	}
 }
 
+// repliesBySlot summarises what installing a view queued for the client, and
+// fails the test if any of it still names the view we just left.
+func repliesBySlot(t *testing.T, r *Replica, wantView uint64) map[uint64]int {
+	t.Helper()
+	out := make(map[uint64]int)
+	for _, pr := range r.pendingReplies {
+		if pr.viewId != wantView {
+			t.Errorf("reply for slot %d stamped view %d, want %d",
+				pr.busSlot, pr.viewId, wantView)
+		}
+		if got, ok := r.dedup[reqKey{pr.clientId, pr.requestId}]; !ok || got != pr.logIndex {
+			t.Errorf("reply for request %d carries log index %d, want %d (present=%v)",
+				pr.requestId, pr.logIndex, got, ok)
+		}
+		out[pr.busSlot]++
+	}
+	return out
+}
+
+// A replica keeps executing for as long as it takes to notice the leader died,
+// and those replies name a leader that will never answer — the client's quorum
+// rule discards them. Installing the new view has to say them again, or the
+// requests sit stranded until the client's own request timeout re-boards them.
+func TestInstallViewReplaysRepliesAboveCommitPoint(t *testing.T) {
+	r := testReplica(0)
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	for s := uint64(0); s < 6; s++ {
+		busAt(r, s, s+1, s*10+1, s*10+2)
+	}
+	r.advanceNextExpectedLocked() // executed under the old leader, replies in view 0
+	r.setStableLocked(2)
+	r.pendingReplies = nil // the view-0 replies; the client could never count them
+
+	// A bus that arrived while the cursor was frozen, so this replica has
+	// recorded it but never executed or replied for it.
+	r.status = statusViewChange
+	busAt(r, 6, 7, 61, 62)
+
+	r.installViewLocked(1, 2, true, nil, false)
+
+	got := repliesBySlot(t, r, 1)
+	want := map[uint64]int{3: 2, 4: 2, 5: 2, 6: 2}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("replies by slot = %v, want %v", got, want)
+	}
+	if r.nextExpected != 7 {
+		t.Errorf("cursor at %d, want 7", r.nextExpected)
+	}
+}
+
+// The replay range is taken after the rewind, so a slot the merge contradicted
+// is replied for by the re-executing cursor and not by the replay as well.
+func TestInstallViewReplayDoesNotDoubleCountRewoundSlots(t *testing.T) {
+	r := testReplica(0)
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	for s := uint64(0); s < 6; s++ {
+		busAt(r, s, s+1, s*10+1, s*10+2)
+	}
+	r.advanceNextExpectedLocked()
+	r.setStableLocked(2)
+	r.pendingReplies = nil
+
+	// The merge says slot 4 is a no-op: the cursor rewinds there, slot 4 loses
+	// its passengers, and slot 5 is re-executed behind it.
+	r.installViewLocked(1, 2, true, []uint64{4}, false)
+
+	got := repliesBySlot(t, r, 1)
+	want := map[uint64]int{3: 2, 5: 2} // 3 replayed, 5 re-executed, 4 gone
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("replies by slot = %v, want %v", got, want)
+	}
+}
+
+// Nothing at or below the commit point is worth saying again: it was acked by a
+// quorum, so the old leader had executed it and its reply was already on the
+// wire before it died.
+func TestInstallViewReplaySkipsCommittedPrefix(t *testing.T) {
+	r := testReplica(0)
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	for s := uint64(0); s < 4; s++ {
+		busAt(r, s, s+1, s*10+1)
+	}
+	r.advanceNextExpectedLocked()
+	r.setStableLocked(3) // everything executed is committed
+	r.pendingReplies = nil
+
+	r.installViewLocked(1, 3, true, nil, false)
+
+	if n := len(r.pendingReplies); n != 0 {
+		t.Errorf("%d replies queued for a fully committed log, want none", n)
+	}
+}
+
 // ── Memory reclamation ──────────────────────────────────────────────────────
 
 func TestPruneReleasesDedup(t *testing.T) {
