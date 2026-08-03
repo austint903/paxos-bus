@@ -19,10 +19,10 @@ func main() {
 		"drop a slot when requestId %% drop-every == 0 (0 = disabled)")
 	gapDeltaMs := flag.Uint64("gap-delta-ms", 5000,
 		"how long past a slot's expected arrival before it is treated as a gap; must exceed max one-way delay + prediction error")
-	syncIntervalMs := flag.Uint64("sync-interval-ms", 500,
-		"leader heartbeat / commit-point interval in ms")
-	suspectTimeoutMs := flag.Uint64("suspect-timeout-ms", 5000,
-		"how long without a leader heartbeat before suspecting it and starting a view change")
+	syncIntervalMs := flag.Uint64("sync-interval-ms", 100,
+		"leader heartbeat / commit-point interval in ms; must exceed the round trip to the nearest follower")
+	suspectTimeoutMs := flag.Uint64("suspect-timeout-ms", 1000,
+		"how long without a leader heartbeat before suspecting it and starting a view change; sized against TCP retransmission and node stalls, not as a multiple of the heartbeat")
 	viewChangeTimeoutMs := flag.Uint64("view-change-timeout-ms", 15000,
 		"how long the new leader waits for a view-change quorum before moving to the next view")
 	retainSlots := flag.Uint64("retain-slots", 1<<14,

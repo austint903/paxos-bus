@@ -314,9 +314,26 @@ type Replica struct {
 	winReplyMax   int
 }
 
-// RecoveryOptions tunes failure detection and the memory window. The timeouts
-// are deliberately slack: a spurious view change costs far more than noticing a
-// dead leader a second later.
+// RecoveryOptions tunes failure detection and the memory window.
+//
+// The heartbeat interval is not only liveness: each beat opens the round that
+// advances the commit point, so it also sets how far the commit point trails,
+// and with it the suffix a view change has to reconcile and the floor below
+// which memory may be reclaimed. It must stay comfortably above the round trip
+// to the nearest follower — syncLoop replaces the outstanding round every tick,
+// so a reply that arrives after the next beat is discarded and the commit point
+// stops advancing altogether.
+//
+// The suspect timeout is not a multiple of the heartbeat, because it answers a
+// different question: how long a healthy leader can plausibly go quiet. A crash
+// closes the socket and is noticed in a one-way delay regardless, so this figure
+// only bounds a leader that has gone silent without dying — hung, or partitioned
+// away. It is sized above the things that delay a beat on a working cluster: a
+// lost segment costs a 200ms retransmit floor and twice that if it happens
+// again, and the peer connections are sparse enough to fall back on that timer
+// rather than fast retransmit. Suspecting a leader that is merely slow is not
+// free — the rejoining leader lands on rewindToStableAndRefetch, which repairs a
+// divergence the view change cannot see on its own.
 type RecoveryOptions struct {
 	SyncIntervalMs      uint64
 	SuspectTimeoutMs    uint64
@@ -326,8 +343,8 @@ type RecoveryOptions struct {
 }
 
 const (
-	defaultSyncIntervalMs      = 500
-	defaultSuspectTimeoutMs    = 5000
+	defaultSyncIntervalMs      = 100
+	defaultSuspectTimeoutMs    = 1000
 	defaultViewChangeTimeoutMs = 15000
 	defaultRetainBytes         = 256 << 20
 )
