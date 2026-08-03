@@ -21,7 +21,7 @@ func main() {
 		"how long past a slot's expected arrival before it is treated as a gap; must exceed max one-way delay + prediction error")
 	syncIntervalMs := flag.Uint64("sync-interval-ms", 100,
 		"leader heartbeat / commit-point interval in ms; must exceed the round trip to the nearest follower")
-	suspectTimeoutMs := flag.Uint64("suspect-timeout-ms", 3000,
+	suspectTimeoutMs := flag.Uint64("suspect-timeout-ms", 2000,
 		"how long without a leader heartbeat before suspecting it and starting a view change; missing heartbeats are the ONLY trigger, so this alone sets detection time for every kind of failure")
 	viewChangeTimeoutMs := flag.Uint64("view-change-timeout-ms", 15000,
 		"how long the new leader waits for a view-change quorum before moving to the next view")
