@@ -707,3 +707,62 @@ func TestStaleViewChangeRequestIgnored(t *testing.T) {
 		t.Fatalf("stale request counted: requests=%d sent=%v, want 1 and not sent", n, sent)
 	}
 }
+
+// ── The failure detector ────────────────────────────────────────────────────
+//
+// Suspicion must come from missing heartbeats and nothing else. A broken socket
+// to the leader is a local, one-sided observation — a partition raises it
+// without a crash, and a crash that kills the machine or its power never raises
+// it at all — so acting on it would make detection fast only for the failures
+// that happen to close their sockets politely.
+
+func suspicionFires(r *Replica, within time.Duration) bool {
+	go r.suspicionLoop()
+	deadline := time.Now().Add(within)
+	for time.Now().Before(deadline) {
+		if r.view() > 0 {
+			return true
+		}
+		time.Sleep(time.Millisecond)
+	}
+	return false
+}
+
+func TestClosedLeaderSocketAloneDoesNotSuspect(t *testing.T) {
+	r := testReplica(1) // view 0's leader is replica 0, so this one is a follower
+	r.suspectTimeout = time.Hour
+	r.status = statusNormal
+	r.mu.Lock()
+	r.lastHeartbeatNs = nowNs()
+	r.mu.Unlock()
+
+	// The leader's connection breaks. On its own this must change nothing.
+	r.retirePeer(0, nil)
+	r.mu.Lock()
+	lost := r.leaderLost
+	r.mu.Unlock()
+	if !lost {
+		t.Fatal("retirePeer did not record the lost leader connection")
+	}
+	if suspicionFires(r, 50*time.Millisecond) {
+		t.Fatal("a closed leader socket started a view change; only the heartbeat timeout may")
+	}
+}
+
+func TestSilentLeaderSuspectedOnTimeout(t *testing.T) {
+	r := testReplica(1)
+	r.suspectTimeout = 20 * time.Millisecond
+	r.status = statusNormal
+	r.mu.Lock()
+	r.lastHeartbeatNs = nowNs()
+	r.mu.Unlock()
+
+	// No socket close at all — the leader has simply gone quiet, which is what a
+	// frozen process or a partition looks like from here.
+	if !suspicionFires(r, 2*time.Second) {
+		t.Fatal("a silent leader was never suspected")
+	}
+	if r.view() != 1 || r.status != statusViewChange {
+		t.Fatalf("view=%d status=%v, want view 1 in viewchange", r.view(), r.status)
+	}
+}

@@ -279,7 +279,7 @@ type Replica struct {
 
 	peerWriters []*lockedWriter
 	peerRedial  []chan struct{} // cap-1 wake for dialPeer after a send failure
-	leaderLost  bool            // peer connection to the leader broke; suspicionLoop acts on it
+	leaderLost  bool            // peer connection to the leader broke; diagnostic only, never triggers suspicion
 
 	gaps map[gapKey]*gapState
 
@@ -344,7 +344,7 @@ type RecoveryOptions struct {
 
 const (
 	defaultSyncIntervalMs      = 100
-	defaultSuspectTimeoutMs    = 1000
+	defaultSuspectTimeoutMs    = 3000
 	defaultViewChangeTimeoutMs = 15000
 	defaultRetainBytes         = 256 << 20
 )
@@ -1563,8 +1563,9 @@ func (r *Replica) retirePeer(j int, lw *lockedWriter) {
 		cleared = r.peerWriters[j] != nil
 		r.peerWriters[j] = nil
 	}
-	// A closed socket says the leader is gone far more definitively than silence
-	// does, so it trips suspicion at once instead of waiting out the heartbeat.
+	// Record that the leader's socket went, but do NOT let it trip suspicion:
+	// see suspicionLoop, which times out on missing heartbeats alone so that
+	// detection costs the same whether or not the failure closed its sockets.
 	if j != r.idx && j == r.leaderIdx() {
 		r.leaderLost = true
 	}

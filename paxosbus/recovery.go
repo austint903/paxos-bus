@@ -249,16 +249,24 @@ func (r *Replica) suspicionLoop() {
 		if st != statusNormal || r.AmLeader() {
 			continue
 		}
+		// Missing heartbeats are the only trigger. A closed socket is tempting to
+		// act on — it arrives one one-way delay after a kill instead of a whole
+		// timeout — but it answers the wrong question: it says this replica's
+		// link to the leader broke, which a partition produces just as readily as
+		// a crash, and a crash that takes the machine or its power down produces
+		// no close at all. Detection that keyed on it would be fast only for the
+		// failures polite enough to close their sockets. So the socket state is
+		// logged as context and nothing more.
 		silentFor := time.Duration(nowNs() - last)
-		if !lost && silentFor < r.suspectTimeout {
+		if silentFor < r.suspectTimeout {
 			continue
 		}
-		reason := "heartbeat timeout"
+		sock := "socket up"
 		if lost {
-			reason = "connection lost"
+			sock = "socket already closed"
 		}
-		Warning("[%s] SUSPECT leader %d (%s, silent for %v)",
-			r.self, r.leaderIdx(), reason, silentFor.Truncate(time.Millisecond))
+		Warning("[%s] SUSPECT leader %d (heartbeat timeout, silent for %v, %s)",
+			r.self, r.leaderIdx(), silentFor.Truncate(time.Millisecond), sock)
 		r.startViewChange(r.view() + 1)
 	}
 }
