@@ -4,6 +4,7 @@ import (
 	"os"
 	"reflect"
 	"testing"
+	"time"
 )
 
 // ── The merge ───────────────────────────────────────────────────────────────
@@ -412,6 +413,31 @@ func TestInstallViewReplaySkipsCommittedPrefix(t *testing.T) {
 
 	if n := len(r.pendingReplies); n != 0 {
 		t.Errorf("%d replies queued for a fully committed log, want none", n)
+	}
+}
+
+// A fetch from a peer whose connection has broken must give up at once. Every
+// fetch shares one goroutine, so a range left waiting out stateFetchTimeout on a
+// dead peer also holds up the view change queued behind it.
+func TestFetchAbandonsDisconnectedPeer(t *testing.T) {
+	r := testReplica(0) // no peer ever dialed, so peerWriters[1] is nil
+
+	done := make(chan struct{})
+	start := time.Now()
+	go func() {
+		r.runFetch(fetchReq{peer: 1, from: 0, to: 100})
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		if el := time.Since(start); el > time.Second {
+			t.Errorf("fetch took %v to give up on a dead peer, want well under %v",
+				el, stateFetchTimeout)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("fetch from a disconnected peer still blocked after 2s "+
+			"(it is waiting out the %v timeout)", stateFetchTimeout)
 	}
 }
 

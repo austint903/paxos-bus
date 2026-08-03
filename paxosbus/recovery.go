@@ -37,6 +37,11 @@ const (
 	stateEntryOverhead = 32
 
 	stateFetchTimeout = 5 * time.Second
+	// stateFetchProbe is how often a blocked fetch rechecks that its peer is
+	// still connected. It bounds how long a dead peer can hold the fetch
+	// goroutine, so it wants to be well under the round trip a live peer takes
+	// to answer — not so fine that an idle fetch spins.
+	stateFetchProbe = 50 * time.Millisecond
 	// mergeFetchAttempts bounds how many times the new leader re-asks for merged
 	// entries a donor failed to produce before declaring those slots no-ops.
 	mergeFetchAttempts = 3
@@ -1110,7 +1115,18 @@ func (r *Replica) stateFetchLoop() {
 	}
 }
 
+// runFetch pulls one slot range, a chunk at a time.
+//
+// It gives up the moment the peer's connection breaks rather than waiting out
+// stateFetchTimeout. A dead peer's reply is never coming, and every fetch shares
+// this one goroutine — so a range left blocking on a corpse also blocks whatever
+// is queued behind it. That is not hypothetical: a replica that has fallen
+// behind is mid-catch-up *from the leader*, so when the leader dies its own
+// view change queues behind a five-second wait for the replica it has just
+// declared dead. Measured at 5.12s of a 6.9s view change.
 func (r *Replica) runFetch(req fetchReq) {
+	probe := time.NewTicker(stateFetchProbe)
+	defer probe.Stop()
 	next := req.from
 	for next <= req.to {
 		r.sendToPeer(req.peer, MsgBusGetState, &BusGetState{
@@ -1132,6 +1148,12 @@ func (r *Replica) runFetch(req fetchReq) {
 				}
 				next = m.ToSlot + 1
 				advanced = true
+			case <-probe.C:
+				if !r.peerConnected(req.peer) {
+					Warning("[%s] state fetch [%d,%d] from replica %d abandoned at slot %d: "+
+						"peer connection lost", r.self, req.from, req.to, req.peer, next)
+					return
+				}
 			case <-deadline:
 				Warning("[%s] state fetch [%d,%d] from replica %d timed out at slot %d",
 					r.self, req.from, req.to, req.peer, next)

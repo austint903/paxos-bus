@@ -1527,6 +1527,15 @@ func (r *Replica) sendToPeer(j int, code uint8, msg wireMsg) {
 	}
 }
 
+// peerConnected reports whether a live writer for peer j exists. A retired peer
+// stays nil until dialPeer has waited out its redial pause, so anything waiting
+// on that peer sees the gap.
+func (r *Replica) peerConnected(j int) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.peerWriters[j] != nil
+}
+
 // retirePeer drops a broken peer writer and wakes its dialer. Passing lw guards
 // against retiring a connection that has already been replaced; peerConnLost
 // passes nil to retire whatever is current.
