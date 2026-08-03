@@ -7,5 +7,9 @@ config-swiftpaxos/
 paxosbus/logs/
 prev/
 *.MD
-*.env 
+*.env
 .venv/
+
+# Python bytecode caches
+__pycache__/
+*.py[cod]
