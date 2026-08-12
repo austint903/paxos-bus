@@ -2,7 +2,8 @@
 set -euo pipefail
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CloudLab WAN run of the swiftpaxos consensus protocols (paxos | epaxos).
+# CloudLab WAN run of the swiftpaxos consensus protocols
+# (paxos | epaxos | swiftpaxos | curp | n2paxos | fastpaxos).
 #
 # Companion to run-cloudlab.sh (which runs the standalone PaxosBus impl): same
 # three single-node CloudLab experiments, same cloudlab/nodes.env, same
@@ -23,8 +24,34 @@ set -euo pipefail
 #
 # Routing (from the generated conf's -- Proxy -- block: every client is
 # (local) to its co-located replica):
-#   paxos   clients send to the LEADER (r$LEADER_REPLICA) over the WAN
-#   epaxos  leaderless; clients send to their co-located (closest) replica
+#   paxos       clients send to the LEADER (r$LEADER_REPLICA) over the WAN
+#   epaxos      leaderless; clients send to their co-located (closest) replica
+#   swiftpaxos  fast: clients send to EVERY replica and collect acks directly
+#   curp        fast: same, acks from all N witnesses on the fast path
+#   n2paxos     fast (set in main.go); all-to-all Paxos, clients wait on the
+#               co-located replica
+#   fastpaxos   fast (set in main.go); clients broadcast to every replica and
+#               wait on the co-located one — Lamport's fast round, no
+#               coordinator on the hot path
+#
+# Leadership. Four of the six protocols are leader-based, and replica ids
+# are handed out by the master in REGISTRATION order, which races run-to-run.
+# So the leader is pinned two ways, both pointing at r$LEADER_REPLICA:
+#   conf `leader: <ip>:<port>`  master/master.go:237 — this is what the master
+#                               reports to clients via GetLeader
+#   quorum file `l r<i>`        replica/quorum.go NewQuorumsFromFile — resolves
+#                               the alias to an address and then to whatever
+#                               replica id that host got, so swiftpaxos / curp
+#                               / n2paxos agree with the master on the leader
+# epaxos is leaderless and gets neither; paxos takes isLeader from the master
+# (run.go) and so needs only the conf field.
+# fastpaxos also takes only the conf field, and deliberately NOT the quorum
+# file: its client is not Leaderless, so it calls GetLeader and the conf keeps
+# that answer from racing — but fastpaxos reads quorum[0] as its FAST quorum
+# (fastpaxos.go:47), and write_quorum emits the CLASSIC majority (2 of 3).
+# Handing it that would let two replicas decide a fast round, which Fast Paxos
+# does not permit. Without the file it falls back to NewThreeQuartersOf(3) =
+# (3*3)/4+1 = 3, i.e. unanimity — the correct fast quorum for N=3, f=1.
 #
 # Transport is DIRECT only — public control IPs, empirically open on arbitrary
 # ports between Utah/Wisconsin/Clemson (see run-cloudlab.sh). `probe` verifies
@@ -36,12 +63,15 @@ set -euo pipefail
 # Usage:
 #   ./run-swiftpaxos-cloudlab.sh                    # paxos, small scale
 #   ./run-swiftpaxos-cloudlab.sh -P epaxos          # epaxos instead
+#   ./run-swiftpaxos-cloudlab.sh -P swiftpaxos      # swiftpaxos / curp / n2paxos
 #   ./run-swiftpaxos-cloudlab.sh --scale large      # clients on EVERY host
 #   ./run-swiftpaxos-cloudlab.sh probe              # port + ICMP reachability
 #   ./run-swiftpaxos-cloudlab.sh setup              # (re)run setup.sh, exit
 #
 # Env knobs (flags win over env):
-#   PROTOCOL=paxos|epaxos   same as -P
+#   PROTOCOL                same as -P
+#   LOG_ROOT                where run dirs land
+#                           (default paxosbus/logs/swiftpaxos)
 #   SCALE=small|large       same as --scale
 #   NUM_CLIENTS             [small] client processes on the client host (1)
 #   CLIENTS_PER_HOST        [large] client processes on EACH host (1)
@@ -80,26 +110,55 @@ REPO_URL="${REPO_URL:-https://github.com/austint903/paxos-bus.git}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 NODES_FILE="${NODES_FILE:-$SCRIPT_DIR/cloudlab/nodes.env}"
+LOG_ROOT="${LOG_ROOT:-$SCRIPT_DIR/paxosbus/logs/swiftpaxos}"
 
 BIN=/local/paxosbus-cloudlab/bin     # built by cloudlab/setup.sh
 CONF=/tmp/swiftpaxos.conf            # pushed to each node
+QCONF=/tmp/swiftpaxos.quorum         # pushed too, leader-based protocols only
 RPC_PORT=$((PORT + 1000))            # replica<->master RPC (run.go:65)
+
+PROTOCOLS='paxos|epaxos|swiftpaxos|curp|n2paxos|fastpaxos'
 
 SUBCMD=run
 while [[ $# -gt 0 ]]; do
     case "$1" in
         run|probe|setup) SUBCMD="$1" ;;
         small|large)     SCALE="$1" ;;
-        paxos|epaxos)    PROTOCOL="$1" ;;
-        -P|--protocol)   PROTOCOL="${2:?-P needs paxos|epaxos}"; shift ;;
+        paxos|epaxos|swiftpaxos|curp|n2paxos|fastpaxos) PROTOCOL="$1" ;;
+        -P|--protocol)   PROTOCOL="${2:?-P needs $PROTOCOLS}"; shift ;;
         --protocol=*)    PROTOCOL="${1#--protocol=}" ;;
         --scale)         SCALE="${2:?--scale needs small|large}"; shift ;;
         --scale=*)       SCALE="${1#--scale=}" ;;
-        *) echo "usage: $0 [run|probe|setup] [-P paxos|epaxos] [--scale small|large]"; exit 1 ;;
+        *) echo "usage: $0 [run|probe|setup] [-P $PROTOCOLS] [--scale small|large]"; exit 1 ;;
     esac
     shift
 done
-[[ "$PROTOCOL" =~ ^(paxos|epaxos)$ ]] || { echo "ERROR: bad PROTOCOL '$PROTOCOL' (want paxos|epaxos)"; exit 1; }
+[[ "$PROTOCOL" =~ ^($PROTOCOLS)$ ]] || { echo "ERROR: bad PROTOCOL '$PROTOCOL' (want $PROTOCOLS)"; exit 1; }
+
+# Leader-based protocols: pin the leader in the conf AND in a quorum file (see
+# the Leadership note in the header). epaxos is leaderless and gets neither.
+LEADER_BASED=0
+QUORUM_FILE=0
+case "$PROTOCOL" in
+    paxos)                      LEADER_BASED=1 ;;
+    fastpaxos)                  LEADER_BASED=1 ;;
+    swiftpaxos|curp|n2paxos)    LEADER_BASED=1; QUORUM_FILE=1 ;;
+esac
+# main.go's per-protocol client switch leaves swiftpaxos and curp to the conf,
+# so they need `fast: true` to send proposals to every replica (client.go:176).
+# n2paxos/fastpaxos set c.Fast in code; paxos/epaxos must stay slow-path.
+FAST=false
+[[ "$PROTOCOL" == swiftpaxos || "$PROTOCOL" == curp ]] && FAST=true
+
+# Second member of the active quorum (the leader is the first) — see
+# write_quorum. Defaults to the first replica that is not the leader.
+if [[ -z "${AQ_PEER:-}" ]]; then
+    for _i in 0 1 2; do
+        [[ "$_i" == "$LEADER_REPLICA" ]] || { AQ_PEER="$_i"; break; }
+    done
+fi
+[[ "$AQ_PEER" =~ ^[012]$ && "$AQ_PEER" != "$LEADER_REPLICA" ]] \
+    || { echo "ERROR: AQ_PEER must be 0, 1 or 2 and differ from LEADER_REPLICA"; exit 1; }
 [[ "$SCALE" =~ ^(small|large)$ ]] || { echo "ERROR: bad SCALE '$SCALE' (want small|large)"; exit 1; }
 [[ "$LEADER_REPLICA" =~ ^[012]$ ]] || { echo "ERROR: LEADER_REPLICA must be 0, 1 or 2"; exit 1; }
 [[ "$CLIENT_REPLICA" =~ ^[012]$ ]] || { echo "ERROR: CLIENT_REPLICA must be 0, 1 or 2"; exit 1; }
@@ -152,7 +211,12 @@ clients_on_replica() {
     echo 0
 }
 
-SSH_OPTS=(-o StrictHostKeyChecking=accept-new -o ConnectTimeout=15 -o BatchMode=yes)
+# ConnectionAttempts retries the initial TCP connect, and the ServerAlive pair
+# keeps a long poll/tail from being silently dropped by a NAT or a stalled
+# uplink (it also surfaces a genuinely dead peer within ~60 s instead of
+# hanging). Both matter when orchestrating from a laptop on a flaky link.
+SSH_OPTS=(-o StrictHostKeyChecking=accept-new -o ConnectTimeout=15 -o BatchMode=yes
+          -o ConnectionAttempts=3 -o ServerAliveInterval=15 -o ServerAliveCountMax=4)
 ssh_to()   { ssh "${SSH_OPTS[@]}" "$SSH_USER@$1" "$2"; }
 scp_from() { scp "${SSH_OPTS[@]}" "$SSH_USER@$1:$2" "$3"; }
 scp_to()   { scp "${SSH_OPTS[@]}" "$3" "$SSH_USER@$1:$2"; }
@@ -329,7 +393,8 @@ write_conf() {
         echo ""
         echo "protocol: $PROTOCOL"
         echo "noop: false"
-        if [[ "$PROTOCOL" == "paxos" ]]; then
+        echo "fast: $FAST"
+        if [[ "$LEADER_BASED" == 1 ]]; then
             # The master string-compares this against the registering replica's
             # addr:port; the parser's default-port fallback is hardwired to
             # 7070, so append :$PORT explicitly.
@@ -356,17 +421,43 @@ write_conf() {
     } > "$out"
 }
 
+# The active quorum for swiftpaxos / curp / n2paxos: the leader (marked by the
+# two-token `l <alias>` form) plus AQ_PEER, which is N/2+1 = 2 replicas for our
+# N=3. Default peer is the first non-leader host in conf order — under the
+# utah-leader geometry that is wisc, the leader's nearest neighbour (38 ms vs
+# 58 ms to clemson), i.e. the majority a real deployment would pick.
+write_quorum() {
+    local out="$1"
+    {
+        echo "l r$LEADER_REPLICA"
+        echo "r$AQ_PEER"
+    } > "$out"
+}
+
 push_confs() {
     echo "==> Generating + distributing swiftpaxos.conf"
     mkdir -p "$SCRIPT_DIR/config-swiftpaxos"
     local tmp="$SCRIPT_DIR/config-swiftpaxos/swiftpaxos-cloudlab.conf"
+    local qtmp="$SCRIPT_DIR/config-swiftpaxos/swiftpaxos-cloudlab.quorum"
     write_conf "$tmp"
+    if [[ "$QUORUM_FILE" == 1 ]]; then write_quorum "$qtmp"; fi
     local i pids=() p
     for i in 0 1 2; do
-        scp_to "${RHOST[$i]}" "$CONF" "$tmp" & pids+=($!)
+        # `if`, not `[[ ]] &&`: this group runs in the background and `wait`
+        # takes its LAST command's status, so a false `[[ ]]` here would report
+        # the push as failed for every protocol that ships no quorum file
+        # (paxos, epaxos, fastpaxos).
+        {
+            scp_to "${RHOST[$i]}" "$CONF" "$tmp"
+            if [[ "$QUORUM_FILE" == 1 ]]; then scp_to "${RHOST[$i]}" "$QCONF" "$qtmp"; fi
+        } & pids+=($!)
     done
     for p in "${pids[@]}"; do wait "$p" || { echo "  conf push failed"; exit 1; }; done
     echo "  conf:"; sed 's/^/    /' "$tmp"
+    if [[ "$QUORUM_FILE" == 1 ]]; then
+        echo "  quorum (leader + AQ, resolved to replica ids at runtime):"
+        sed 's/^/    /' "$qtmp"
+    fi
 }
 
 # ── Launch: master -> replicas -> clients ────────────────────────────────────
@@ -402,11 +493,15 @@ launch_master() {
 
 launch_replicas() {
     echo "==> Launching replicas — one ssh process per node, in parallel"
+    # Only the replicas read the quorum file (swift.New / curp.New / n2paxos.New);
+    # clients take the leader from the master, so they don't need -quorum.
+    local qflag=""
+    [[ "$QUORUM_FILE" == 1 ]] && qflag="-quorum $QCONF"
     local i p lpids=()
     for i in 0 1 2; do
         ssh_to "${RHOST[$i]}" "
             ulimit -n \$(ulimit -Hn) 2>/dev/null || true
-            nohup $BIN/swiftpaxos -run server -config $CONF -protocol $PROTOCOL -alias r$i \
+            nohup $BIN/swiftpaxos -run server -config $CONF -protocol $PROTOCOL $qflag -alias r$i \
               </dev/null >/tmp/swiftpaxos-replica.log 2>&1 &
             sleep 1
             if pgrep -f '^$BIN/swiftpaxos -run server' >/dev/null; then
@@ -482,16 +577,42 @@ tail_logs() {
     TAIL_PIDS=("${pids[@]}")
 }
 
+# The poll must survive a flaky laptop uplink. `|| true` inside the remote
+# command only covers pgrep's status on the node; if the local ssh process
+# itself dies (connection reset -> 255) the command substitution fails and
+# `set -e` takes the whole run down, even though the clients on the nodes are
+# finishing normally. That cost two runs of the swiftpaxos campaign. So: a
+# failed poll means "unknown, assume still running" and we retry, giving up
+# only if a host stays unreachable for POLL_FAIL_MAX consecutive rounds.
+POLL_FAIL_MAX="${POLL_FAIL_MAX:-24}"     # x5 s sleep = 2 min of hard failure
+
 wait_clients() {
-    local start=$SECONDS deadline=$((SECONDS + DURATION_S))
+    local start=$SECONDS deadline=$((SECONDS + DURATION_S)) pollfail=0
     echo "==> Waiting for clients to finish their $REQS reqs each (cap ${DURATION_S}s)"
     while :; do
-        local left=0 pos ridx n
+        local left=0 pos ridx n rc bad=0
         for pos in "${!CLIENT_HOST_IDXS[@]}"; do
             ridx="${CLIENT_HOST_IDXS[$pos]}"
-            n=$(ssh_to "${RHOST[$ridx]}" "pgrep -fc '^$BIN/swiftpaxos -run client' 2>/dev/null || true")
+            rc=0
+            n=$(ssh_to "${RHOST[$ridx]}" "pgrep -fc '^$BIN/swiftpaxos -run client' 2>/dev/null || true") || rc=$?
+            if [[ "$rc" != 0 ]]; then
+                bad=1
+                echo "  WARN: poll of ${RLABEL[$ridx]} failed (ssh rc=$rc) — retrying"
+                continue
+            fi
             left=$((left + ${n:-0}))
         done
+        if [[ "$bad" == 1 ]]; then
+            pollfail=$((pollfail + 1))
+            if [[ "$pollfail" -ge "$POLL_FAIL_MAX" ]]; then
+                echo "==> ERROR: client poll failed $pollfail times in a row — giving up"
+                return 1
+            fi
+            [[ $SECONDS -ge $deadline ]] && { echo "==> WARN: ${DURATION_S}s cap hit while polling was failing"; break; }
+            sleep 5
+            continue
+        fi
+        pollfail=0
         if [[ "$left" -eq 0 ]]; then
             echo "==> All clients finished after $((SECONDS - start))s"
             break
@@ -520,7 +641,7 @@ collect() {
 
     local ts run_dir
     ts=$(date +%Y%m%d-%H%M%S)
-    run_dir="$SCRIPT_DIR/paxosbus/logs/swiftpaxos/cloudlab-$PROTOCOL-run-$ts"
+    run_dir="$LOG_ROOT/cloudlab-$PROTOCOL-run-$ts"
     mkdir -p "$run_dir"
 
     echo "==> Collecting logs -> $run_dir"
@@ -560,6 +681,11 @@ collect() {
         echo "master_port=$MASTER_PORT"
         echo "duration_cap_s=$DURATION_S"
         echo "leader_replica=$LEADER_REPLICA (${RLABEL[$LEADER_REPLICA]})"
+        echo "leader_pinned=$LEADER_BASED"
+        if [[ "$QUORUM_FILE" == 1 ]]; then
+            echo "quorum_aq=r$LEADER_REPLICA(${RLABEL[$LEADER_REPLICA]},leader) r$AQ_PEER(${RLABEL[$AQ_PEER]})"
+        fi
+        echo "fast=$FAST"
         echo "client_hosts=$(for pos in "${!CLIENT_HOST_IDXS[@]}"; do printf '%s ' "${RLABEL[${CLIENT_HOST_IDXS[$pos]}]}"; done)"
         echo "replicas=${RLABEL[*]}"
     } > "$run_dir/run-meta.txt"

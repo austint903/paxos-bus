@@ -2,8 +2,9 @@
 set -euo pipefail
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Closed-loop client sweep for the swiftpaxos protocols (paxos | epaxos) on
-# CloudLab — the Figure-8 methodology from the SwiftPaxos paper (NSDI'24):
+# Closed-loop client sweep for the swiftpaxos protocols
+# (paxos | epaxos | swiftpaxos | curp | n2paxos | fastpaxos) on CloudLab —
+# the Figure-8 methodology from the SwiftPaxos paper (NSDI'24):
 # ramp the number of concurrent closed-loop clients and record one
 # (throughput, latency) sample per run; saturation is where throughput
 # plateaus while latency climbs.
@@ -18,7 +19,8 @@ set -euo pipefail
 # REQS is sized per step from the PREVIOUS step's measured avg latency
 # (bootstrapped by LAT_EST_MS), clamped to [200, 5000].
 #
-# Every run appends one line to paxosbus/logs/swiftpaxos/<proto>-sweep-manifest.txt:
+# Every run appends one line to $LOG_ROOT/<proto>-sweep-manifest.txt
+# (LOG_ROOT defaults to paxosbus/logs/swiftpaxos):
 #   clients=<N> clones=<C> reqs=<R> rep=<K> rc=<RC> no_took=<J> dir=<run-dir-basename>
 # (same manifest-driven provenance as paxosbus/logs/cloudlab/sweep-manifest.txt;
 # dir is relative to the manifest's directory, rc!=0 or dir=MISSING = failed run,
@@ -34,6 +36,8 @@ set -euo pipefail
 #   LAT_EST_MS    initial avg-latency estimate for REQS sizing (70)
 #   DURATION_S    per-run hard cap passed through to the run script (600)
 #   REQS_MIN/MAX  clamp for the per-step REQS (200 / 5000)
+#   LOG_ROOT      run dirs + manifest location (paxosbus/logs/swiftpaxos)
+#   MANIFEST_NAME override the manifest file name
 # ─────────────────────────────────────────────────────────────────────────────
 
 PROTOCOL=""
@@ -45,21 +49,23 @@ DURATION_S="${DURATION_S:-600}"
 REQS_MIN="${REQS_MIN:-200}"
 REQS_MAX="${REQS_MAX:-5000}"
 
+PROTOCOLS='paxos|epaxos|swiftpaxos|curp|n2paxos|fastpaxos'
+
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        -P|--protocol) PROTOCOL="${2:?-P needs paxos|epaxos}"; shift ;;
+        -P|--protocol) PROTOCOL="${2:?-P needs $PROTOCOLS}"; shift ;;
         -c|--clients)  CLIENT_COUNTS="${2:?-c needs a list like \"9 45 90\"}"; shift ;;
         -r|--reps)     REPS="${2:?-r needs a number}"; shift ;;
         -t|--target)   TARGET_S="${2:?-t needs seconds}"; shift ;;
-        *) echo "usage: $0 -P paxos|epaxos -c \"9 45 90 ...\" [-r reps] [-t target_s]"; exit 1 ;;
+        *) echo "usage: $0 -P $PROTOCOLS -c \"9 45 90 ...\" [-r reps] [-t target_s]"; exit 1 ;;
     esac
     shift
 done
-[[ "$PROTOCOL" =~ ^(paxos|epaxos)$ ]] || { echo "ERROR: -P must be paxos|epaxos"; exit 1; }
+[[ "$PROTOCOL" =~ ^($PROTOCOLS)$ ]] || { echo "ERROR: -P must be $PROTOCOLS"; exit 1; }
 [[ -n "$CLIENT_COUNTS" ]] || { echo "ERROR: -c is required"; exit 1; }
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-LOGS="$SCRIPT_DIR/paxosbus/logs/swiftpaxos"
+LOGS="${LOG_ROOT:-$SCRIPT_DIR/paxosbus/logs/swiftpaxos}"
 # MANIFEST_NAME=<proto>-final-manifest.txt routes the 5-loads x 5-reps final
 # measurement runs to their own manifest (same line format).
 MANIFEST="$LOGS/${MANIFEST_NAME:-$PROTOCOL-sweep-manifest.txt}"
@@ -80,7 +86,7 @@ for n in $CLIENT_COUNTS; do
         step_log="$(mktemp)"
         rc=0
         SCALE=large CLIENTS_PER_HOST=3 CLONES="$clones" REQS="$reqs" \
-            DURATION_S="$DURATION_S" PROTOCOL="$PROTOCOL" \
+            DURATION_S="$DURATION_S" PROTOCOL="$PROTOCOL" LOG_ROOT="$LOGS" \
             "$SCRIPT_DIR/run-swiftpaxos-cloudlab.sh" >"$step_log" 2>&1 || rc=$?
 
         run_dir="$(sed -n 's/^==> Done\. Logs: //p' "$step_log" | tail -n1)"
