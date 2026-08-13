@@ -1071,6 +1071,16 @@ func (r *Replica) recordReceivedLocked(slot, clientId, reqId uint64, op []byte) 
 // decision, so a replica that has since received the real message must discard
 // it. The owner comes from the lazy inverse, naming whose message was lost.
 func (r *Replica) setNoOpLocked(slot uint64) bool {
+	// ...but only above the cursor. Below it the slot has already executed and
+	// been replied on, and its entry may have been reclaimed — slotEntryLocked
+	// would resurrect a phantom under the prune floor and the fold would run a
+	// second time. Every caller reaching here with such a slot is acting on
+	// stale information, so refuse rather than corrupt settled history.
+	if r.executedLocked(slot) {
+		Warning("[%s] refusing no-op at slot=%d below executed frontier %d",
+			r.self, slot, r.nextExpected)
+		return false
+	}
 	r.observeSlotLocked(slot)
 	e := r.slotEntryLocked(slot)
 	if e.state == slotNoOp {
@@ -1106,6 +1116,18 @@ func (r *Replica) slotStateLocked(slot uint64) slotState {
 		return e.state
 	}
 	return slotEmpty
+}
+
+// executedLocked reports whether the cursor has already run past slot.
+//
+// An absent entry means slotEmpty, which conflates two opposite situations: a
+// slot never received, and one received, executed and since reclaimed. The
+// prune floor never rises above nextExpected (see pruneCommittedLocked), so the
+// cursor separates them — below it, an empty slot was freed, not missed. Gap
+// agreement must not lose that distinction: resolving a reclaimed slot as a
+// no-op overwrites history a quorum already committed and replied on.
+func (r *Replica) executedLocked(slot uint64) bool {
+	return slot < r.nextExpected
 }
 
 func (r *Replica) slotOpLocked(slot uint64) []byte {
@@ -1800,6 +1822,9 @@ func (r *Replica) handleGapRequest(msg *BusGapRequest) {
 	}
 	st := r.slotStateLocked(slot)
 	op, isBus := r.slotGapPayloadLocked(slot)
+	// Empty below our own cursor means reclaimed, not missing: the asker is
+	// simply further behind than our retain window reaches.
+	reclaimed := st == slotEmpty && r.executedLocked(slot)
 	r.mu.Unlock()
 
 	if !r.AmLeader() {
@@ -1820,6 +1845,12 @@ func (r *Replica) handleGapRequest(msg *BusGapRequest) {
 		r.sendToPeer(int(msg.SenderIdx), MsgBusGapCommit,
 			&BusGapCommit{Slot: slot, SenderIdx: uint32(r.idx), ViewId: r.view()})
 	default:
+		if reclaimed {
+			// Settled history, not a gap. The asker catches up through the sync
+			// round's state transfer, which reads the durable log; agreeing a
+			// no-op here would overwrite a slot we already committed.
+			return
+		}
 		r.ensureLeaderResolve(slot, msg.SenderIdx)
 	}
 }
@@ -1884,6 +1915,16 @@ func (r *Replica) handleGapCommit(msg *BusGapCommit) {
 	// differently, so stale commits are dropped rather than obeyed.
 	if r.status != statusNormal || msg.ViewId != r.view() {
 		r.mu.Unlock()
+		return
+	}
+	// A no-op below our cursor is a leader resolving a slot we already executed.
+	// Return without acking: the ack is what lets it reach its quorum, so
+	// staying silent stops the decision rather than merely declining to apply it.
+	if r.executedLocked(msg.Slot) {
+		executed := r.nextExpected
+		r.mu.Unlock()
+		Warning("[%s] ignoring no-op commit for settled slot=%d (executed=%d)",
+			r.self, msg.Slot, executed)
 		return
 	}
 	if r.setNoOpLocked(msg.Slot) {

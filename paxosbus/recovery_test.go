@@ -571,6 +571,105 @@ func TestPruneRespectsByteBudget(t *testing.T) {
 	}
 }
 
+// ── Reclaimed slots are not gaps ────────────────────────────────────────────
+
+// runAhead executes n slots with the commit point following, so the retain
+// window reclaims everything but its own tail.
+func runAhead(r *Replica, n uint64) {
+	r.mu.Lock()
+	for s := uint64(0); s < n; s++ {
+		busAt(r, s, s+1, s+1)
+		r.advanceNextExpectedLocked()
+		r.setStableLocked(s)
+	}
+	r.mu.Unlock()
+}
+
+// An absent entry reads as slotEmpty whether the slot was never received or
+// received, executed and since reclaimed. A peer that falls further behind than
+// the retain window reaches asks for the second kind, and answering it as a gap
+// makes the leader agree a no-op over a slot it already committed and replied
+// on — corruption with no failure anywhere, just a lagging reader.
+func TestGapRequestForReclaimedSlotIsNotResolved(t *testing.T) {
+	r := testReplica(0)
+	runAhead(r, 400) // retainSlots is 64 here, so slot 10 is long gone
+	if !r.AmLeader() {
+		t.Fatal("replica 0 is not the leader of view 0")
+	}
+
+	r.mu.Lock()
+	if _, resident := r.globalLog[10]; resident {
+		t.Fatal("slot 10 is still resident; the test proves nothing")
+	}
+	if r.prunedBelow <= 10 {
+		t.Fatalf("prune floor is %d, so slot 10 was never reclaimed", r.prunedBelow)
+	}
+	executedBefore := r.nextExpected
+	r.mu.Unlock()
+
+	r.handleGapRequest(&BusGapRequest{Slot: 10, SenderIdx: 1})
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if n := len(r.gaps); n != 0 {
+		t.Errorf("gap agreement started for a reclaimed slot (%d in flight)", n)
+	}
+	if e, resurrected := r.globalLog[10]; resurrected {
+		t.Errorf("reclaimed slot 10 was resurrected below the prune floor as %v", e.state)
+	}
+	if r.nextExpected != executedBefore {
+		t.Errorf("cursor moved from %d to %d", executedBefore, r.nextExpected)
+	}
+}
+
+// The same slot arriving as an already-decided no-op, from a leader that
+// resolved it while we were ahead of it. Applying it would overwrite settled
+// history, and acking it would help it reach quorum, so neither may happen.
+func TestGapCommitBelowCursorIsIgnoredAndUnacked(t *testing.T) {
+	r := testReplica(0)
+	runAhead(r, 400)
+
+	r.mu.Lock()
+	executedBefore, noopsBefore := r.nextExpected, r.winNoops
+	r.mu.Unlock()
+
+	r.handleGapCommit(&BusGapCommit{Slot: 10, SenderIdx: 1, ViewId: r.view()})
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if _, resurrected := r.globalLog[10]; resurrected {
+		t.Error("a stale no-op commit wrote over a reclaimed, already-executed slot")
+	}
+	if r.winNoops != noopsBefore {
+		t.Errorf("no-ops went %d -> %d; the commit was applied", noopsBefore, r.winNoops)
+	}
+	if r.nextExpected != executedBefore {
+		t.Errorf("cursor moved from %d to %d", executedBefore, r.nextExpected)
+	}
+}
+
+// The backstop under every caller: setNoOpLocked allocates through
+// slotEntryLocked, so without the guard a no-op below the cursor both rewrites a
+// committed slot and leaves a phantom entry beneath the prune floor that nothing
+// will ever visit again.
+func TestSetNoOpRefusesBelowCursor(t *testing.T) {
+	r := testReplica(0)
+	runAhead(r, 400)
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.setNoOpLocked(10) {
+		t.Error("setNoOpLocked accepted a slot below the executed frontier")
+	}
+	if _, resurrected := r.globalLog[10]; resurrected {
+		t.Error("setNoOpLocked allocated a phantom entry below the prune floor")
+	}
+	// Still allowed above it, where a slot genuinely may be missing.
+	if !r.setNoOpLocked(r.nextExpected + 5) {
+		t.Error("setNoOpLocked refused a genuine gap above the cursor")
+	}
+}
+
 // ── Durable log round trip ──────────────────────────────────────────────────
 
 func TestDurableLogReadBack(t *testing.T) {
