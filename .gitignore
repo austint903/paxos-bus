@@ -15,3 +15,5 @@ __pycache__/
 *.py[cod]
 .DS_Store
 *.csv
+cloudlab/median5-csv.py
+*.ipynb
