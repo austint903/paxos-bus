@@ -48,6 +48,7 @@ set -euo pipefail
 #
 # Env knobs (mirror run-gcp.sh):
 #   INTERVAL_MS DURATION_S DROP_MODE DROP_EVERY REQUEST_GEN GEN_INTERVAL_US
+#   GAP_RETRY_TIMEOUT_MS             gap-commit rebroadcast interval (default 1500)
 #   SCALE=small|large           same as --scale (flag wins)
 #   NUM_CLIENTS                 [small] clients on the client cluster (default 1)
 #   CLIENTS_PER_HOST            [large] clients on EACH replica cluster (default 3)
@@ -73,6 +74,7 @@ DROP_MODE="${DROP_MODE:-none}"
 DROP_EVERY="${DROP_EVERY:-0}"
 REQUEST_GEN="${REQUEST_GEN:-1}"
 GEN_INTERVAL_US="${GEN_INTERVAL_US:-500}"
+GAP_RETRY_TIMEOUT_MS="${GAP_RETRY_TIMEOUT_MS:-1500}"
 NUM_CLIENTS="${NUM_CLIENTS:-1}"
 CLIENTS_PER_HOST="${CLIENTS_PER_HOST:-3}"
 RESEND_MS="${RESEND_MS:-5000}"
@@ -421,7 +423,8 @@ launch() {
             rm -rf /tmp/paxosbus-durable && mkdir -p /tmp/paxosbus-durable
             nohup $BIN/paxosbus-replica \
               -c $CONF -i $i -l ${RLABEL[$i]} -d /tmp/paxosbus-durable \
-              -drop-mode $DROP_MODE -drop-every $DROP_EVERY $REPLICA_FLAGS \
+              -drop-mode $DROP_MODE -drop-every $DROP_EVERY \
+              -gap-retry-timeout-ms $GAP_RETRY_TIMEOUT_MS $REPLICA_FLAGS \
               </dev/null >/tmp/paxosbus.log 2>&1 &
             sleep 1
             if pgrep -f '[p]axosbus-replica' >/dev/null; then
@@ -590,6 +593,7 @@ collect() {
         echo "drop_every=$DROP_EVERY"
         echo "request_gen=$REQUEST_GEN"
         echo "gen_interval_us=$GEN_INTERVAL_US"
+        echo "gap_retry_timeout_ms=$GAP_RETRY_TIMEOUT_MS"
         echo "client_hosts=$(for pos in "${!CLIENT_HOST_IDXS[@]}"; do printf '%s ' "${RLABEL[${CLIENT_HOST_IDXS[$pos]}]}"; done)"
         echo "replicas=${RLABEL[*]}"
         echo "kill_leader_at_s=$KILL_LEADER_AT_S"

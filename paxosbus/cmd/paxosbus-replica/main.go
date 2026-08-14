@@ -25,6 +25,8 @@ func main() {
 		"how long without a leader heartbeat before suspecting it and starting a view change; missing heartbeats are the ONLY trigger, so this alone sets detection time for every kind of failure")
 	viewChangeTimeoutMs := flag.Uint64("view-change-timeout-ms", 15000,
 		"how long the new leader waits for a view-change quorum before moving to the next view")
+	gapRetryTimeoutMs := flag.Uint64("gap-retry-timeout-ms", 1500,
+		"how long the leader waits for a no-op quorum before rebroadcasting the same gap commit")
 	retainSlots := flag.Uint64("retain-slots", 1<<14,
 		"how many committed slots stay in memory; older ones are served from the durable log instead")
 	retainMB := flag.Uint64("retain-mb", 256,
@@ -58,6 +60,7 @@ func main() {
 			SyncIntervalMs:      *syncIntervalMs,
 			SuspectTimeoutMs:    *suspectTimeoutMs,
 			ViewChangeTimeoutMs: *viewChangeTimeoutMs,
+			GapRetryTimeoutMs:   *gapRetryTimeoutMs,
 			RetainSlots:         *retainSlots,
 			RetainBytes:         *retainMB << 20,
 		})

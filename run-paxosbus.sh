@@ -18,6 +18,7 @@ GEN_INTERVAL_US=1      # request generation interval in µs (-r only; -g 1 -p 1 
 KILL_AT_S=0            # kill the current leader this many seconds into the data phase (0 = never)
 KILL_COUNT=1           # how many successive leaders to kill (view 0 -> 1 -> 2 ...)
 RETAIN_SLOTS=16384     # committed slots kept in memory; smaller forces state transfer to read the durable log
+GAP_RETRY_TIMEOUT_MS="${GAP_RETRY_TIMEOUT_MS:-1500}" # gap-commit rebroadcast interval
 # ────────────────────────────────────────────────────────────────────────────
 
 FORCE_BUILD=0
@@ -141,6 +142,7 @@ mkdir -p "$RUN_LOG_DIR"
     echo "drop_every=$DROP_EVERY"
     echo "request_gen=$REQUEST_GEN"
     echo "gen_interval_us=$GEN_INTERVAL_US"
+    echo "gap_retry_timeout_ms=$GAP_RETRY_TIMEOUT_MS"
     echo "kill_at_s=$KILL_AT_S"
     echo "kill_count=$KILL_COUNT"
 } > "$RUN_LOG_DIR/run-meta.txt"
@@ -172,6 +174,7 @@ for i in $(seq 0 $((NUM_REPLICAS - 1))); do
         "$IMAGE" \
         /paxosbus/paxosbus-replica -c /config/paxosbus.conf -i "$i" -d /durable \
             -drop-mode "$DROP_MODE" -drop-every "$DROP_EVERY" \
+            -gap-retry-timeout-ms "$GAP_RETRY_TIMEOUT_MS" \
             -retain-slots "$RETAIN_SLOTS" \
         > /dev/null
     CONTAINERS+=("$NAME")
