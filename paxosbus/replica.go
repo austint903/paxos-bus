@@ -130,8 +130,10 @@ type gapState struct {
 	start        int64
 	askers       map[uint32]struct{}
 	probeReplies chan *BusGapReply
-	commitAcks   chan struct{}
-	doneCh       chan struct{}
+	// commitAcks carries the acking replica's index: the commit is rebroadcast
+	// each round, so a replica acks repeatedly and only distinct senders count.
+	commitAcks chan uint32
+	doneCh     chan struct{}
 }
 
 func newGapState(start int64) *gapState {
@@ -139,7 +141,7 @@ func newGapState(start int64) *gapState {
 		start:        start,
 		askers:       make(map[uint32]struct{}),
 		probeReplies: make(chan *BusGapReply, 8),
-		commitAcks:   make(chan struct{}, 8),
+		commitAcks:   make(chan uint32, 8),
 		doneCh:       make(chan struct{}, 1),
 	}
 }
@@ -158,7 +160,9 @@ func (gs *gapState) snapshotAskers() []uint32 {
 // jitter around the line — it stays generous anyway, msgs are rarely dropped.
 const defaultGapDeltaMs = 5000
 
-const gapProtocolTimeout = 3 * time.Second
+// gapRecoveryTimeout bounds the leader-first lookup/probe phase. Commit
+// retransmission has its own configurable interval on Replica.
+const gapRecoveryTimeout = 3 * time.Second
 
 type dropMode uint8
 
@@ -287,6 +291,7 @@ type Replica struct {
 	syncInterval      time.Duration
 	suspectTimeout    time.Duration
 	viewChangeTimeout time.Duration
+	gapRetryTimeout   time.Duration
 	lastHeartbeatNs   int64
 	sync              *syncRound
 	vc                *vcState
@@ -334,10 +339,15 @@ type Replica struct {
 // rather than fast retransmit. Suspecting a leader that is merely slow is not
 // free — the rejoining leader lands on rewindToStableAndRefetch, which repairs a
 // divergence the view change cannot see on its own.
+//
+// The gap retry timeout is independent of the leader-first recovery probe. It
+// only controls how often an already-installed no-op commit is rebroadcast
+// while the leader waits for f distinct follower acknowledgements.
 type RecoveryOptions struct {
 	SyncIntervalMs      uint64
 	SuspectTimeoutMs    uint64
 	ViewChangeTimeoutMs uint64
+	GapRetryTimeoutMs   uint64
 	RetainSlots         uint64
 	RetainBytes         uint64
 }
@@ -346,6 +356,7 @@ const (
 	defaultSyncIntervalMs      = 100
 	defaultSuspectTimeoutMs    = 2000
 	defaultViewChangeTimeoutMs = 15000
+	defaultGapRetryTimeoutMs   = 1500
 	defaultRetainBytes         = 256 << 20
 )
 
@@ -359,6 +370,9 @@ func (o *RecoveryOptions) withDefaults() RecoveryOptions {
 	}
 	if out.ViewChangeTimeoutMs == 0 {
 		out.ViewChangeTimeoutMs = defaultViewChangeTimeoutMs
+	}
+	if out.GapRetryTimeoutMs == 0 {
+		out.GapRetryTimeoutMs = defaultGapRetryTimeoutMs
 	}
 	if out.RetainSlots == 0 {
 		out.RetainSlots = defaultRetainSlots
@@ -410,6 +424,7 @@ func NewReplica(config *Config, idx int, label, logDir string, mode dropMode, ev
 		syncInterval:      time.Duration(opts.SyncIntervalMs) * time.Millisecond,
 		suspectTimeout:    time.Duration(opts.SuspectTimeoutMs) * time.Millisecond,
 		viewChangeTimeout: time.Duration(opts.ViewChangeTimeoutMs) * time.Millisecond,
+		gapRetryTimeout:   time.Duration(opts.GapRetryTimeoutMs) * time.Millisecond,
 		fetchQ:            make(chan fetchReq, 64),
 		serveQ:            make(chan *BusGetState, 64),
 		newStateCh:        make(chan *BusNewState, 8),
@@ -438,8 +453,8 @@ func NewReplica(config *Config, idx int, label, logDir string, mode dropMode, ev
 	}
 	Notice("[%s] started (view=0, f=%d, quorum=%d, leader=%s, gap_delta=%dms)",
 		r.self, config.F, config.QuorumSize(), leader, r.gapDeltaNs/1e6)
-	Notice("[%s] recovery: sync=%v suspect=%v view_change_timeout=%v retain_slots=%d",
-		r.self, r.syncInterval, r.suspectTimeout, r.viewChangeTimeout, r.retainSlots)
+	Notice("[%s] recovery: sync=%v suspect=%v view_change_timeout=%v gap_retry_timeout=%v retain_slots=%d",
+		r.self, r.syncInterval, r.suspectTimeout, r.viewChangeTimeout, r.gapRetryTimeout, r.retainSlots)
 	if r.dropMode != dropNone && r.dropEvery > 0 {
 		Notice("[%s] artificial drop enabled: mode=%s every=%d (drop slot when reqId%%%d==0)",
 			r.self, r.dropMode, r.dropEvery, r.dropEvery)
@@ -926,22 +941,16 @@ func (r *Replica) bindReplySender(clientId uint64, lw *lockedWriter) {
 	r.replySenders[clientId] = newReplySender(r, lw)
 }
 
-// applyDuringRecoveryLocked handles a bus arriving while an earlier slot is
-// still being agreed on: apply it if it is that slot, else buffer it so the
-// commit prefix cannot run past the hole under negotiation.
+// applyDuringRecoveryLocked records every bus in its deterministic slot even
+// while an earlier slot is under gap agreement. advanceNextExpectedLocked
+// already stops at the first empty slot, so later buses can be retained without
+// executing out of order. Once a real bus or no-op fills the hole, the retained
+// suffix is ready to advance immediately.
 func (r *Replica) applyDuringRecoveryLocked(msg *BusMessage) {
 	slot := computeGlobalSlot(r.clients, msg.ClientId, msg.BusSeqNum)
-	gs, isGap := r.gaps[gapKey{slot}]
-	if !isGap {
-		// The read loop reuses msg; a shallow copy suffices because Unmarshal
-		// allocates a fresh Requests slice each time.
-		cp := *msg
-		r.pendingBuses = append(r.pendingBuses, &cp)
-		return
-	}
-	r.recordBusReceivedLocked(slot, msg.ClientId, msg.BusSeqNum, msg.Requests)
+	stored := r.recordBusReceivedLocked(slot, msg.ClientId, msg.BusSeqNum, msg.Requests)
 	r.advanceNextExpectedLocked()
-	if gs != nil {
+	if gs := r.gaps[gapKey{slot}]; stored && gs != nil {
 		// Non-blocking: the waiter may already have timed out.
 		select {
 		case gs.doneCh <- struct{}{}:
@@ -1169,7 +1178,7 @@ func (r *Replica) advanceNextExpectedLocked() {
 // in memory (globalLog/slotMeta/dedup) below nextExpected. Without this these
 // maps grow ~one entry per request forever, and the rising GC pressure is the
 // leading suspect for the mid-run stall. The window stays well above the
-// gap-recovery window (gap Δ default 5s + gapProtocolTimeout 3s ≈ 8s of traffic,
+// gap-recovery window (gap Δ default 5s + gapRecoveryTimeout 3s ≈ 8s of traffic,
 // ~16k slots at the benchmark's ~2k/s) so a lagging peer's gap request is still
 // answerable from memory; older slots are served from the durable log instead
 // (see logreader.go), so shrinking this trades memory for a disk read on the
@@ -1705,7 +1714,7 @@ func (r *Replica) followerRecover(slot uint64, gs *gapState) {
 		case slotNoOp:
 			Notice("[%s] noop_latency=%dus slot=%d client=%d req=%d", r.self, lat, slot, clientId, reqId)
 		}
-	case <-time.After(gapProtocolTimeout):
+	case <-time.After(gapRecoveryTimeout):
 		Warning("[%s] gap recovery timed out slot=%d", r.self, slot)
 		r.mu.Lock()
 		r.finishGapLocked(gapKey{slot})
@@ -1733,7 +1742,7 @@ func (r *Replica) leaderResolve(slot uint64, gs *gapState) {
 		&BusGapRequest{Slot: slot, SenderIdx: uint32(r.idx)})
 	var recovered []byte
 	var recoveredBus bool
-	timeout := time.After(gapProtocolTimeout)
+	timeout := time.After(gapRecoveryTimeout)
 probe:
 	for {
 		select {
@@ -1783,27 +1792,54 @@ probe:
 	r.advanceNextExpectedLocked()
 	r.mu.Unlock()
 
-	r.broadcastToPeers(MsgBusGapCommit,
-		&BusGapCommit{Slot: slot, SenderIdx: uint32(r.idx), ViewId: r.view()})
-	acks := 1
-	timeout = time.After(gapProtocolTimeout)
-collect:
-	for acks < r.config.QuorumSize() {
-		select {
-		case <-gs.commitAcks:
-			acks++
-		case <-timeout:
-			Warning("[%s] noop commit got only %d/%d acks slot=%d",
-				r.self, acks, r.config.QuorumSize(), slot)
-			break collect
-		}
-	}
+	acked := r.collectNoOpQuorum(slot, gs)
+
 	clientId, reqId := r.ownerLog(slot)
 	r.mu.Lock()
 	r.finishGapLocked(key)
 	r.mu.Unlock()
+	if !acked {
+		return
+	}
 	Notice("[%s] noop_latency=%dus slot=%d client=%d req=%d",
 		r.self, (nowNs()-gs.start)/1000, slot, clientId, reqId)
+}
+
+// collectNoOpQuorum rebroadcasts the commit every configured retry interval until a
+// quorum of distinct replicas has accepted it. Silence is not a leader failure,
+// so a missed round is answered by the next one rather than by escalating to a
+// view change.
+func (r *Replica) collectNoOpQuorum(slot uint64, gs *gapState) bool {
+	commit := &BusGapCommit{Slot: slot, SenderIdx: uint32(r.idx), ViewId: r.view()}
+	r.broadcastToPeers(MsgBusGapCommit, commit)
+
+	acked := make(map[uint32]struct{}, r.config.N)
+	timer := time.NewTimer(r.gapRetryTimeout)
+	defer timer.Stop()
+	for round := 1; len(acked)+1 < r.config.QuorumSize(); {
+		select {
+		case idx := <-gs.commitAcks:
+			acked[idx] = struct{}{}
+		case <-timer.C:
+			if !r.AmLeader() || !r.inNormalStatus() {
+				Warning("[%s] abandoning noop commit slot=%d after %d rounds: no longer leading a normal view",
+					r.self, slot, round)
+				return false
+			}
+			round++
+			Warning("[%s] noop commit round %d for slot=%d: %d/%d acks, retrying",
+				r.self, round, slot, len(acked)+1, r.config.QuorumSize())
+			r.broadcastToPeers(MsgBusGapCommit, commit)
+			timer.Reset(r.gapRetryTimeout)
+		}
+	}
+	return true
+}
+
+func (r *Replica) inNormalStatus() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.status == statusNormal
 }
 
 func (r *Replica) answerAskers(slot uint64, askers []uint32, op []byte, isBus bool) {
@@ -1917,21 +1953,7 @@ func (r *Replica) handleGapCommit(msg *BusGapCommit) {
 		r.mu.Unlock()
 		return
 	}
-	// A no-op below our cursor is a leader resolving a slot we already executed.
-	// Return without acking: the ack is what lets it reach its quorum, so
-	// staying silent stops the decision rather than merely declining to apply it.
-	if r.executedLocked(msg.Slot) {
-		executed := r.nextExpected
-		r.mu.Unlock()
-		Warning("[%s] ignoring no-op commit for settled slot=%d (executed=%d)",
-			r.self, msg.Slot, executed)
-		return
-	}
-	if r.setNoOpLocked(msg.Slot) {
-		r.durableAppendLocked(msg.Slot, nil, true)
-		r.winNoops++
-	}
-	r.advanceNextExpectedLocked()
+	ack := r.applyGapCommitLocked(msg.Slot)
 	gs := r.gaps[key]
 	r.mu.Unlock()
 	if gs != nil {
@@ -1940,8 +1962,35 @@ func (r *Replica) handleGapCommit(msg *BusGapCommit) {
 		default:
 		}
 	}
+	if !ack {
+		return
+	}
 	r.sendToPeer(int(msg.SenderIdx), MsgBusGapCommitReply,
 		&BusGapCommitReply{Slot: msg.Slot, SenderIdx: uint32(r.idx)})
+}
+
+// applyGapCommitLocked installs an agreed no-op and reports whether to ack it.
+//
+// The commit is retransmitted every round, so this has to be idempotent: a slot
+// already holding the no-op re-acks, since installing it moved the cursor past
+// the slot and the leader may simply have lost the first ack. Only a slot that
+// executed as something other than a no-op is refused, and refused silently —
+// withholding the ack denies the quorum instead of merely declining locally.
+func (r *Replica) applyGapCommitLocked(slot uint64) bool {
+	if r.slotStateLocked(slot) == slotNoOp {
+		return true
+	}
+	if r.executedLocked(slot) {
+		Warning("[%s] ignoring no-op commit for settled slot=%d (executed=%d)",
+			r.self, slot, r.nextExpected)
+		return false
+	}
+	if r.setNoOpLocked(slot) {
+		r.durableAppendLocked(slot, nil, true)
+		r.winNoops++
+	}
+	r.advanceNextExpectedLocked()
+	return true
 }
 
 func (r *Replica) handleGapCommitReply(msg *BusGapCommitReply) {
@@ -1952,7 +2001,7 @@ func (r *Replica) handleGapCommitReply(msg *BusGapCommitReply) {
 		return
 	}
 	select {
-	case gs.commitAcks <- struct{}{}:
+	case gs.commitAcks <- msg.SenderIdx:
 	default:
 	}
 }

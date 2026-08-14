@@ -1,6 +1,8 @@
 package paxosbus
 
 import (
+	"bufio"
+	"fmt"
 	"os"
 	"reflect"
 	"testing"
@@ -667,6 +669,189 @@ func TestSetNoOpRefusesBelowCursor(t *testing.T) {
 	// Still allowed above it, where a slot genuinely may be missing.
 	if !r.setNoOpLocked(r.nextExpected + 5) {
 		t.Error("setNoOpLocked refused a genuine gap above the cursor")
+	}
+}
+
+// ── No-op agreement ─────────────────────────────────────────────────────────
+
+func testReplicaN(idx, n, f int) *Replica {
+	cfg := &Config{N: n, F: f}
+	for i := 0; i < n; i++ {
+		cfg.Replicas = append(cfg.Replicas, fmt.Sprintf("r%d:%d", i, 1000+i))
+	}
+	r := NewReplica(cfg, idx, "", "", dropNone, 0, 0, RecoveryOptions{RetainSlots: 64})
+	r.clients[1] = &clientLine{baseNs: 0, intervalNs: ms}
+	r.busMode = true
+	return r
+}
+
+// One reachable follower acks once per round, so counting acks rather than
+// distinct senders would let it supply a whole quorum by itself.
+func TestNoOpQuorumCountsDistinctReplicas(t *testing.T) {
+	r := testReplicaN(0, 5, 2) // quorum 3: the leader plus two others
+	gs := newGapState(nowNs())
+
+	done := make(chan bool, 1)
+	go func() { done <- r.collectNoOpQuorum(7, gs) }()
+
+	gs.commitAcks <- 3
+	gs.commitAcks <- 3 // same replica, next round
+	select {
+	case <-done:
+		t.Fatal("one replica acking twice was counted as a quorum")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	gs.commitAcks <- 4
+	select {
+	case ok := <-done:
+		if !ok {
+			t.Error("quorum of distinct replicas did not complete the round")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("two distinct acks did not satisfy a quorum of 3")
+	}
+}
+
+type retrySignalWriter struct {
+	writes chan struct{}
+}
+
+func (w *retrySignalWriter) Write(p []byte) (int, error) {
+	w.writes <- struct{}{}
+	return len(p), nil
+}
+
+func TestNoOpCommitUsesConfiguredRetryTimeout(t *testing.T) {
+	r := testReplicaN(0, 3, 1)
+	if r.gapRetryTimeout != 1500*time.Millisecond {
+		t.Fatalf("default gap retry timeout = %v, want 1.5s", r.gapRetryTimeout)
+	}
+	r = NewReplica(r.config, 0, "", "", dropNone, 0, 0,
+		RecoveryOptions{RetainSlots: 64, GapRetryTimeoutMs: 10})
+	if r.gapRetryTimeout != 10*time.Millisecond {
+		t.Fatalf("configured gap retry timeout = %v, want 10ms", r.gapRetryTimeout)
+	}
+
+	w := &retrySignalWriter{writes: make(chan struct{}, 8)}
+	r.mu.Lock()
+	r.peerWriters[1] = &lockedWriter{w: bufio.NewWriter(w)}
+	r.mu.Unlock()
+
+	gs := newGapState(nowNs())
+	done := make(chan bool, 1)
+	go func() { done <- r.collectNoOpQuorum(7, gs) }()
+
+	select {
+	case <-w.writes: // initial broadcast
+	case <-time.After(time.Second):
+		t.Fatal("initial gap commit was not broadcast")
+	}
+	select {
+	case <-w.writes: // timeout-driven rebroadcast
+	case <-time.After(250 * time.Millisecond):
+		t.Fatal("gap commit was not rebroadcast at the configured timeout")
+	}
+
+	gs.commitAcks <- 1
+	select {
+	case ok := <-done:
+		if !ok {
+			t.Fatal("collector abandoned a valid quorum")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("collector did not finish after the retry was acknowledged")
+	}
+}
+
+func TestBusIntakeContinuesWhileNoOpQuorumPending(t *testing.T) {
+	r := testReplica(0)
+	gs := newGapState(nowNs())
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.gaps[gapKey{0}] = gs
+
+	// Slot 1 arrives while slot 0 is still being resolved. Retain it in its
+	// assigned slot instead of buffering it behind the agreement goroutine.
+	r.applyDuringRecoveryLocked(&BusMessage{
+		ClientId:  1,
+		BusSeqNum: 2,
+		Requests: []RequestMessage{{
+			ClientId: 1, RequestId: 2, Op: []byte("later"),
+		}},
+	})
+	if st := r.slotStateLocked(1); st != slotReceived {
+		t.Fatalf("later bus state = %v, want received", st)
+	}
+	if r.nextExpected != 0 {
+		t.Fatalf("cursor advanced through the unresolved hole to %d", r.nextExpected)
+	}
+	if len(r.pendingBuses) != 0 {
+		t.Fatalf("buffered %d buses behind gap agreement", len(r.pendingBuses))
+	}
+
+	// The leader installs its speculative no-op before collecting follower
+	// acks. That fills slot 0 and releases slot 1 even though the gap state—and
+	// therefore the quorum collector—is still live.
+	if !r.applyGapCommitLocked(0) {
+		t.Fatal("leader's speculative no-op was not installed")
+	}
+	if r.nextExpected != 2 {
+		t.Fatalf("cursor = %d after filling the hole, want 2", r.nextExpected)
+	}
+	if r.gaps[gapKey{0}] != gs {
+		t.Fatal("gap agreement ended before its ack quorum completed")
+	}
+
+	// New traffic also keeps advancing while the same gap waits for its acks.
+	r.applyDuringRecoveryLocked(&BusMessage{
+		ClientId:  1,
+		BusSeqNum: 3,
+		Requests: []RequestMessage{{
+			ClientId: 1, RequestId: 3, Op: []byte("newer"),
+		}},
+	})
+	if r.nextExpected != 3 {
+		t.Fatalf("new bus blocked by pending no-op quorum; cursor = %d, want 3", r.nextExpected)
+	}
+}
+
+// Installing the no-op moves the cursor past the slot, so every retransmitted
+// round arrives at a slot the follower has already executed. It must still ack:
+// a follower that goes silent after the first round leaves a leader whose ack
+// was lost retrying forever.
+func TestGapCommitIsIdempotentAcrossRounds(t *testing.T) {
+	r := testReplica(0)
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	busAt(r, 0, 1, 1)
+	r.advanceNextExpectedLocked()
+
+	if !r.applyGapCommitLocked(1) {
+		t.Fatal("first round was not acked")
+	}
+	if r.nextExpected != 2 {
+		t.Fatalf("cursor at %d after the no-op filled slot 1, want 2", r.nextExpected)
+	}
+	noops := r.winNoops
+
+	for round := 2; round <= 4; round++ {
+		if !r.applyGapCommitLocked(1) {
+			t.Errorf("round %d was not acked; the leader would retry forever", round)
+		}
+	}
+	if r.winNoops != noops {
+		t.Errorf("no-ops counted %d -> %d; a repeat round was applied twice",
+			noops, r.winNoops)
+	}
+	if r.nextExpected != 2 {
+		t.Errorf("cursor moved to %d on a repeat round", r.nextExpected)
+	}
+
+	// A slot that executed as a real bus is still refused, and still silently.
+	if r.applyGapCommitLocked(0) {
+		t.Error("acked a no-op over a slot that executed a real bus")
 	}
 }
 
