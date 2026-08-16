@@ -315,14 +315,19 @@ func (m *RequestReplyMessage) Unmarshal(wire io.Reader) error {
 	return nil
 }
 
+// Gap messages use (ViewId, Slot) as the identity of one logical agreement.
+// Retransmissions keep both fields unchanged, and a view change invalidates all
+// messages from the previous identity.
 type BusGapRequest struct {
 	Slot      uint64
 	SenderIdx uint32
+	ViewId    uint64
 }
 
 type BusGapReply struct {
 	Slot      uint64
 	SenderIdx uint32
+	ViewId    uint64
 	Found     bool
 	Bus       bool
 	Op        []byte
@@ -337,40 +342,44 @@ type BusGapCommit struct {
 type BusGapCommitReply struct {
 	Slot      uint64
 	SenderIdx uint32
+	ViewId    uint64
 }
 
 func (m *BusGapRequest) New() fastrpc.Serializable { return new(BusGapRequest) }
 
 func (m *BusGapRequest) Marshal(wire io.Writer) {
-	var b [12]byte
+	var b [20]byte
 	binary.LittleEndian.PutUint64(b[0:8], m.Slot)
 	binary.LittleEndian.PutUint32(b[8:12], m.SenderIdx)
+	binary.LittleEndian.PutUint64(b[12:20], m.ViewId)
 	wire.Write(b[:])
 }
 
 func (m *BusGapRequest) Unmarshal(wire io.Reader) error {
-	var b [12]byte
+	var b [20]byte
 	if _, err := io.ReadFull(wire, b[:]); err != nil {
 		return err
 	}
 	m.Slot = binary.LittleEndian.Uint64(b[0:8])
 	m.SenderIdx = binary.LittleEndian.Uint32(b[8:12])
+	m.ViewId = binary.LittleEndian.Uint64(b[12:20])
 	return nil
 }
 
 func (m *BusGapReply) New() fastrpc.Serializable { return new(BusGapReply) }
 
 func (m *BusGapReply) Marshal(wire io.Writer) {
-	var b [18]byte
+	var b [26]byte
 	binary.LittleEndian.PutUint64(b[0:8], m.Slot)
 	binary.LittleEndian.PutUint32(b[8:12], m.SenderIdx)
+	binary.LittleEndian.PutUint64(b[12:20], m.ViewId)
 	if m.Found {
-		b[12] = 1
+		b[20] = 1
 	}
 	if m.Bus {
-		b[13] = 1
+		b[21] = 1
 	}
-	binary.LittleEndian.PutUint32(b[14:18], uint32(len(m.Op)))
+	binary.LittleEndian.PutUint32(b[22:26], uint32(len(m.Op)))
 	wire.Write(b[:])
 	if len(m.Op) > 0 {
 		wire.Write(m.Op)
@@ -378,15 +387,16 @@ func (m *BusGapReply) Marshal(wire io.Writer) {
 }
 
 func (m *BusGapReply) Unmarshal(wire io.Reader) error {
-	var b [18]byte
+	var b [26]byte
 	if _, err := io.ReadFull(wire, b[:]); err != nil {
 		return err
 	}
 	m.Slot = binary.LittleEndian.Uint64(b[0:8])
 	m.SenderIdx = binary.LittleEndian.Uint32(b[8:12])
-	m.Found = b[12] != 0
-	m.Bus = b[13] != 0
-	opLen := binary.LittleEndian.Uint32(b[14:18])
+	m.ViewId = binary.LittleEndian.Uint64(b[12:20])
+	m.Found = b[20] != 0
+	m.Bus = b[21] != 0
+	opLen := binary.LittleEndian.Uint32(b[22:26])
 	m.Op = make([]byte, opLen)
 	if _, err := io.ReadFull(wire, m.Op); err != nil {
 		return err
@@ -418,19 +428,21 @@ func (m *BusGapCommit) Unmarshal(wire io.Reader) error {
 func (m *BusGapCommitReply) New() fastrpc.Serializable { return new(BusGapCommitReply) }
 
 func (m *BusGapCommitReply) Marshal(wire io.Writer) {
-	var b [12]byte
+	var b [20]byte
 	binary.LittleEndian.PutUint64(b[0:8], m.Slot)
 	binary.LittleEndian.PutUint32(b[8:12], m.SenderIdx)
+	binary.LittleEndian.PutUint64(b[12:20], m.ViewId)
 	wire.Write(b[:])
 }
 
 func (m *BusGapCommitReply) Unmarshal(wire io.Reader) error {
-	var b [12]byte
+	var b [20]byte
 	if _, err := io.ReadFull(wire, b[:]); err != nil {
 		return err
 	}
 	m.Slot = binary.LittleEndian.Uint64(b[0:8])
 	m.SenderIdx = binary.LittleEndian.Uint32(b[8:12])
+	m.ViewId = binary.LittleEndian.Uint64(b[12:20])
 	return nil
 }
 

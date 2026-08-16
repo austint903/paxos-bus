@@ -191,11 +191,12 @@ func (r *Replica) handleSyncReply(msg *BusSyncReply) {
 }
 
 func (r *Replica) handleSyncCommit(msg *BusSyncCommit) {
-	if msg.ViewId != r.view() {
+	if !r.validReplicaIndex(msg.SenderIdx) {
 		return
 	}
 	r.mu.Lock()
-	if r.status == statusNormal {
+	if r.status == statusNormal && msg.ViewId == r.view() &&
+		int(msg.SenderIdx) == r.config.LeaderIndex(msg.ViewId) {
 		r.setStableLocked(msg.StableSlot)
 		r.lastHeartbeatNs = nowNs()
 		r.leaderLost = false
@@ -312,10 +313,10 @@ func (r *Replica) startViewChange(newView uint64) {
 	r.leaderLost = false
 	r.sync = nil
 	r.lastHeartbeatNs = nowNs()
-	// Retire in-flight gap agreement: those goroutines are negotiating with a
-	// leader we have just given up on, and their no-ops would land on slots the
-	// merge is about to decide. They time out on their own.
-	r.gaps = make(map[gapKey]*gapState)
+	// Retire in-flight gap agreement immediately. Messages already in flight
+	// carry the old view and are ignored; the view-change merge decides their
+	// slots rather than allowing an old retry goroutine to keep working.
+	r.cancelGapsLocked()
 	r.drainPendingBusesLocked()
 	leader := r.config.LeaderIndex(newView)
 	vc := newVCState(newView, r.config.N)
@@ -849,7 +850,7 @@ func (r *Replica) installStartView(msg *BusStartView) {
 		r.vc = nil
 	}
 	r.sync = nil
-	r.gaps = make(map[gapKey]*gapState)
+	r.cancelGapsLocked()
 	r.status = statusViewChange
 	r.viewId.Store(msg.ViewId)
 	r.drainPendingBusesLocked()

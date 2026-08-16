@@ -123,10 +123,12 @@ func countBefore(line *clientLine, y int64, tiePrecedes bool) uint64 {
 }
 
 type gapKey struct {
+	view uint64
 	slot uint64
 }
 
 type gapState struct {
+	view         uint64
 	start        int64
 	askers       map[uint32]struct{}
 	probeReplies chan *BusGapReply
@@ -134,15 +136,32 @@ type gapState struct {
 	// each round, so a replica acks repeatedly and only distinct senders count.
 	commitAcks chan uint32
 	doneCh     chan struct{}
+	abortCh    chan struct{}
+	abortOnce  sync.Once
 }
 
-func newGapState(start int64) *gapState {
+func newGapState(start int64, view uint64) *gapState {
 	return &gapState{
+		view:         view,
 		start:        start,
 		askers:       make(map[uint32]struct{}),
 		probeReplies: make(chan *BusGapReply, 8),
 		commitAcks:   make(chan uint32, 8),
 		doneCh:       make(chan struct{}, 1),
+		abortCh:      make(chan struct{}),
+	}
+}
+
+func (gs *gapState) cancel() {
+	gs.abortOnce.Do(func() { close(gs.abortCh) })
+}
+
+func (gs *gapState) cancelled() bool {
+	select {
+	case <-gs.abortCh:
+		return true
+	default:
+		return false
 	}
 }
 
@@ -950,7 +969,8 @@ func (r *Replica) applyDuringRecoveryLocked(msg *BusMessage) {
 	slot := computeGlobalSlot(r.clients, msg.ClientId, msg.BusSeqNum)
 	stored := r.recordBusReceivedLocked(slot, msg.ClientId, msg.BusSeqNum, msg.Requests)
 	r.advanceNextExpectedLocked()
-	if gs := r.gaps[gapKey{slot}]; stored && gs != nil {
+	key := gapKey{view: r.view(), slot: slot}
+	if gs := r.gaps[key]; stored && gs != nil {
 		// Non-blocking: the waiter may already have timed out.
 		select {
 		case gs.doneCh <- struct{}{}:
@@ -959,13 +979,37 @@ func (r *Replica) applyDuringRecoveryLocked(msg *BusMessage) {
 	}
 }
 
-// finishGapLocked retires a resolved gap, releasing the buffered buses once the
-// last one is done.
-func (r *Replica) finishGapLocked(key gapKey) {
+func (r *Replica) gapActiveLocked(key gapKey, gs *gapState) bool {
+	return gs != nil && !gs.cancelled() && gs.view == key.view &&
+		r.status == statusNormal && r.view() == key.view && r.gaps[key] == gs
+}
+
+func (r *Replica) leaderGapActiveLocked(key gapKey, gs *gapState) bool {
+	return r.gapActiveLocked(key, gs) && r.config.LeaderIndex(key.view) == r.idx
+}
+
+// finishGapLocked retires a resolved gap only if the map still points to the
+// exact state being finished. An old goroutine must never remove replacement
+// state installed for the same slot.
+func (r *Replica) finishGapLocked(key gapKey, gs *gapState) {
+	if r.gaps[key] != gs {
+		return
+	}
+	gs.cancel()
 	delete(r.gaps, key)
 	if len(r.gaps) == 0 {
 		r.drainPendingBusesLocked()
 	}
+}
+
+// cancelGapsLocked stops every waiter from the view being retired. The ACK
+// channels stay open so a packet handler that already obtained a pointer cannot
+// panic while delivering a late message.
+func (r *Replica) cancelGapsLocked() {
+	for _, gs := range r.gaps {
+		gs.cancel()
+	}
+	r.gaps = make(map[gapKey]*gapState)
 }
 
 // drainPendingBusesLocked replays the buffered buses. Their slots come from
@@ -1563,6 +1607,9 @@ func (r *Replica) dialPeer(j int) {
 }
 
 func (r *Replica) sendToPeer(j int, code uint8, msg wireMsg) {
+	if j < 0 || j >= len(r.peerWriters) {
+		return
+	}
 	r.mu.Lock()
 	lw := r.peerWriters[j]
 	r.mu.Unlock()
@@ -1573,6 +1620,10 @@ func (r *Replica) sendToPeer(j int, code uint8, msg wireMsg) {
 		Warning("[%s] send to peer %d failed: %v", r.self, j, err)
 		r.retirePeer(j, lw)
 	}
+}
+
+func (r *Replica) validReplicaIndex(idx uint32) bool {
+	return uint64(idx) < uint64(r.config.N) && int(idx) < len(r.peerWriters)
 }
 
 // peerConnected reports whether a live writer for peer j exists. A retired peer
@@ -1630,7 +1681,9 @@ func (r *Replica) broadcastToPeers(code uint8, msg wireMsg) {
 
 func (r *Replica) gapDetectLoop() {
 	type spawnInfo struct {
-		slot, clientId, reqId uint64
+		key             gapKey
+		gs              *gapState
+		clientId, reqId uint64
 	}
 	ticker := time.NewTicker(time.Second)
 	for range ticker.C {
@@ -1641,6 +1694,7 @@ func (r *Replica) gapDetectLoop() {
 		// With the cursor frozen every slot above nextExpected looks like a gap,
 		// and there is no leader to agree a no-op with anyway.
 		if r.status == statusNormal && r.haveMax && len(r.clients) > 0 {
+			view := r.view()
 			r.genCursorUpToLocked(r.maxSlotSeen)
 			for slot := r.nextExpected; slot <= r.maxSlotSeen; slot++ {
 				if e := r.globalLog[slot]; e != nil && e.state != slotEmpty {
@@ -1653,35 +1707,36 @@ func (r *Replica) gapDetectLoop() {
 				if wallNow <= meta.expectedNs+r.gapDeltaNs {
 					continue
 				}
-				key := gapKey{slot}
+				key := gapKey{view: view, slot: slot}
 				if _, busy := r.gaps[key]; busy {
 					continue
 				}
-				r.gaps[key] = newGapState(monoNow)
+				gs := newGapState(monoNow, view)
+				r.gaps[key] = gs
 				r.winGaps++
-				spawn = append(spawn, spawnInfo{slot, meta.clientId, meta.reqId})
+				spawn = append(spawn, spawnInfo{key: key, gs: gs, clientId: meta.clientId, reqId: meta.reqId})
 			}
 		}
 		r.mu.Unlock()
 		for _, s := range spawn {
-			Notice("[%s] GAP detected slot=%d client=%d req=%d", r.self, s.slot, s.clientId, s.reqId)
-			go r.handleGap(s.slot)
+			Notice("[%s] GAP detected slot=%d client=%d req=%d", r.self, s.key.slot, s.clientId, s.reqId)
+			go r.handleGap(s.key, s.gs)
 		}
 	}
 }
 
-func (r *Replica) handleGap(slot uint64) {
-	key := gapKey{slot}
+func (r *Replica) handleGap(key gapKey, gs *gapState) {
 	r.mu.Lock()
-	gs := r.gaps[key]
+	active := r.gapActiveLocked(key, gs)
+	leader := r.config.LeaderIndex(key.view)
 	r.mu.Unlock()
-	if gs == nil {
+	if !active {
 		return
 	}
-	if r.AmLeader() {
-		r.leaderResolve(slot, gs)
+	if leader == r.idx {
+		r.leaderResolve(key, gs)
 	} else {
-		r.followerRecover(slot, gs)
+		r.followerRecover(key, gs)
 	}
 }
 
@@ -1695,54 +1750,65 @@ func (r *Replica) ownerLog(slot uint64) (uint64, uint64) {
 	return m.clientId, m.reqId
 }
 
-func (r *Replica) followerRecover(slot uint64, gs *gapState) {
-	leader := r.leaderIdx()
+func (r *Replica) followerRecover(key gapKey, gs *gapState) {
+	leader := r.config.LeaderIndex(key.view)
 	r.sendToPeer(leader, MsgBusGapRequest,
-		&BusGapRequest{Slot: slot, SenderIdx: uint32(r.idx)})
+		&BusGapRequest{Slot: key.slot, SenderIdx: uint32(r.idx), ViewId: key.view})
 
+	timer := time.NewTimer(gapRecoveryTimeout)
+	defer timer.Stop()
 	select {
 	case <-gs.doneCh:
 		lat := (nowNs() - gs.start) / 1000
 		r.mu.Lock()
-		st := r.slotStateLocked(slot)
-		r.finishGapLocked(gapKey{slot})
+		if !r.gapActiveLocked(key, gs) {
+			r.mu.Unlock()
+			return
+		}
+		st := r.slotStateLocked(key.slot)
+		r.finishGapLocked(key, gs)
 		r.mu.Unlock()
-		clientId, reqId := r.ownerLog(slot)
+		clientId, reqId := r.ownerLog(key.slot)
 		switch st {
 		case slotReceived:
-			Notice("[%s] recovery_latency=%dus slot=%d client=%d req=%d", r.self, lat, slot, clientId, reqId)
+			Notice("[%s] recovery_latency=%dus slot=%d client=%d req=%d", r.self, lat, key.slot, clientId, reqId)
 		case slotNoOp:
-			Notice("[%s] noop_latency=%dus slot=%d client=%d req=%d", r.self, lat, slot, clientId, reqId)
+			Notice("[%s] noop_latency=%dus slot=%d client=%d req=%d", r.self, lat, key.slot, clientId, reqId)
 		}
-	case <-time.After(gapRecoveryTimeout):
-		Warning("[%s] gap recovery timed out slot=%d", r.self, slot)
+	case <-timer.C:
+		Warning("[%s] gap recovery timed out slot=%d", r.self, key.slot)
 		r.mu.Lock()
-		r.finishGapLocked(gapKey{slot})
+		r.finishGapLocked(key, gs)
 		r.mu.Unlock()
+	case <-gs.abortCh:
+		return
 	}
 }
 
-func (r *Replica) leaderResolve(slot uint64, gs *gapState) {
-	key := gapKey{slot}
-
+func (r *Replica) leaderResolve(key gapKey, gs *gapState) {
+	slot := key.slot
 	r.mu.Lock()
+	if !r.leaderGapActiveLocked(key, gs) {
+		r.mu.Unlock()
+		return
+	}
 	if st := r.slotStateLocked(slot); st != slotEmpty {
 		op, isBus := r.slotGapPayloadLocked(slot)
 		askers := gs.snapshotAskers()
-		r.finishGapLocked(key)
+		r.finishGapLocked(key, gs)
 		r.mu.Unlock()
 		if st == slotReceived {
-			r.answerAskers(slot, askers, op, isBus)
+			r.answerAskers(key.view, slot, askers, op, isBus)
 		}
 		return
 	}
 	r.mu.Unlock()
 
 	r.broadcastToPeers(MsgBusGapRequest,
-		&BusGapRequest{Slot: slot, SenderIdx: uint32(r.idx)})
+		&BusGapRequest{Slot: slot, SenderIdx: uint32(r.idx), ViewId: key.view})
 	var recovered []byte
 	var recoveredBus bool
-	timeout := time.After(gapRecoveryTimeout)
+	timer := time.NewTimer(gapRecoveryTimeout)
 probe:
 	for {
 		select {
@@ -1752,13 +1818,26 @@ probe:
 				recoveredBus = reply.Bus
 				break probe
 			}
-		case <-timeout:
+		case <-timer.C:
 			break probe
+		case <-gs.abortCh:
+			timer.Stop()
+			return
+		}
+	}
+	if !timer.Stop() {
+		select {
+		case <-timer.C:
+		default:
 		}
 	}
 
 	if recovered != nil {
 		r.mu.Lock()
+		if !r.leaderGapActiveLocked(key, gs) {
+			r.mu.Unlock()
+			return
+		}
 		m := r.slotOwnerLocked(slot)
 		stored := r.storeRecoveredLocked(slot, m.clientId, m.reqId, recovered, recoveredBus)
 		if stored {
@@ -1768,21 +1847,25 @@ probe:
 		r.advanceNextExpectedLocked()
 		op, isBus := r.slotGapPayloadLocked(slot)
 		askers := gs.snapshotAskers()
-		r.finishGapLocked(key)
+		r.finishGapLocked(key, gs)
 		r.mu.Unlock()
-		r.answerAskers(slot, askers, op, isBus)
+		r.answerAskers(key.view, slot, askers, op, isBus)
 		Notice("[%s] recovery_latency=%dus slot=%d client=%d req=%d",
 			r.self, (nowNs()-gs.start)/1000, slot, m.clientId, m.reqId)
 		return
 	}
 
 	r.mu.Lock()
+	if !r.leaderGapActiveLocked(key, gs) {
+		r.mu.Unlock()
+		return
+	}
 	if r.slotStateLocked(slot) == slotReceived {
 		op, isBus := r.slotGapPayloadLocked(slot)
 		askers := gs.snapshotAskers()
-		r.finishGapLocked(key)
+		r.finishGapLocked(key, gs)
 		r.mu.Unlock()
-		r.answerAskers(slot, askers, op, isBus)
+		r.answerAskers(key.view, slot, askers, op, isBus)
 		return
 	}
 	if r.setNoOpLocked(slot) {
@@ -1792,15 +1875,15 @@ probe:
 	r.advanceNextExpectedLocked()
 	r.mu.Unlock()
 
-	acked := r.collectNoOpQuorum(slot, gs)
+	acked := r.collectNoOpQuorum(key, gs)
 
-	clientId, reqId := r.ownerLog(slot)
 	r.mu.Lock()
-	r.finishGapLocked(key)
+	r.finishGapLocked(key, gs)
 	r.mu.Unlock()
 	if !acked {
 		return
 	}
+	clientId, reqId := r.ownerLog(slot)
 	Notice("[%s] noop_latency=%dus slot=%d client=%d req=%d",
 		r.self, (nowNs()-gs.start)/1000, slot, clientId, reqId)
 }
@@ -1809,50 +1892,73 @@ probe:
 // quorum of distinct replicas has accepted it. Silence is not a leader failure,
 // so a missed round is answered by the next one rather than by escalating to a
 // view change.
-func (r *Replica) collectNoOpQuorum(slot uint64, gs *gapState) bool {
-	commit := &BusGapCommit{Slot: slot, SenderIdx: uint32(r.idx), ViewId: r.view()}
+func (r *Replica) collectNoOpQuorum(key gapKey, gs *gapState) bool {
+	r.mu.Lock()
+	active := r.leaderGapActiveLocked(key, gs)
+	r.mu.Unlock()
+	if !active {
+		return false
+	}
+	commit := &BusGapCommit{Slot: key.slot, SenderIdx: uint32(r.idx), ViewId: key.view}
 	r.broadcastToPeers(MsgBusGapCommit, commit)
 
 	acked := make(map[uint32]struct{}, r.config.N)
 	timer := time.NewTimer(r.gapRetryTimeout)
 	defer timer.Stop()
-	for round := 1; len(acked)+1 < r.config.QuorumSize(); {
+	for round := 1; ; {
+		if len(acked)+1 >= r.config.QuorumSize() {
+			r.mu.Lock()
+			active := r.leaderGapActiveLocked(key, gs)
+			r.mu.Unlock()
+			return active
+		}
 		select {
 		case idx := <-gs.commitAcks:
-			acked[idx] = struct{}{}
+			if r.validReplicaIndex(idx) && int(idx) != r.idx {
+				acked[idx] = struct{}{}
+			}
 		case <-timer.C:
-			if !r.AmLeader() || !r.inNormalStatus() {
+			r.mu.Lock()
+			active := r.leaderGapActiveLocked(key, gs)
+			r.mu.Unlock()
+			if !active {
 				Warning("[%s] abandoning noop commit slot=%d after %d rounds: no longer leading a normal view",
-					r.self, slot, round)
+					r.self, key.slot, round)
 				return false
 			}
 			round++
 			Warning("[%s] noop commit round %d for slot=%d: %d/%d acks, retrying",
-				r.self, round, slot, len(acked)+1, r.config.QuorumSize())
+				r.self, round, key.slot, len(acked)+1, r.config.QuorumSize())
 			r.broadcastToPeers(MsgBusGapCommit, commit)
 			timer.Reset(r.gapRetryTimeout)
+		case <-gs.abortCh:
+			return false
 		}
 	}
-	return true
 }
 
-func (r *Replica) inNormalStatus() bool {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	return r.status == statusNormal
-}
-
-func (r *Replica) answerAskers(slot uint64, askers []uint32, op []byte, isBus bool) {
+func (r *Replica) answerAskers(view, slot uint64, askers []uint32, op []byte, isBus bool) {
 	for _, idx := range askers {
 		r.sendToPeer(int(idx), MsgBusGapReply,
-			&BusGapReply{Slot: slot, SenderIdx: uint32(r.idx), Found: true, Bus: isBus, Op: op})
+			&BusGapReply{Slot: slot, SenderIdx: uint32(r.idx), ViewId: view, Found: true, Bus: isBus, Op: op})
 	}
 }
 
 func (r *Replica) handleGapRequest(msg *BusGapRequest) {
+	if !r.validReplicaIndex(msg.SenderIdx) {
+		return
+	}
 	slot := msg.Slot
 	r.mu.Lock()
-	if r.status != statusNormal {
+	if r.status != statusNormal || msg.ViewId != r.view() {
+		r.mu.Unlock()
+		return
+	}
+	leader := r.config.LeaderIndex(msg.ViewId)
+	amLeader := leader == r.idx
+	// Followers only answer the current leader's all-replica probe. The leader
+	// accepts requests from followers trying to recover their own gap.
+	if !amLeader && int(msg.SenderIdx) != leader {
 		r.mu.Unlock()
 		return
 	}
@@ -1863,8 +1969,8 @@ func (r *Replica) handleGapRequest(msg *BusGapRequest) {
 	reclaimed := st == slotEmpty && r.executedLocked(slot)
 	r.mu.Unlock()
 
-	if !r.AmLeader() {
-		reply := &BusGapReply{Slot: slot, SenderIdx: uint32(r.idx), Found: st == slotReceived}
+	if !amLeader {
+		reply := &BusGapReply{Slot: slot, SenderIdx: uint32(r.idx), ViewId: msg.ViewId, Found: st == slotReceived}
 		if reply.Found {
 			reply.Op = op
 			reply.Bus = isBus
@@ -1876,10 +1982,10 @@ func (r *Replica) handleGapRequest(msg *BusGapRequest) {
 	switch st {
 	case slotReceived:
 		r.sendToPeer(int(msg.SenderIdx), MsgBusGapReply,
-			&BusGapReply{Slot: slot, SenderIdx: uint32(r.idx), Found: true, Bus: isBus, Op: op})
+			&BusGapReply{Slot: slot, SenderIdx: uint32(r.idx), ViewId: msg.ViewId, Found: true, Bus: isBus, Op: op})
 	case slotNoOp:
 		r.sendToPeer(int(msg.SenderIdx), MsgBusGapCommit,
-			&BusGapCommit{Slot: slot, SenderIdx: uint32(r.idx), ViewId: r.view()})
+			&BusGapCommit{Slot: slot, SenderIdx: uint32(r.idx), ViewId: msg.ViewId})
 	default:
 		if reclaimed {
 			// Settled history, not a gap. The asker catches up through the sync
@@ -1887,17 +1993,21 @@ func (r *Replica) handleGapRequest(msg *BusGapRequest) {
 			// no-op here would overwrite a slot we already committed.
 			return
 		}
-		r.ensureLeaderResolve(slot, msg.SenderIdx)
+		r.ensureLeaderResolve(msg.ViewId, slot, msg.SenderIdx)
 	}
 }
 
-func (r *Replica) ensureLeaderResolve(slot uint64, asker uint32) {
-	key := gapKey{slot}
+func (r *Replica) ensureLeaderResolve(view, slot uint64, asker uint32) {
+	key := gapKey{view: view, slot: slot}
 	r.mu.Lock()
+	if r.status != statusNormal || r.view() != view || r.config.LeaderIndex(view) != r.idx {
+		r.mu.Unlock()
+		return
+	}
 	gs := r.gaps[key]
 	spawn := false
 	if gs == nil {
-		gs = newGapState(nowNs())
+		gs = newGapState(nowNs(), view)
 		r.gaps[key] = gs
 		r.winGaps++
 		spawn = true
@@ -1907,58 +2017,75 @@ func (r *Replica) ensureLeaderResolve(slot uint64, asker uint32) {
 	r.mu.Unlock()
 	if spawn {
 		Notice("[%s] GAP detected slot=%d client=%d req=%d (peer request)", r.self, slot, m.clientId, m.reqId)
-		go r.handleGap(slot)
+		go r.handleGap(key, gs)
 	}
 }
 
 func (r *Replica) handleGapReply(msg *BusGapReply) {
-	key := gapKey{msg.Slot}
+	if !r.validReplicaIndex(msg.SenderIdx) {
+		return
+	}
+	key := gapKey{view: msg.ViewId, slot: msg.Slot}
 	r.mu.Lock()
 	gs := r.gaps[key]
-	frozen := r.status != statusNormal
-	r.mu.Unlock()
-	if gs == nil || frozen {
+	if !r.gapActiveLocked(key, gs) {
+		r.mu.Unlock()
 		return
 	}
-	if r.AmLeader() {
-		select {
-		case gs.probeReplies <- msg:
-		default:
+	leader := r.config.LeaderIndex(msg.ViewId)
+	if leader == r.idx {
+		if int(msg.SenderIdx) == r.idx {
+			r.mu.Unlock()
+			return
 		}
-		return
-	}
-	if msg.Found {
-		r.mu.Lock()
-		m := r.slotOwnerLocked(msg.Slot)
-		if r.storeRecoveredLocked(msg.Slot, m.clientId, m.reqId, msg.Op, msg.Bus) {
-			r.durableAppendLocked(msg.Slot, msg.Op, false)
-			r.winRecovered++
-		}
-		r.advanceNextExpectedLocked()
 		r.mu.Unlock()
 		select {
-		case gs.doneCh <- struct{}{}:
+		case gs.probeReplies <- msg:
+		case <-gs.abortCh:
 		default:
 		}
+		return
+	}
+	if int(msg.SenderIdx) != leader || !msg.Found {
+		r.mu.Unlock()
+		return
+	}
+	m := r.slotOwnerLocked(msg.Slot)
+	if r.storeRecoveredLocked(msg.Slot, m.clientId, m.reqId, msg.Op, msg.Bus) {
+		r.durableAppendLocked(msg.Slot, msg.Op, false)
+		r.winRecovered++
+	}
+	r.advanceNextExpectedLocked()
+	r.mu.Unlock()
+	select {
+	case gs.doneCh <- struct{}{}:
+	case <-gs.abortCh:
+	default:
 	}
 }
 
 func (r *Replica) handleGapCommit(msg *BusGapCommit) {
-	key := gapKey{msg.Slot}
+	if !r.validReplicaIndex(msg.SenderIdx) {
+		return
+	}
+	key := gapKey{view: msg.ViewId, slot: msg.Slot}
 	r.mu.Lock()
 	// A no-op is a decision of one view. Applying one announced by a leader we
 	// have already deposed would overwrite a slot the new view may have merged
 	// differently, so stale commits are dropped rather than obeyed.
-	if r.status != statusNormal || msg.ViewId != r.view() {
+	if r.status != statusNormal || msg.ViewId != r.view() ||
+		int(msg.SenderIdx) != r.config.LeaderIndex(msg.ViewId) {
 		r.mu.Unlock()
 		return
 	}
 	ack := r.applyGapCommitLocked(msg.Slot)
 	gs := r.gaps[key]
+	active := r.gapActiveLocked(key, gs)
 	r.mu.Unlock()
-	if gs != nil {
+	if active {
 		select {
 		case gs.doneCh <- struct{}{}:
+		case <-gs.abortCh:
 		default:
 		}
 	}
@@ -1966,7 +2093,7 @@ func (r *Replica) handleGapCommit(msg *BusGapCommit) {
 		return
 	}
 	r.sendToPeer(int(msg.SenderIdx), MsgBusGapCommitReply,
-		&BusGapCommitReply{Slot: msg.Slot, SenderIdx: uint32(r.idx)})
+		&BusGapCommitReply{Slot: msg.Slot, SenderIdx: uint32(r.idx), ViewId: msg.ViewId})
 }
 
 // applyGapCommitLocked installs an agreed no-op and reports whether to ack it.
@@ -1994,14 +2121,19 @@ func (r *Replica) applyGapCommitLocked(slot uint64) bool {
 }
 
 func (r *Replica) handleGapCommitReply(msg *BusGapCommitReply) {
+	if !r.validReplicaIndex(msg.SenderIdx) || int(msg.SenderIdx) == r.idx {
+		return
+	}
+	key := gapKey{view: msg.ViewId, slot: msg.Slot}
 	r.mu.Lock()
-	gs := r.gaps[gapKey{msg.Slot}]
-	r.mu.Unlock()
-	if gs == nil {
+	gs := r.gaps[key]
+	if !r.leaderGapActiveLocked(key, gs) {
+		r.mu.Unlock()
 		return
 	}
 	select {
 	case gs.commitAcks <- msg.SenderIdx:
 	default:
 	}
+	r.mu.Unlock()
 }

@@ -2,6 +2,7 @@ package paxosbus
 
 import (
 	"bufio"
+	"bytes"
 	"fmt"
 	"os"
 	"reflect"
@@ -609,7 +610,7 @@ func TestGapRequestForReclaimedSlotIsNotResolved(t *testing.T) {
 	executedBefore := r.nextExpected
 	r.mu.Unlock()
 
-	r.handleGapRequest(&BusGapRequest{Slot: 10, SenderIdx: 1})
+	r.handleGapRequest(&BusGapRequest{Slot: 10, SenderIdx: 1, ViewId: r.view()})
 
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -628,14 +629,14 @@ func TestGapRequestForReclaimedSlotIsNotResolved(t *testing.T) {
 // resolved it while we were ahead of it. Applying it would overwrite settled
 // history, and acking it would help it reach quorum, so neither may happen.
 func TestGapCommitBelowCursorIsIgnoredAndUnacked(t *testing.T) {
-	r := testReplica(0)
+	r := testReplica(1)
 	runAhead(r, 400)
 
 	r.mu.Lock()
 	executedBefore, noopsBefore := r.nextExpected, r.winNoops
 	r.mu.Unlock()
 
-	r.handleGapCommit(&BusGapCommit{Slot: 10, SenderIdx: 1, ViewId: r.view()})
+	r.handleGapCommit(&BusGapCommit{Slot: 10, SenderIdx: 0, ViewId: r.view()})
 
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -685,14 +686,256 @@ func testReplicaN(idx, n, f int) *Replica {
 	return r
 }
 
+func setNormalViewForTest(r *Replica, view uint64) {
+	r.mu.Lock()
+	r.viewId.Store(view)
+	r.lastNormalView = view
+	r.status = statusNormal
+	r.mu.Unlock()
+}
+
+func TestGapMessagesRoundTripView(t *testing.T) {
+	t.Run("request", func(t *testing.T) {
+		want := &BusGapRequest{Slot: 9, SenderIdx: 2, ViewId: 7}
+		var wire bytes.Buffer
+		want.Marshal(&wire)
+		var got BusGapRequest
+		if err := got.Unmarshal(&wire); err != nil {
+			t.Fatal(err)
+		}
+		if !reflect.DeepEqual(&got, want) {
+			t.Fatalf("round trip = %+v, want %+v", got, *want)
+		}
+	})
+
+	t.Run("reply", func(t *testing.T) {
+		want := &BusGapReply{Slot: 9, SenderIdx: 2, ViewId: 7, Found: true, Bus: true, Op: []byte("bus")}
+		var wire bytes.Buffer
+		want.Marshal(&wire)
+		var got BusGapReply
+		if err := got.Unmarshal(&wire); err != nil {
+			t.Fatal(err)
+		}
+		if !reflect.DeepEqual(&got, want) {
+			t.Fatalf("round trip = %+v, want %+v", got, *want)
+		}
+	})
+
+	t.Run("commit reply", func(t *testing.T) {
+		want := &BusGapCommitReply{Slot: 9, SenderIdx: 2, ViewId: 7}
+		var wire bytes.Buffer
+		want.Marshal(&wire)
+		var got BusGapCommitReply
+		if err := got.Unmarshal(&wire); err != nil {
+			t.Fatal(err)
+		}
+		if !reflect.DeepEqual(&got, want) {
+			t.Fatalf("round trip = %+v, want %+v", got, *want)
+		}
+	})
+}
+
+func TestGapCommitRequiresCurrentViewLeader(t *testing.T) {
+	r := testReplica(2)
+	setNormalViewForTest(r, 1) // replica 1 leads view 1
+
+	r.handleGapCommit(&BusGapCommit{Slot: 0, SenderIdx: 0, ViewId: 0})
+	r.handleGapCommit(&BusGapCommit{Slot: 0, SenderIdx: 0, ViewId: 1})
+	r.handleGapCommit(&BusGapCommit{Slot: 0, SenderIdx: 99, ViewId: 1})
+	r.mu.Lock()
+	if st := r.slotStateLocked(0); st != slotEmpty {
+		r.mu.Unlock()
+		t.Fatalf("stale/non-leader commit changed slot to %v", st)
+	}
+	r.mu.Unlock()
+
+	r.handleGapCommit(&BusGapCommit{Slot: 0, SenderIdx: 1, ViewId: 1})
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if st := r.slotStateLocked(0); st != slotNoOp {
+		t.Fatalf("current leader commit left slot in state %v", st)
+	}
+}
+
+func TestGapRequestAndReplyRequireMatchingView(t *testing.T) {
+	r := testReplica(0)
+	r.handleGapRequest(&BusGapRequest{Slot: 7, SenderIdx: 1, ViewId: 1})
+	r.mu.Lock()
+	if len(r.gaps) != 0 {
+		r.mu.Unlock()
+		t.Fatal("future-view request created current-view gap state")
+	}
+	key := gapKey{view: 0, slot: 7}
+	gs := newGapState(nowNs(), key.view)
+	r.gaps[key] = gs
+	r.mu.Unlock()
+
+	r.handleGapReply(&BusGapReply{Slot: 7, SenderIdx: 1, ViewId: 1})
+	select {
+	case reply := <-gs.probeReplies:
+		t.Fatalf("mismatched reply from view %d reached view 0", reply.ViewId)
+	default:
+	}
+
+	r.handleGapReply(&BusGapReply{Slot: 7, SenderIdx: 1, ViewId: 0})
+	select {
+	case reply := <-gs.probeReplies:
+		if reply.ViewId != 0 {
+			t.Fatalf("matching reply carried view %d", reply.ViewId)
+		}
+	default:
+		t.Fatal("matching reply did not reach the active gap")
+	}
+}
+
+func TestGapCommitReplyRequiresActiveMatchingView(t *testing.T) {
+	r := testReplica(1)
+	setNormalViewForTest(r, 1) // this replica leads view 1
+	key := gapKey{view: 1, slot: 7}
+	gs := newGapState(nowNs(), key.view)
+	r.mu.Lock()
+	r.gaps[key] = gs
+	r.mu.Unlock()
+
+	r.handleGapCommitReply(&BusGapCommitReply{Slot: 7, SenderIdx: 2, ViewId: 0})
+	r.handleGapCommitReply(&BusGapCommitReply{Slot: 8, SenderIdx: 2, ViewId: 1})
+	select {
+	case idx := <-gs.commitAcks:
+		t.Fatalf("mismatched ACK from replica %d reached the active gap", idx)
+	default:
+	}
+
+	r.handleGapCommitReply(&BusGapCommitReply{Slot: 7, SenderIdx: 2, ViewId: 1})
+	select {
+	case idx := <-gs.commitAcks:
+		if idx != 2 {
+			t.Fatalf("ACK sender = %d, want 2", idx)
+		}
+	default:
+		t.Fatal("matching ACK did not reach the active gap")
+	}
+
+	r.mu.Lock()
+	r.finishGapLocked(key, gs)
+	r.mu.Unlock()
+	r.handleGapCommitReply(&BusGapCommitReply{Slot: 7, SenderIdx: 2, ViewId: 1})
+	select {
+	case idx := <-gs.commitAcks:
+		t.Fatalf("late ACK from replica %d reached a finished gap", idx)
+	default:
+	}
+}
+
+func TestViewChangeCancelsGapCollector(t *testing.T) {
+	r := testReplica(0)
+	key := gapKey{view: 0, slot: 7}
+	gs := newGapState(nowNs(), key.view)
+	r.mu.Lock()
+	r.gaps[key] = gs
+	r.mu.Unlock()
+
+	done := make(chan bool, 1)
+	go func() { done <- r.collectNoOpQuorum(key, gs) }()
+	r.startViewChange(1)
+
+	select {
+	case ok := <-done:
+		if ok {
+			t.Fatal("old-view collector reported a quorum after cancellation")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("old-view collector did not stop on view change")
+	}
+	if !gs.cancelled() {
+		t.Fatal("view change did not cancel the old gap state")
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if len(r.gaps) != 0 {
+		t.Fatalf("view change retained %d old gap states", len(r.gaps))
+	}
+}
+
+func TestViewChangeCancelsGapResolutionBeforeNoOp(t *testing.T) {
+	r := testReplica(0)
+	key := gapKey{view: 0, slot: 0}
+	gs := newGapState(nowNs(), key.view)
+	r.mu.Lock()
+	r.gaps[key] = gs
+	r.mu.Unlock()
+
+	done := make(chan struct{})
+	go func() {
+		r.leaderResolve(key, gs)
+		close(done)
+	}()
+	r.startViewChange(1)
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("old-view gap resolution did not stop on view change")
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if st := r.slotStateLocked(0); st != slotEmpty {
+		t.Fatalf("cancelled resolution installed %v in the new view", st)
+	}
+	if r.winNoops != 0 {
+		t.Fatalf("cancelled resolution recorded %d no-ops", r.winNoops)
+	}
+}
+
+func TestOldGapCannotDeleteReplacementState(t *testing.T) {
+	r := testReplica(0)
+	key := gapKey{view: 0, slot: 7}
+	old := newGapState(nowNs(), key.view)
+	replacement := newGapState(nowNs(), key.view)
+	r.mu.Lock()
+	r.gaps[key] = replacement
+	r.finishGapLocked(key, old)
+	got := r.gaps[key]
+	r.mu.Unlock()
+	if got != replacement {
+		t.Fatal("an old gap goroutine deleted replacement state")
+	}
+}
+
+func TestSyncCommitRequiresCurrentLeader(t *testing.T) {
+	r := testReplica(2)
+	r.mu.Lock()
+	busAt(r, 0, 1, 1)
+	r.advanceNextExpectedLocked()
+	r.mu.Unlock()
+
+	r.handleSyncCommit(&BusSyncCommit{ViewId: 0, StableSlot: 0, SenderIdx: 1})
+	r.mu.Lock()
+	if r.haveStable {
+		r.mu.Unlock()
+		t.Fatal("non-leader advanced the stable frontier")
+	}
+	r.mu.Unlock()
+
+	r.handleSyncCommit(&BusSyncCommit{ViewId: 0, StableSlot: 0, SenderIdx: 0})
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if !r.haveStable || r.stableSlot != 0 {
+		t.Fatalf("leader commit produced stable=%d/%v, want 0/true", r.stableSlot, r.haveStable)
+	}
+}
+
 // One reachable follower acks once per round, so counting acks rather than
 // distinct senders would let it supply a whole quorum by itself.
 func TestNoOpQuorumCountsDistinctReplicas(t *testing.T) {
 	r := testReplicaN(0, 5, 2) // quorum 3: the leader plus two others
-	gs := newGapState(nowNs())
+	key := gapKey{view: r.view(), slot: 7}
+	gs := newGapState(nowNs(), key.view)
+	r.mu.Lock()
+	r.gaps[key] = gs
+	r.mu.Unlock()
 
 	done := make(chan bool, 1)
-	go func() { done <- r.collectNoOpQuorum(7, gs) }()
+	go func() { done <- r.collectNoOpQuorum(key, gs) }()
 
 	gs.commitAcks <- 3
 	gs.commitAcks <- 3 // same replica, next round
@@ -738,9 +981,13 @@ func TestNoOpCommitUsesConfiguredRetryTimeout(t *testing.T) {
 	r.peerWriters[1] = &lockedWriter{w: bufio.NewWriter(w)}
 	r.mu.Unlock()
 
-	gs := newGapState(nowNs())
+	key := gapKey{view: r.view(), slot: 7}
+	gs := newGapState(nowNs(), key.view)
+	r.mu.Lock()
+	r.gaps[key] = gs
+	r.mu.Unlock()
 	done := make(chan bool, 1)
-	go func() { done <- r.collectNoOpQuorum(7, gs) }()
+	go func() { done <- r.collectNoOpQuorum(key, gs) }()
 
 	select {
 	case <-w.writes: // initial broadcast
@@ -766,11 +1013,12 @@ func TestNoOpCommitUsesConfiguredRetryTimeout(t *testing.T) {
 
 func TestBusIntakeContinuesWhileNoOpQuorumPending(t *testing.T) {
 	r := testReplica(0)
-	gs := newGapState(nowNs())
+	key := gapKey{view: r.view(), slot: 0}
+	gs := newGapState(nowNs(), key.view)
 
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.gaps[gapKey{0}] = gs
+	r.gaps[key] = gs
 
 	// Slot 1 arrives while slot 0 is still being resolved. Retain it in its
 	// assigned slot instead of buffering it behind the agreement goroutine.
@@ -800,7 +1048,7 @@ func TestBusIntakeContinuesWhileNoOpQuorumPending(t *testing.T) {
 	if r.nextExpected != 2 {
 		t.Fatalf("cursor = %d after filling the hole, want 2", r.nextExpected)
 	}
-	if r.gaps[gapKey{0}] != gs {
+	if r.gaps[key] != gs {
 		t.Fatal("gap agreement ended before its ack quorum completed")
 	}
 
