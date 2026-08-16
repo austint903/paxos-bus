@@ -1808,6 +1808,8 @@ func (r *Replica) leaderResolve(key gapKey, gs *gapState) {
 		&BusGapRequest{Slot: slot, SenderIdx: uint32(r.idx), ViewId: key.view})
 	var recovered []byte
 	var recoveredBus bool
+	recoveredFound := false
+	notFound := make(map[uint32]struct{}, r.config.N-1)
 	timer := time.NewTimer(gapRecoveryTimeout)
 probe:
 	for {
@@ -1816,7 +1818,14 @@ probe:
 			if reply.Found {
 				recovered = reply.Op
 				recoveredBus = reply.Bus
+				recoveredFound = true
 				break probe
+			}
+			if r.validReplicaIndex(reply.SenderIdx) && int(reply.SenderIdx) != r.idx {
+				notFound[reply.SenderIdx] = struct{}{}
+				if len(notFound) == r.config.N-1 {
+					break probe
+				}
 			}
 		case <-timer.C:
 			break probe
@@ -1832,7 +1841,7 @@ probe:
 		}
 	}
 
-	if recovered != nil {
+	if recoveredFound {
 		r.mu.Lock()
 		if !r.leaderGapActiveLocked(key, gs) {
 			r.mu.Unlock()

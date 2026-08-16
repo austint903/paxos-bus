@@ -788,6 +788,49 @@ func TestGapRequestAndReplyRequireMatchingView(t *testing.T) {
 	}
 }
 
+func TestLeaderResolvesGapAfterDistinctNotFoundReplies(t *testing.T) {
+	r := testReplicaN(0, 3, 1)
+	key := gapKey{view: r.view(), slot: 0}
+	gs := newGapState(nowNs(), key.view)
+	r.mu.Lock()
+	r.gaps[key] = gs
+	r.mu.Unlock()
+	t.Cleanup(gs.cancel)
+
+	done := make(chan struct{})
+	go func() {
+		r.leaderResolve(key, gs)
+		close(done)
+	}()
+
+	// A retransmitting replica still counts only once toward the all-missing
+	// result. Queue the commit ACK now so an incorrectly early NO-OP would let
+	// leaderResolve return and make the duplicate-counting bug observable.
+	r.handleGapReply(&BusGapReply{Slot: key.slot, SenderIdx: 1, ViewId: key.view})
+	r.handleGapReply(&BusGapReply{Slot: key.slot, SenderIdx: 1, ViewId: key.view})
+	r.handleGapCommitReply(&BusGapCommitReply{Slot: key.slot, SenderIdx: 1, ViewId: key.view})
+	select {
+	case <-done:
+		t.Fatal("duplicate not-found replies triggered a NO-OP")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	// The other peer's distinct not-found reply completes n-1 immediately;
+	// leaderResolve must not wait for the three-second recovery timeout.
+	r.handleGapReply(&BusGapReply{Slot: key.slot, SenderIdx: 2, ViewId: key.view})
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("all distinct not-found replies did not resolve the gap early")
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if st := r.slotStateLocked(key.slot); st != slotNoOp {
+		t.Fatalf("all peers reported not found, slot state = %v, want NO-OP", st)
+	}
+}
+
 func TestGapCommitReplyRequiresActiveMatchingView(t *testing.T) {
 	r := testReplica(1)
 	setNormalViewForTest(r, 1) // this replica leads view 1
