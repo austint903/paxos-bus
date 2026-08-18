@@ -802,7 +802,7 @@ func (r *Replica) driveViewChange(vc *vcState) {
 	}
 
 	r.mu.Lock()
-	if r.view() != vc.view {
+	if !r.viewChangeActiveLocked(vc) {
 		r.mu.Unlock()
 		return
 	}
@@ -823,20 +823,37 @@ func (r *Replica) driveViewChange(vc *vcState) {
 // to close a hole nobody can fill, and the alternative is a view change that
 // never finishes.
 func (r *Replica) fetchMergedState(vc *vcState, plan *mergePlan) bool {
+	if !r.viewChangeActive(vc) {
+		return false
+	}
 	if plan.hasStable && plan.hasCatchUp && int(plan.catchUp) != r.idx {
 		r.mu.Lock()
+		if !r.viewChangeActiveLocked(vc) {
+			r.mu.Unlock()
+			return false
+		}
 		from := r.nextExpected
 		r.mu.Unlock()
 		if from <= plan.stableSlot {
 			Notice("[%s] view %d: catching up committed prefix [%d,%d] from replica %d",
 				r.self, vc.view, from, plan.stableSlot, plan.catchUp)
-			r.fetchRangeBlocking(int(plan.catchUp), from, plan.stableSlot)
+			if !r.viewChangeActive(vc) {
+				return false
+			}
+			r.fetchViewChangeRange(vc, int(plan.catchUp), from, plan.stableSlot)
+			if !r.viewChangeActive(vc) {
+				return false
+			}
 		}
 	}
 
 	for attempt := 0; attempt < mergeFetchAttempts; attempt++ {
 		byDonor := make(map[uint32][2]uint64) // donor -> [lo, hi] of what it still owes
 		r.mu.Lock()
+		if !r.viewChangeActiveLocked(vc) {
+			r.mu.Unlock()
+			return false
+		}
 		for slot, donor := range plan.donors {
 			if e := r.globalLog[slot]; e != nil && e.state != slotEmpty {
 				continue
@@ -859,23 +876,31 @@ func (r *Replica) fetchMergedState(vc *vcState, plan *mergePlan) bool {
 		}
 		r.mu.Unlock()
 		if len(byDonor) == 0 {
-			return true
-		}
-		select {
-		case <-vc.abort:
-			return false
-		default:
+			return r.viewChangeActive(vc)
 		}
 		for donor, rng := range byDonor {
+			if !r.viewChangeActive(vc) {
+				return false
+			}
 			if int(donor) == r.idx {
 				continue
 			}
-			r.fetchRangeBlocking(int(donor), rng[0], rng[1])
+			// An unavailable donor is retried on the next attempt and eventually
+			// becomes a no-op. A retired view change, however, must stop before
+			// this old plan can advance to another donor.
+			r.fetchViewChangeRange(vc, int(donor), rng[0], rng[1])
+			if !r.viewChangeActive(vc) {
+				return false
+			}
 		}
 	}
 
 	// Whatever is still missing gets closed as a no-op.
 	r.mu.Lock()
+	if !r.viewChangeActiveLocked(vc) {
+		r.mu.Unlock()
+		return false
+	}
 	var stuck []uint64
 	for slot := range plan.donors {
 		if e := r.globalLog[slot]; e == nil || e.state == slotEmpty {
@@ -885,13 +910,16 @@ func (r *Replica) fetchMergedState(vc *vcState, plan *mergePlan) bool {
 		}
 	}
 	r.mu.Unlock()
+	if !r.viewChangeActive(vc) {
+		return false
+	}
 	if len(stuck) > 0 {
 		Warning("[%s] view %d: %d merged slots could not be fetched, closing them as no-ops",
 			r.self, vc.view, len(stuck))
 		plan.noops = append(plan.noops, stuck...)
 		sort.Slice(plan.noops, func(i, j int) bool { return plan.noops[i] < plan.noops[j] })
 	}
-	return true
+	return r.viewChangeActive(vc)
 }
 
 // broadcastStartView announces the installed view. It carries no entries: the
@@ -1521,6 +1549,7 @@ type fetchReq struct {
 	view       uint64
 	fetchID    uint64
 	installGen uint64
+	vc         *vcState
 	cancel     <-chan struct{}
 	done       chan bool
 }
@@ -1550,10 +1579,42 @@ func (r *Replica) enqueueFetch(peer int, from, to uint64, done chan bool) {
 	}
 }
 
-func (r *Replica) fetchRangeBlocking(peer int, from, to uint64) bool {
+// fetchViewChangeRange binds one leader-merge fetch to the exact view-change
+// attempt that selected its donor. Unlike a generic fetch, it never snapshots
+// the replica's mutable current view after the merge has begun.
+func (r *Replica) fetchViewChangeRange(vc *vcState, peer int, from, to uint64) bool {
+	if !r.viewChangeActive(vc) {
+		return false
+	}
+	if peer < 0 || peer >= r.config.N || peer == r.idx || from > to {
+		return peer == r.idx || from > to
+	}
 	done := make(chan bool, 1)
-	r.enqueueFetch(peer, from, to, done)
-	return <-done
+	req := fetchReq{
+		peer:    peer,
+		from:    from,
+		to:      to,
+		view:    vc.view,
+		fetchID: r.fetchSeq.Add(1),
+		vc:      vc,
+		cancel:  vc.abort,
+		done:    done,
+	}
+	select {
+	case <-vc.abort:
+		return false
+	case r.fetchQ <- req:
+	default:
+		Warning("[%s] state-fetch queue full, dropping view-change request [%d,%d]",
+			r.self, from, to)
+		return false
+	}
+	select {
+	case ok := <-done:
+		return ok && r.viewChangeActive(vc)
+	case <-vc.abort:
+		return false
+	}
 }
 
 func (r *Replica) fetchRecoveryRange(rec *viewRecovery, from, to uint64) bool {
@@ -1609,6 +1670,12 @@ func (r *Replica) fetchActive(req fetchReq) bool {
 	}
 	if r.view() != req.view {
 		return false
+	}
+	if req.vc != nil {
+		r.mu.Lock()
+		active := r.viewChangeActiveLocked(req.vc)
+		r.mu.Unlock()
+		return active
 	}
 	if req.installGen == 0 {
 		return true
@@ -1748,8 +1815,16 @@ func (r *Replica) applyStateEntries(m *BusNewState, req fetchReq) bool {
 }
 
 func (r *Replica) fetchActiveLocked(req fetchReq) bool {
+	select {
+	case <-req.cancel:
+		return false
+	default:
+	}
 	if r.view() != req.view {
 		return false
+	}
+	if req.vc != nil {
+		return r.viewChangeActiveLocked(req.vc)
 	}
 	if req.installGen == 0 {
 		return true
@@ -1757,6 +1832,33 @@ func (r *Replica) fetchActiveLocked(req fetchReq) bool {
 	return r.recovery != nil && r.recovery.generation == req.installGen &&
 		r.recovery.view == req.view && r.recovery.leader == req.peer &&
 		r.status == statusViewChange
+}
+
+func (r *Replica) viewChangeActive(vc *vcState) bool {
+	if vc == nil {
+		return false
+	}
+	select {
+	case <-vc.abort:
+		return false
+	default:
+	}
+	r.mu.Lock()
+	active := r.viewChangeActiveLocked(vc)
+	r.mu.Unlock()
+	return active
+}
+
+func (r *Replica) viewChangeActiveLocked(vc *vcState) bool {
+	if vc == nil {
+		return false
+	}
+	select {
+	case <-vc.abort:
+		return false
+	default:
+	}
+	return r.vc == vc && r.view() == vc.view && r.status == statusViewChange
 }
 
 func (r *Replica) handleGetState(msg *BusGetState) {
