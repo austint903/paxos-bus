@@ -480,6 +480,35 @@ func readSlotList(wire io.Reader) ([]uint64, error) {
 	return out, nil
 }
 
+func putReplicaList(wire io.Writer, replicas []uint32) {
+	var b [4]byte
+	binary.LittleEndian.PutUint32(b[:], uint32(len(replicas)))
+	wire.Write(b[:])
+	for _, replica := range replicas {
+		binary.LittleEndian.PutUint32(b[:], replica)
+		wire.Write(b[:])
+	}
+}
+
+func readReplicaList(wire io.Reader) ([]uint32, error) {
+	var b [4]byte
+	if _, err := io.ReadFull(wire, b[:]); err != nil {
+		return nil, err
+	}
+	n := binary.LittleEndian.Uint32(b[:])
+	if n > maxStateEntries {
+		return nil, fmt.Errorf("replica list too long: %d", n)
+	}
+	out := make([]uint32, n)
+	for i := range out {
+		if _, err := io.ReadFull(wire, b[:]); err != nil {
+			return nil, err
+		}
+		out[i] = binary.LittleEndian.Uint32(b[:])
+	}
+	return out, nil
+}
+
 func putBool(b []byte, v bool) {
 	if v {
 		b[0] = 1
@@ -611,17 +640,18 @@ type BusViewChange struct {
 
 // BusStartView installs the new view. Like BusViewChange it is metadata only:
 // followers learn the committed prefix (StableSlot), how far the merged suffix
-// runs (MaxSlot) and which of those slots the merge turned into no-ops, then
-// fetch whatever entries they are missing lazily.
+// runs (MaxSlot), which reports selected it, and which slots became no-ops.
+// They remain in recovery while fetching every missing entry.
 type BusStartView struct {
-	ViewId     uint64
-	StableSlot uint64
-	HasStable  bool
-	MaxSlot    uint64
-	HasMax     bool
-	PrefixHash uint64 // at StableSlot
-	SenderIdx  uint32
-	NoOpSlots  []uint64
+	ViewId          uint64
+	StableSlot      uint64
+	HasStable       bool
+	MaxSlot         uint64
+	HasMax          bool
+	PrefixHash      uint64 // at StableSlot
+	SenderIdx       uint32
+	NoOpSlots       []uint64
+	SelectedReports []uint32 // reports retained after filtering to the highest LastNormalView
 }
 
 // BusStateQuery is how a replica that finds itself in a stale view asks to be
@@ -742,6 +772,7 @@ func (m *BusStartView) Marshal(wire io.Writer) {
 	binary.LittleEndian.PutUint32(b[34:38], m.SenderIdx)
 	wire.Write(b[:])
 	putSlotList(wire, m.NoOpSlots)
+	putReplicaList(wire, m.SelectedReports)
 }
 
 func (m *BusStartView) Unmarshal(wire io.Reader) error {
@@ -761,6 +792,11 @@ func (m *BusStartView) Unmarshal(wire io.Reader) error {
 		return err
 	}
 	m.NoOpSlots = slots
+	replicas, err := readReplicaList(wire)
+	if err != nil {
+		return err
+	}
+	m.SelectedReports = replicas
 	return nil
 }
 
@@ -771,6 +807,7 @@ type BusGetState struct {
 	ViewId    uint64
 	FromSlot  uint64
 	ToSlot    uint64
+	FetchId   uint64
 	SenderIdx uint32
 }
 
@@ -794,6 +831,7 @@ type BusNewState struct {
 	ViewId    uint64
 	FromSlot  uint64
 	ToSlot    uint64
+	FetchId   uint64
 	SenderIdx uint32
 	Entries   []StateEntry
 }
@@ -801,23 +839,25 @@ type BusNewState struct {
 func (m *BusGetState) New() fastrpc.Serializable { return new(BusGetState) }
 
 func (m *BusGetState) Marshal(wire io.Writer) {
-	var b [28]byte
+	var b [36]byte
 	binary.LittleEndian.PutUint64(b[0:8], m.ViewId)
 	binary.LittleEndian.PutUint64(b[8:16], m.FromSlot)
 	binary.LittleEndian.PutUint64(b[16:24], m.ToSlot)
-	binary.LittleEndian.PutUint32(b[24:28], m.SenderIdx)
+	binary.LittleEndian.PutUint64(b[24:32], m.FetchId)
+	binary.LittleEndian.PutUint32(b[32:36], m.SenderIdx)
 	wire.Write(b[:])
 }
 
 func (m *BusGetState) Unmarshal(wire io.Reader) error {
-	var b [28]byte
+	var b [36]byte
 	if _, err := io.ReadFull(wire, b[:]); err != nil {
 		return err
 	}
 	m.ViewId = binary.LittleEndian.Uint64(b[0:8])
 	m.FromSlot = binary.LittleEndian.Uint64(b[8:16])
 	m.ToSlot = binary.LittleEndian.Uint64(b[16:24])
-	m.SenderIdx = binary.LittleEndian.Uint32(b[24:28])
+	m.FetchId = binary.LittleEndian.Uint64(b[24:32])
+	m.SenderIdx = binary.LittleEndian.Uint32(b[32:36])
 	return nil
 }
 
@@ -856,12 +896,13 @@ func (e *StateEntry) Unmarshal(wire io.Reader) error {
 func (m *BusNewState) New() fastrpc.Serializable { return new(BusNewState) }
 
 func (m *BusNewState) Marshal(wire io.Writer) {
-	var b [32]byte
+	var b [40]byte
 	binary.LittleEndian.PutUint64(b[0:8], m.ViewId)
 	binary.LittleEndian.PutUint64(b[8:16], m.FromSlot)
 	binary.LittleEndian.PutUint64(b[16:24], m.ToSlot)
-	binary.LittleEndian.PutUint32(b[24:28], m.SenderIdx)
-	binary.LittleEndian.PutUint32(b[28:32], uint32(len(m.Entries)))
+	binary.LittleEndian.PutUint64(b[24:32], m.FetchId)
+	binary.LittleEndian.PutUint32(b[32:36], m.SenderIdx)
+	binary.LittleEndian.PutUint32(b[36:40], uint32(len(m.Entries)))
 	wire.Write(b[:])
 	for i := range m.Entries {
 		m.Entries[i].Marshal(wire)
@@ -869,15 +910,16 @@ func (m *BusNewState) Marshal(wire io.Writer) {
 }
 
 func (m *BusNewState) Unmarshal(wire io.Reader) error {
-	var b [32]byte
+	var b [40]byte
 	if _, err := io.ReadFull(wire, b[:]); err != nil {
 		return err
 	}
 	m.ViewId = binary.LittleEndian.Uint64(b[0:8])
 	m.FromSlot = binary.LittleEndian.Uint64(b[8:16])
 	m.ToSlot = binary.LittleEndian.Uint64(b[16:24])
-	m.SenderIdx = binary.LittleEndian.Uint32(b[24:28])
-	n := binary.LittleEndian.Uint32(b[28:32])
+	m.FetchId = binary.LittleEndian.Uint64(b[24:32])
+	m.SenderIdx = binary.LittleEndian.Uint32(b[32:36])
+	n := binary.LittleEndian.Uint32(b[36:40])
 	if n > maxStateEntries {
 		return fmt.Errorf("state transfer too many entries: %d", n)
 	}

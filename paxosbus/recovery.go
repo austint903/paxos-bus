@@ -11,7 +11,8 @@ package paxosbus
 // order, only to reconcile which slots hold what, and it can do that from
 // metadata: which slots each replica holds (a bitmap), which of them are agreed
 // no-ops, and a hash of the committed prefix. Entries themselves move only over
-// BusGetState, lazily, after the new view is already running.
+// BusGetState. A follower remains in Recovering until it has installed the
+// complete merged range.
 
 import (
 	"sort"
@@ -45,7 +46,29 @@ const (
 	// mergeFetchAttempts bounds how many times the new leader re-asks for merged
 	// entries a donor failed to produce before declaring those slots no-ops.
 	mergeFetchAttempts = 3
+
+	// A follower that cannot complete a StartView fetch stays fenced in
+	// Recovering and retries. This delay keeps a disconnected leader from
+	// turning the recovery goroutine into a tight send loop.
+	recoveryRetryDelay = 100 * time.Millisecond
 )
+
+// viewRecovery is one follower-side StartView installation. generation is a
+// local fence: a newer StartView or view change cancels abort and makes every
+// outstanding state-transfer response from this installation ineligible to
+// mutate the log.
+type viewRecovery struct {
+	view       uint64
+	generation uint64
+	leader     int
+	abort      chan struct{}
+	stable     uint64
+	hasStable  bool
+	maxSlot    uint64
+	hasMax     bool
+	replayFrom uint64
+	replayTo   uint64
+}
 
 // ── Commit point ────────────────────────────────────────────────────────────
 
@@ -247,7 +270,10 @@ func (r *Replica) suspicionLoop() {
 		r.mu.Lock()
 		lost, last, st := r.leaderLost, r.lastHeartbeatNs, r.status
 		r.mu.Unlock()
-		if st != statusNormal || r.AmLeader() {
+		// A follower installing StartView still depends on that view's leader for
+		// state transfer. If the leader dies before recovery completes, the
+		// follower must be able to start the next view rather than retry forever.
+		if (st != statusNormal && st != statusRecovering) || r.AmLeader() {
 			continue
 		}
 		// Missing heartbeats are the only trigger. A closed socket is tempting to
@@ -298,6 +324,14 @@ func newVCState(view uint64, n int) *vcState {
 	}
 }
 
+func (r *Replica) cancelRecoveryLocked() {
+	if r.recovery == nil {
+		return
+	}
+	close(r.recovery.abort)
+	r.recovery = nil
+}
+
 func (r *Replica) startViewChange(newView uint64) {
 	r.mu.Lock()
 	if newView <= r.view() {
@@ -308,6 +342,7 @@ func (r *Replica) startViewChange(newView uint64) {
 		close(r.vc.abort)
 		r.vc = nil
 	}
+	r.cancelRecoveryLocked()
 	r.viewId.Store(newView)
 	r.status = statusViewChange
 	r.leaderLost = false
@@ -547,6 +582,7 @@ type mergePlan struct {
 	hasMax     bool
 	noops      []uint64          // sorted; slots in (stableSlot, maxSlot] agreed empty
 	donors     map[uint64]uint32 // slot -> a replica known to hold the entry
+	selected   []uint32          // reports retained at the highest LastNormalView
 	catchUp    uint32            // who to pull the committed prefix from
 	hasCatchUp bool
 }
@@ -578,8 +614,10 @@ func mergeSuffix(reports []*BusViewChange) mergePlan {
 	for _, m := range reports {
 		if m.LastNormalView == best {
 			survivors = append(survivors, m)
+			plan.selected = append(plan.selected, m.SenderIdx)
 		}
 	}
+	sort.Slice(plan.selected, func(i, j int) bool { return plan.selected[i] < plan.selected[j] })
 
 	var bestNext uint64
 	for _, m := range survivors {
@@ -673,6 +711,8 @@ func (r *Replica) driveViewChange(vc *vcState) {
 		r.mu.Unlock()
 		return
 	}
+	r.startViewView = vc.view
+	r.startViewUsed = append(r.startViewUsed[:0], plan.selected...)
 	r.installViewLocked(vc.view, plan.stableSlot, plan.hasStable, plan.noops, false)
 	r.vc = nil
 	r.mu.Unlock()
@@ -759,8 +799,9 @@ func (r *Replica) fetchMergedState(vc *vcState, plan *mergePlan) bool {
 }
 
 // broadcastStartView announces the installed view. It carries no entries: the
-// committed prefix and its hash, how far the merged suffix runs, and which of
-// those slots are no-ops. Anything a follower is missing it pulls afterwards.
+// committed prefix and its hash, how far the merged suffix runs, which reports
+// selected that result, and which slots are no-ops. A follower pulls everything
+// it lacks before exposing the view as normal.
 func (r *Replica) broadcastStartView() {
 	msg := r.startViewMsg()
 	if msg == nil {
@@ -787,8 +828,12 @@ func (r *Replica) startViewMsg() *BusStartView {
 		return nil
 	}
 	msg := &BusStartView{
-		ViewId:    r.view(),
-		SenderIdx: uint32(r.idx),
+		ViewId:          r.view(),
+		SenderIdx:       uint32(r.idx),
+		SelectedReports: append([]uint32(nil), r.startViewUsed...),
+	}
+	if r.startViewView != msg.ViewId {
+		msg.SelectedReports = nil
 	}
 	if r.haveStable {
 		msg.StableSlot, msg.HasStable = r.stableSlot, true
@@ -813,11 +858,75 @@ func (r *Replica) startViewMsg() *BusStartView {
 // this very connection — blocking the reader here would deadlock against it.
 func (r *Replica) handleStartView(msg *BusStartView) {
 	cp := *msg
+	cp.NoOpSlots = append([]uint64(nil), msg.NoOpSlots...)
+	cp.SelectedReports = append([]uint32(nil), msg.SelectedReports...)
+	if !r.validStartView(&cp) {
+		return
+	}
+
+	r.mu.Lock()
+	view := r.view()
+	if cp.ViewId < view ||
+		(cp.ViewId == view && r.status == statusNormal && r.lastNormalView == view) ||
+		(r.recovery != nil && cp.ViewId == r.recovery.view) {
+		r.mu.Unlock()
+		return
+	}
 	select {
 	case r.startViewQ <- &cp:
+		if cp.ViewId > r.startViewSeen {
+			r.startViewSeen = cp.ViewId
+		}
+		if r.recovery != nil && cp.ViewId > r.recovery.view {
+			r.cancelRecoveryLocked()
+		}
+		r.mu.Unlock()
 	default:
+		r.mu.Unlock()
 		Warning("[%s] start-view queue full, dropping view %d", r.self, msg.ViewId)
 	}
+}
+
+func (r *Replica) validStartView(msg *BusStartView) bool {
+	if int(msg.SenderIdx) >= r.config.N ||
+		int(msg.SenderIdx) != r.config.LeaderIndex(msg.ViewId) {
+		Warning("[%s] ignoring start view %d from non-leader replica %d",
+			r.self, msg.ViewId, msg.SenderIdx)
+		return false
+	}
+	if msg.HasStable && (!msg.HasMax || msg.MaxSlot < msg.StableSlot) {
+		Warning("[%s] ignoring malformed start view %d: stable=%d max=%d/%v",
+			r.self, msg.ViewId, msg.StableSlot, msg.MaxSlot, msg.HasMax)
+		return false
+	}
+	if msg.HasMax && msg.MaxSlot == ^uint64(0) {
+		Warning("[%s] ignoring malformed start view %d: max slot overflows",
+			r.self, msg.ViewId)
+		return false
+	}
+	base := suffixBase(msg.StableSlot, msg.HasStable)
+	for _, slot := range msg.NoOpSlots {
+		if !msg.HasMax || slot < base || slot > msg.MaxSlot {
+			Warning("[%s] ignoring malformed start view %d: no-op slot %d outside [%d,%d]",
+				r.self, msg.ViewId, slot, base, msg.MaxSlot)
+			return false
+		}
+	}
+	seen := make(map[uint32]struct{}, len(msg.SelectedReports))
+	for _, replica := range msg.SelectedReports {
+		if int(replica) >= r.config.N {
+			Warning("[%s] ignoring start view %d with invalid selected replica %d",
+				r.self, msg.ViewId, replica)
+			return false
+		}
+		if _, duplicate := seen[replica]; duplicate {
+			Warning("[%s] ignoring start view %d with duplicate selected replica %d",
+				r.self, msg.ViewId, replica)
+			return false
+		}
+		seen[replica] = struct{}{}
+	}
+	return true
 }
 
 // viewInstallLoop serialises view installs so two StartViews cannot rewind the
@@ -835,68 +944,282 @@ func (r *Replica) viewInstallLoop() {
 func (r *Replica) installStartView(msg *BusStartView) {
 	r.mu.Lock()
 	view := r.view()
-	if msg.ViewId < view ||
+	if msg.ViewId < view || msg.ViewId < r.startViewSeen ||
 		(msg.ViewId == view && r.status == statusNormal && r.lastNormalView == view) {
 		r.mu.Unlock()
 		return
 	}
-	// Having sent a report for exactly this view means we know our suffix was
-	// part of the merge, so the no-op list is a complete account of how the
-	// result can differ from what we executed. Otherwise — a stale replica being
-	// caught up — nothing above our own commit point can be trusted.
-	participated := msg.ViewId == view && r.status == statusViewChange
+	if r.recovery != nil {
+		r.mu.Unlock()
+		return
+	}
+	eligible := msg.ViewId == view && r.status == statusViewChange &&
+		r.vc != nil && r.vc.view == msg.ViewId && r.vc.reportSent
+	selected := false
+	if eligible {
+		for _, replica := range msg.SelectedReports {
+			if int(replica) == r.idx {
+				selected = true
+				break
+			}
+		}
+	}
+	// A selected replica can retain its suffix only if its known committed
+	// prefix agrees with the decision. Otherwise it takes the same conservative
+	// path as a replica whose report was not used.
+	if selected && msg.HasStable && r.nextExpected > msg.StableSlot {
+		if h, ok := r.prefixHashAtLocked(msg.StableSlot); ok && h != msg.PrefixHash {
+			Warning("[%s] PREFIX MISMATCH installing view %d at slot=%d (ours=%016x leader=%016x)",
+				r.self, msg.ViewId, msg.StableSlot, h, msg.PrefixHash)
+			selected = false
+		}
+	}
 	if r.vc != nil {
 		close(r.vc.abort)
 		r.vc = nil
 	}
 	r.sync = nil
 	r.cancelGapsLocked()
-	r.status = statusViewChange
-	r.viewId.Store(msg.ViewId)
 	r.drainPendingBusesLocked()
-	behindBy := int64(0)
-	if msg.HasStable && r.nextExpected <= msg.StableSlot {
-		behindBy = int64(msg.StableSlot) - int64(r.nextExpected) + 1
+	r.viewId.Store(msg.ViewId)
+	r.status = statusRecovering
+	// Receiving StartView is proof that this view's leader is alive. Start the
+	// recovery failure detector here so a slow fetch gets a full suspicion
+	// window, while a leader that subsequently disappears can still be replaced.
+	r.lastHeartbeatNs = nowNs()
+	r.leaderLost = false
+	r.recoveryGen++
+	rec := &viewRecovery{
+		view:       msg.ViewId,
+		generation: r.recoveryGen,
+		leader:     int(msg.SenderIdx),
+		abort:      make(chan struct{}),
+		stable:     msg.StableSlot,
+		hasStable:  msg.HasStable,
+		maxSlot:    msg.MaxSlot,
+		hasMax:     msg.HasMax,
 	}
-	from := r.nextExpected
-	r.mu.Unlock()
-
-	// The committed prefix is not optional — nothing may execute past a hole in
-	// it — so it is fetched before the view is installed, unlike the suffix.
-	if behindBy > 0 {
-		Notice("[%s] view %d: fetching committed prefix [%d,%d] from leader %d",
-			r.self, msg.ViewId, from, msg.StableSlot, msg.SenderIdx)
-		r.fetchRangeBlocking(int(msg.SenderIdx), from, msg.StableSlot)
-	}
-
-	r.mu.Lock()
-	if r.view() != msg.ViewId {
-		r.mu.Unlock()
-		return
-	}
-	if participated && msg.HasStable && r.haveStable && r.stableSlot >= msg.StableSlot {
-		if h, ok := r.prefixHashAtLocked(msg.StableSlot); ok && h != msg.PrefixHash {
-			Warning("[%s] PREFIX MISMATCH installing view %d at slot=%d (ours=%016x leader=%016x)",
-				r.self, msg.ViewId, msg.StableSlot, h, msg.PrefixHash)
-			participated = false
-		}
-	}
-	rewound, didRewind := r.installViewLocked(
-		msg.ViewId, msg.StableSlot, msg.HasStable, msg.NoOpSlots, !participated)
-	next, top := r.nextExpected, msg.MaxSlot
+	r.recovery = rec
+	r.startViewView = msg.ViewId
+	r.startViewUsed = append(r.startViewUsed[:0], msg.SelectedReports...)
+	rewound, didRewind, prepared := r.prepareRecoveryLocked(rec, msg, selected)
 	r.mu.Unlock()
 
 	if didRewind {
 		Notice("[%s] view %d: rewound cursor to slot %d", r.self, msg.ViewId, rewound)
 	}
-	Notice("[%s] VIEW-CHANGE done view=%d leader=%d executed=%d",
-		r.self, msg.ViewId, msg.SenderIdx, next)
-
-	// Everything else is lazy: the cursor is already running, and it advances
-	// as each chunk of the suffix lands.
-	if msg.HasMax && next <= top {
-		r.enqueueFetch(int(msg.SenderIdx), next, top, nil)
+	if !prepared {
+		return
 	}
+
+	for {
+		if r.finishRecoveryIfComplete(rec) {
+			return
+		}
+		from, to, active := r.recoveryMissingRange(rec)
+		if !active {
+			return
+		}
+		if from <= to {
+			r.fetchRecoveryRange(rec, from, to)
+		}
+		if r.finishRecoveryIfComplete(rec) {
+			return
+		}
+		timer := time.NewTimer(recoveryRetryDelay)
+		select {
+		case <-rec.abort:
+			if !timer.Stop() {
+				<-timer.C
+			}
+			return
+		case <-timer.C:
+		}
+	}
+}
+
+// prepareRecoveryLocked establishes the immutable reconciliation boundary
+// before releasing r.mu. Entries already present outside the merged log are
+// removed here, so buses arriving after recovery begins are never swept away by
+// a later cleanup pass.
+func (r *Replica) prepareRecoveryLocked(rec *viewRecovery, msg *BusStartView,
+	selected bool) (rewound uint64, didRewind, ok bool) {
+
+	replayFrom := suffixBase(r.stableSlot, r.haveStable)
+	if replayFrom < r.prunedBelow {
+		replayFrom = r.prunedBelow
+	}
+	target := r.nextExpected
+	canonicalEnd := uint64(0)
+	if msg.HasMax {
+		canonicalEnd = msg.MaxSlot + 1
+	}
+	localStableEnd := suffixBase(r.stableSlot, r.haveStable)
+	if r.haveStable && (!msg.HasMax || canonicalEnd < localStableEnd) {
+		Warning("[%s] cannot prepare recovery for view %d: merged end %d is below local stable frontier %d",
+			r.self, rec.view, canonicalEnd, localStableEnd)
+		return 0, false, false
+	}
+	noop := make(map[uint64]struct{}, len(msg.NoOpSlots))
+	for _, slot := range msg.NoOpSlots {
+		if r.haveStable && slot < localStableEnd && r.slotStateLocked(slot) != slotNoOp {
+			Warning("[%s] cannot prepare recovery for view %d: merged no-op at stable slot %d conflicts with local history",
+				r.self, rec.view, slot)
+			return 0, false, false
+		}
+		noop[slot] = struct{}{}
+	}
+
+	if !msg.HasMax {
+		target = 0
+	} else if !selected {
+		target = localStableEnd
+	} else {
+		if target > canonicalEnd {
+			target = canonicalEnd
+		}
+		for _, slot := range msg.NoOpSlots {
+			if slot < target && r.slotStateLocked(slot) == slotReceived {
+				target = slot
+			}
+		}
+		base := suffixBase(msg.StableSlot, msg.HasStable)
+		for slot, entry := range r.globalLog {
+			if slot < base || slot >= canonicalEnd || entry == nil || entry.state != slotNoOp {
+				continue
+			}
+			if _, canonical := noop[slot]; !canonical && slot < target {
+				target = slot
+			}
+		}
+	}
+
+	if target < r.nextExpected {
+		if !r.rewindToLocked(target) {
+			Warning("[%s] cannot prepare recovery for view %d: rewind to slot %d is outside the hash window",
+				r.self, rec.view, target)
+			return 0, false, false
+		}
+		rewound, didRewind = target, true
+	}
+
+	if !selected {
+		r.clearSlotRangeLocked(target, 0, false)
+	} else {
+		r.clearSlotRangeLocked(canonicalEnd, 0, false)
+		base := suffixBase(msg.StableSlot, msg.HasStable)
+		for slot, entry := range r.globalLog {
+			if slot < base || slot >= canonicalEnd || entry == nil || entry.state != slotNoOp {
+				continue
+			}
+			if _, canonical := noop[slot]; !canonical {
+				r.releaseEntryBytesLocked(entry)
+				delete(r.globalLog, slot)
+			}
+		}
+	}
+	r.recomputeMaxSlotLocked()
+	for _, slot := range msg.NoOpSlots {
+		if r.setNoOpLocked(slot) {
+			r.durableAppendLocked(slot, nil, true)
+			r.winNoops++
+		}
+	}
+	rec.replayFrom = replayFrom
+	rec.replayTo = r.nextExpected
+	return rewound, didRewind, true
+}
+
+// clearSlotRangeLocked removes the entries that existed when recovery began.
+// The caller holds r.mu, so a live bus cannot appear in the range until after
+// this one-time cleanup has finished.
+func (r *Replica) clearSlotRangeLocked(from, to uint64, bounded bool) {
+	for slot, entry := range r.globalLog {
+		if slot < from || (bounded && slot > to) {
+			continue
+		}
+		r.releaseEntryBytesLocked(entry)
+		delete(r.globalLog, slot)
+	}
+}
+
+func (r *Replica) recomputeMaxSlotLocked() {
+	r.haveMax = r.nextExpected > 0
+	if r.haveMax {
+		r.maxSlotSeen = r.nextExpected - 1
+	} else {
+		r.maxSlotSeen = 0
+	}
+	for slot, entry := range r.globalLog {
+		if entry == nil || entry.state == slotEmpty {
+			continue
+		}
+		if !r.haveMax || slot > r.maxSlotSeen {
+			r.maxSlotSeen, r.haveMax = slot, true
+		}
+	}
+}
+
+func (r *Replica) recoveryMissingRange(rec *viewRecovery) (uint64, uint64, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.recovery != rec || r.status != statusRecovering ||
+		r.view() != rec.view || r.config.LeaderIndex(rec.view) != rec.leader {
+		return 0, 0, false
+	}
+	if !rec.hasMax || r.nextExpected > rec.maxSlot {
+		return 1, 0, true
+	}
+	for slot := r.nextExpected; slot <= rec.maxSlot; slot++ {
+		if entry := r.globalLog[slot]; entry == nil || entry.state == slotEmpty {
+			// Pull only this contiguous missing run. Selected followers retain
+			// entries already represented in the merge, so re-downloading the
+			// filled tail would defeat that optimization.
+			to := slot
+			for to < rec.maxSlot {
+				next := to + 1
+				entry := r.globalLog[next]
+				if entry != nil && entry.state != slotEmpty {
+					break
+				}
+				to = next
+			}
+			return slot, to, true
+		}
+	}
+	return 1, 0, true
+}
+
+func (r *Replica) finishRecoveryIfComplete(rec *viewRecovery) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.recovery != rec || r.status != statusRecovering || r.view() != rec.view {
+		return false
+	}
+	if rec.hasMax && r.nextExpected <= rec.maxSlot {
+		for slot := r.nextExpected; slot <= rec.maxSlot; slot++ {
+			if entry := r.globalLog[slot]; entry == nil || entry.state == slotEmpty {
+				return false
+			}
+		}
+	}
+
+	// Publish Normal only after the canonical range is complete. The mutex keeps
+	// ordinary bus handling out until execution, replay, and reply enqueueing
+	// have all completed; replyLoop performs the network writes off this path.
+	r.lastNormalView = rec.view
+	r.status = statusNormal
+	r.lastHeartbeatNs = nowNs()
+	r.leaderLost = false
+	r.advanceNextExpectedLocked()
+	r.replayRepliesLocked(rec.replayFrom, rec.replayTo)
+	if rec.hasStable {
+		r.setStableLocked(rec.stable)
+	}
+	r.recovery = nil
+	Notice("[%s] VIEW-CHANGE done view=%d leader=%d executed=%d",
+		r.self, rec.view, rec.leader, r.nextExpected)
+	return true
 }
 
 // installViewLocked makes the local log agree with a decided view and returns
@@ -1082,33 +1405,77 @@ func (r *Replica) clearSlotsAboveLocked(from uint64) {
 // ── State transfer ──────────────────────────────────────────────────────────
 
 type fetchReq struct {
-	peer int
-	from uint64
-	to   uint64
-	done chan struct{}
+	peer       int
+	from       uint64
+	to         uint64
+	view       uint64
+	fetchID    uint64
+	installGen uint64
+	cancel     <-chan struct{}
+	done       chan bool
 }
 
-func (r *Replica) enqueueFetch(peer int, from, to uint64, done chan struct{}) {
-	if peer == r.idx || from > to {
+func (r *Replica) enqueueFetch(peer int, from, to uint64, done chan bool) {
+	if peer < 0 || peer >= r.config.N || peer == r.idx || from > to {
 		if done != nil {
-			close(done)
+			done <- peer == r.idx || from > to
 		}
 		return
 	}
+	req := fetchReq{
+		peer:    peer,
+		from:    from,
+		to:      to,
+		view:    r.view(),
+		fetchID: r.fetchSeq.Add(1),
+		done:    done,
+	}
 	select {
-	case r.fetchQ <- fetchReq{peer: peer, from: from, to: to, done: done}:
+	case r.fetchQ <- req:
 	default:
 		Warning("[%s] state-fetch queue full, dropping request [%d,%d]", r.self, from, to)
 		if done != nil {
-			close(done)
+			done <- false
 		}
 	}
 }
 
-func (r *Replica) fetchRangeBlocking(peer int, from, to uint64) {
-	done := make(chan struct{})
+func (r *Replica) fetchRangeBlocking(peer int, from, to uint64) bool {
+	done := make(chan bool, 1)
 	r.enqueueFetch(peer, from, to, done)
-	<-done
+	return <-done
+}
+
+func (r *Replica) fetchRecoveryRange(rec *viewRecovery, from, to uint64) bool {
+	if rec.leader == r.idx || from > to {
+		return true
+	}
+	done := make(chan bool, 1)
+	req := fetchReq{
+		peer:       rec.leader,
+		from:       from,
+		to:         to,
+		view:       rec.view,
+		fetchID:    r.fetchSeq.Add(1),
+		installGen: rec.generation,
+		cancel:     rec.abort,
+		done:       done,
+	}
+	select {
+	case r.fetchQ <- req:
+	case <-rec.abort:
+		return false
+	default:
+		Warning("[%s] state-fetch queue full, dropping recovery request [%d,%d]",
+			r.self, from, to)
+		return false
+	}
+	select {
+	case ok := <-done:
+		return ok
+	case <-rec.abort:
+		return false
+	}
 }
 
 // stateFetchLoop owns every inbound state transfer. Keeping it on one goroutine
@@ -1117,11 +1484,31 @@ func (r *Replica) fetchRangeBlocking(peer int, from, to uint64) {
 // through the same place.
 func (r *Replica) stateFetchLoop() {
 	for req := range r.fetchQ {
-		r.runFetch(req)
+		ok := r.runFetch(req)
 		if req.done != nil {
-			close(req.done)
+			req.done <- ok
 		}
 	}
+}
+
+func (r *Replica) fetchActive(req fetchReq) bool {
+	select {
+	case <-req.cancel:
+		return false
+	default:
+	}
+	if r.view() != req.view {
+		return false
+	}
+	if req.installGen == 0 {
+		return true
+	}
+	r.mu.Lock()
+	active := r.recovery != nil && r.recovery.generation == req.installGen &&
+		r.recovery.view == req.view && r.recovery.leader == req.peer &&
+		r.status == statusRecovering
+	r.mu.Unlock()
+	return active
 }
 
 // runFetch pulls one slot range, a chunk at a time.
@@ -1133,46 +1520,75 @@ func (r *Replica) stateFetchLoop() {
 // behind is mid-catch-up *from the leader*, so when the leader dies its own
 // view change queues behind a five-second wait for the replica it has just
 // declared dead. Measured at 5.12s of a 6.9s view change.
-func (r *Replica) runFetch(req fetchReq) {
+func (r *Replica) runFetch(req fetchReq) bool {
+	if req.peer < 0 || req.peer >= r.config.N || req.peer == r.idx || req.from > req.to {
+		return req.peer == r.idx || req.from > req.to
+	}
 	probe := time.NewTicker(stateFetchProbe)
 	defer probe.Stop()
 	next := req.from
 	for next <= req.to {
+		if !r.fetchActive(req) {
+			return false
+		}
 		r.sendToPeer(req.peer, MsgBusGetState, &BusGetState{
-			ViewId:    r.view(),
+			ViewId:    req.view,
 			FromSlot:  next,
 			ToSlot:    req.to,
+			FetchId:   req.fetchID,
 			SenderIdx: uint32(r.idx),
 		})
-		deadline := time.After(stateFetchTimeout)
+		deadline := time.NewTimer(stateFetchTimeout)
 		for advanced := false; !advanced; {
 			select {
 			case m := <-r.newStateCh:
-				if m.FromSlot != next {
+				if m.ViewId != req.view || int(m.SenderIdx) != req.peer ||
+					m.FetchId != req.fetchID || m.FromSlot != next ||
+					m.ToSlot < next || m.ToSlot > req.to {
 					continue // a reply to an earlier, abandoned request
 				}
-				r.applyStateEntries(m)
-				if m.ToSlot < next {
-					return // responder made no progress; give up on this range
+				if !r.applyStateEntries(m, req) {
+					if !deadline.Stop() {
+						<-deadline.C
+					}
+					return false
 				}
 				next = m.ToSlot + 1
 				advanced = true
+			case <-req.cancel:
+				if !deadline.Stop() {
+					<-deadline.C
+				}
+				return false
 			case <-probe.C:
 				if !r.peerConnected(req.peer) {
 					Warning("[%s] state fetch [%d,%d] from replica %d abandoned at slot %d: "+
 						"peer connection lost", r.self, req.from, req.to, req.peer, next)
-					return
+					if !deadline.Stop() {
+						<-deadline.C
+					}
+					return false
 				}
-			case <-deadline:
+			case <-deadline.C:
 				Warning("[%s] state fetch [%d,%d] from replica %d timed out at slot %d",
 					r.self, req.from, req.to, req.peer, next)
-				return
+				return false
+			}
+		}
+		if !deadline.Stop() {
+			select {
+			case <-deadline.C:
+			default:
 			}
 		}
 	}
+	return true
 }
 
 func (r *Replica) handleNewState(msg *BusNewState) {
+	if int(msg.SenderIdx) >= r.config.N {
+		return
+	}
 	select {
 	case r.newStateCh <- msg:
 	default:
@@ -1181,11 +1597,28 @@ func (r *Replica) handleNewState(msg *BusNewState) {
 	}
 }
 
-func (r *Replica) applyStateEntries(m *BusNewState) {
-	if len(m.Entries) == 0 {
-		return
+func (r *Replica) applyStateEntries(m *BusNewState, req fetchReq) bool {
+	if m.ViewId != req.view || int(m.SenderIdx) != req.peer ||
+		m.FetchId != req.fetchID || m.FromSlot < req.from ||
+		m.ToSlot < m.FromSlot || m.ToSlot > req.to {
+		return false
 	}
 	r.mu.Lock()
+	defer r.mu.Unlock()
+	if !r.fetchActiveLocked(req) {
+		return false
+	}
+	seen := make(map[uint64]struct{}, len(m.Entries))
+	for i := range m.Entries {
+		slot := m.Entries[i].Slot
+		if slot < m.FromSlot || slot > m.ToSlot || slot < req.from || slot > req.to {
+			return false
+		}
+		if _, duplicate := seen[slot]; duplicate {
+			return false
+		}
+		seen[slot] = struct{}{}
+	}
 	for i := range m.Entries {
 		e := &m.Entries[i]
 		if e.IsNoOp {
@@ -1201,10 +1634,25 @@ func (r *Replica) applyStateEntries(m *BusNewState) {
 		}
 	}
 	r.advanceNextExpectedLocked()
-	r.mu.Unlock()
+	return true
+}
+
+func (r *Replica) fetchActiveLocked(req fetchReq) bool {
+	if r.view() != req.view {
+		return false
+	}
+	if req.installGen == 0 {
+		return true
+	}
+	return r.recovery != nil && r.recovery.generation == req.installGen &&
+		r.recovery.view == req.view && r.recovery.leader == req.peer &&
+		r.status == statusRecovering
 }
 
 func (r *Replica) handleGetState(msg *BusGetState) {
+	if int(msg.SenderIdx) >= r.config.N || msg.FromSlot > msg.ToSlot || msg.ViewId != r.view() {
+		return
+	}
 	cp := *msg
 	select {
 	case r.serveQ <- &cp:
@@ -1224,9 +1672,13 @@ func (r *Replica) stateServeLoop() {
 }
 
 func (r *Replica) serveState(req *BusGetState) {
+	if req.ViewId != r.view() || int(req.SenderIdx) >= r.config.N {
+		return
+	}
 	reply := &BusNewState{
-		ViewId:    r.view(),
+		ViewId:    req.ViewId,
 		FromSlot:  req.FromSlot,
+		FetchId:   req.FetchId,
 		SenderIdx: uint32(r.idx),
 	}
 	last := req.FromSlot
@@ -1242,6 +1694,9 @@ func (r *Replica) serveState(req *BusGetState) {
 		}
 	}
 	reply.ToSlot = last
+	if req.ViewId != r.view() {
+		return
+	}
 	r.sendToPeer(int(req.SenderIdx), MsgBusNewState, reply)
 }
 

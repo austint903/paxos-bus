@@ -229,13 +229,18 @@ type replicaStatus uint8
 const (
 	statusNormal replicaStatus = iota
 	statusViewChange
+	statusRecovering
 )
 
 func (s replicaStatus) String() string {
-	if s == statusViewChange {
+	switch s {
+	case statusViewChange:
 		return "view-change"
+	case statusRecovering:
+		return "recovering"
+	default:
+		return "normal"
 	}
-	return "normal"
 }
 
 type Replica struct {
@@ -250,6 +255,11 @@ type Replica struct {
 	clients        map[uint64]*clientLine
 	status         replicaStatus
 	lastNormalView uint64
+	recovery       *viewRecovery
+	recoveryGen    uint64
+	startViewSeen  uint64
+	startViewView  uint64
+	startViewUsed  []uint32
 
 	globalLog    map[uint64]*globalEntry
 	nextExpected uint64
@@ -318,6 +328,7 @@ type Replica struct {
 	serveQ            chan *BusGetState
 	newStateCh        chan *BusNewState
 	startViewQ        chan *BusStartView
+	fetchSeq          atomic.Uint64
 
 	logDir     string
 	durable    *durableLog // BusMessage Log: slot -> bus (replica.log)

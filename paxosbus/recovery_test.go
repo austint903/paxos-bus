@@ -93,6 +93,9 @@ func TestMergeIgnoresStaleLastNormalView(t *testing.T) {
 	if plan.maxSlot != 6 {
 		t.Errorf("max = %d, want 6 (stale report must not extend it)", plan.maxSlot)
 	}
+	if !reflect.DeepEqual(plan.selected, []uint32{0, 1}) {
+		t.Errorf("selected reports = %v, want [0 1]", plan.selected)
+	}
 }
 
 func TestMergeClosesSlotsNobodyHolds(t *testing.T) {
@@ -114,6 +117,54 @@ func TestMergeEmpty(t *testing.T) {
 	if plan := mergeSuffix(nil); plan.hasStable || plan.hasMax {
 		t.Errorf("empty merge produced %+v", plan)
 	}
+}
+
+func TestStartViewAndStateTransferRoundTripRecoveryFences(t *testing.T) {
+	t.Run("start view", func(t *testing.T) {
+		want := &BusStartView{
+			ViewId: 4, StableSlot: 8, HasStable: true, MaxSlot: 12, HasMax: true,
+			PrefixHash: 99, SenderIdx: 1, NoOpSlots: []uint64{9, 11},
+			SelectedReports: []uint32{0, 1, 3},
+		}
+		var wire bytes.Buffer
+		want.Marshal(&wire)
+		var got BusStartView
+		if err := got.Unmarshal(&wire); err != nil {
+			t.Fatal(err)
+		}
+		if !reflect.DeepEqual(&got, want) {
+			t.Fatalf("round trip = %+v, want %+v", got, *want)
+		}
+	})
+
+	t.Run("get state", func(t *testing.T) {
+		want := &BusGetState{ViewId: 4, FromSlot: 9, ToSlot: 12, FetchId: 77, SenderIdx: 2}
+		var wire bytes.Buffer
+		want.Marshal(&wire)
+		var got BusGetState
+		if err := got.Unmarshal(&wire); err != nil {
+			t.Fatal(err)
+		}
+		if !reflect.DeepEqual(&got, want) {
+			t.Fatalf("round trip = %+v, want %+v", got, *want)
+		}
+	})
+
+	t.Run("new state", func(t *testing.T) {
+		want := &BusNewState{
+			ViewId: 4, FromSlot: 9, ToSlot: 9, FetchId: 77, SenderIdx: 1,
+			Entries: []StateEntry{{Slot: 9, ClientId: 3, ReqId: 5, IsBus: true, Payload: []byte("bus")}},
+		}
+		var wire bytes.Buffer
+		want.Marshal(&wire)
+		var got BusNewState
+		if err := got.Unmarshal(&wire); err != nil {
+			t.Fatal(err)
+		}
+		if !reflect.DeepEqual(&got, want) {
+			t.Fatalf("round trip = %+v, want %+v", got, *want)
+		}
+	})
 }
 
 // ── Prefix hash ─────────────────────────────────────────────────────────────
@@ -416,6 +467,427 @@ func TestInstallViewReplaySkipsCommittedPrefix(t *testing.T) {
 
 	if n := len(r.pendingReplies); n != 0 {
 		t.Errorf("%d replies queued for a fully committed log, want none", n)
+	}
+}
+
+func prepareFollowerRecoveryForTest(t *testing.T, r *Replica, msg *BusStartView,
+	selected bool) *viewRecovery {
+	t.Helper()
+	r.mu.Lock()
+	r.viewId.Store(msg.ViewId)
+	r.status = statusRecovering
+	r.recoveryGen++
+	rec := &viewRecovery{
+		view:       msg.ViewId,
+		generation: r.recoveryGen,
+		leader:     int(msg.SenderIdx),
+		abort:      make(chan struct{}),
+		stable:     msg.StableSlot,
+		hasStable:  msg.HasStable,
+		maxSlot:    msg.MaxSlot,
+		hasMax:     msg.HasMax,
+	}
+	r.recovery = rec
+	if _, _, ok := r.prepareRecoveryLocked(rec, msg, selected); !ok {
+		r.mu.Unlock()
+		t.Fatal("could not prepare follower recovery")
+	}
+	r.mu.Unlock()
+	return rec
+}
+
+func TestSelectedFollowerRetainsMergedSuffixAndLateBus(t *testing.T) {
+	r := testReplica(0)
+	r.mu.Lock()
+	for slot := uint64(0); slot < 7; slot++ {
+		busAt(r, slot, slot+1, slot+1)
+	}
+	r.advanceNextExpectedLocked()
+	r.setStableLocked(2)
+	r.pendingReplies = nil
+	r.mu.Unlock()
+
+	msg := &BusStartView{
+		ViewId: 1, SenderIdx: 1, StableSlot: 2, HasStable: true,
+		MaxSlot: 4, HasMax: true, SelectedReports: []uint32{0, 1},
+	}
+	rec := prepareFollowerRecoveryForTest(t, r, msg, true)
+
+	r.mu.Lock()
+	if r.status != statusRecovering || r.lastNormalView != 0 {
+		t.Fatalf("status=%v lastNormalView=%d, want recovering in old normal view",
+			r.status, r.lastNormalView)
+	}
+	for _, slot := range []uint64{3, 4} {
+		if r.slotStateLocked(slot) != slotReceived {
+			t.Errorf("selected suffix slot %d was not retained", slot)
+		}
+	}
+	for _, slot := range []uint64{5, 6} {
+		if _, ok := r.globalLog[slot]; ok {
+			t.Errorf("pre-StartView slot %d beyond merged max survived", slot)
+		}
+	}
+	// This bus arrives after the one-time cleanup. Finishing recovery must not
+	// erase it merely because it is beyond the old merged MaxSlot.
+	busAt(r, 6, 7, 70)
+	r.mu.Unlock()
+
+	if !r.finishRecoveryIfComplete(rec) {
+		t.Fatal("complete selected suffix did not finish recovery")
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.status != statusNormal || r.lastNormalView != 1 {
+		t.Errorf("status=%v lastNormalView=%d, want normal in view 1", r.status, r.lastNormalView)
+	}
+	if r.slotStateLocked(6) != slotReceived {
+		t.Error("bus arriving after recovery began was deleted")
+	}
+}
+
+func TestUnselectedFollowerDiscardsSpeculativeSuffix(t *testing.T) {
+	r := testReplica(0)
+	r.mu.Lock()
+	for slot := uint64(0); slot < 7; slot++ {
+		busAt(r, slot, slot+1, slot+1)
+	}
+	r.advanceNextExpectedLocked()
+	r.setStableLocked(2)
+	r.pendingReplies = nil
+	r.mu.Unlock()
+
+	msg := &BusStartView{
+		ViewId: 1, SenderIdx: 1, StableSlot: 2, HasStable: true,
+		MaxSlot: 5, HasMax: true, NoOpSlots: []uint64{4}, SelectedReports: []uint32{1, 2},
+	}
+	prepareFollowerRecoveryForTest(t, r, msg, false)
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.nextExpected != 3 {
+		t.Errorf("cursor=%d, want rewind to own stable frontier 3", r.nextExpected)
+	}
+	if r.slotStateLocked(3) != slotEmpty || r.slotStateLocked(5) != slotEmpty {
+		t.Error("unselected speculative real entries survived conservative rewind")
+	}
+	if r.slotStateLocked(4) != slotNoOp {
+		t.Errorf("canonical slot 4 state=%v, want no-op", r.slotStateLocked(4))
+	}
+}
+
+func TestRecoveryNeverRewindsBelowLocalStableFrontier(t *testing.T) {
+	r := testReplica(0)
+	r.mu.Lock()
+	for slot := uint64(0); slot < 5; slot++ {
+		busAt(r, slot, slot+1, slot+1)
+	}
+	r.advanceNextExpectedLocked()
+	r.setStableLocked(3)
+	r.viewId.Store(1)
+	r.status = statusRecovering
+	rec := &viewRecovery{
+		view: 1, generation: 1, leader: 1, abort: make(chan struct{}),
+		stable: 1, hasStable: true, maxSlot: 2, hasMax: true,
+	}
+	r.recovery = rec
+	msg := &BusStartView{
+		ViewId: 1, SenderIdx: 1, StableSlot: 1, HasStable: true,
+		MaxSlot: 2, HasMax: true,
+	}
+	_, _, ok := r.prepareRecoveryLocked(rec, msg, false)
+	if ok {
+		r.mu.Unlock()
+		t.Fatal("accepted a merged log ending below the local stable frontier")
+	}
+	if r.nextExpected != 5 || r.stableSlot != 3 {
+		next, stable := r.nextExpected, r.stableSlot
+		r.mu.Unlock()
+		t.Fatalf("failed recovery rewound stable history: next=%d stable=%d, want 5/3", next, stable)
+	}
+	for slot := uint64(0); slot < 5; slot++ {
+		if r.slotStateLocked(slot) != slotReceived {
+			r.mu.Unlock()
+			t.Fatalf("failed recovery changed stable slot %d", slot)
+		}
+	}
+	r.mu.Unlock()
+}
+
+func TestIncompleteOrFailedRecoveryStaysRecovering(t *testing.T) {
+	r := testReplica(0)
+	r.mu.Lock()
+	busAt(r, 0, 1, 1)
+	r.advanceNextExpectedLocked()
+	r.setStableLocked(0)
+	r.pendingReplies = nil
+	r.mu.Unlock()
+
+	msg := &BusStartView{
+		ViewId: 1, SenderIdx: 1, StableSlot: 0, HasStable: true,
+		MaxSlot: 2, HasMax: true, NoOpSlots: []uint64{2}, SelectedReports: []uint32{0, 1},
+	}
+	rec := prepareFollowerRecoveryForTest(t, r, msg, true)
+	if r.finishRecoveryIfComplete(rec) {
+		t.Fatal("recovery completed with missing slot 1")
+	}
+
+	ok := r.runFetch(fetchReq{
+		peer: 1, from: 1, to: 2, view: 1, fetchID: 10,
+		installGen: rec.generation, cancel: rec.abort,
+	})
+	if ok {
+		t.Fatal("fetch from disconnected leader reported success")
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.status != statusRecovering || r.lastNormalView != 0 {
+		t.Errorf("failed fetch exposed replica as %v in lastNormalView %d",
+			r.status, r.lastNormalView)
+	}
+}
+
+func TestRecoveryFetchesOnlyContiguousMissingRuns(t *testing.T) {
+	r := testReplica(0)
+	r.mu.Lock()
+	for slot := uint64(0); slot < 3; slot++ {
+		busAt(r, slot, slot+1, slot+1)
+	}
+	r.advanceNextExpectedLocked()
+	r.status = statusViewChange
+	busAt(r, 4, 5, 5)
+	busAt(r, 6, 7, 7)
+	r.mu.Unlock()
+
+	msg := &BusStartView{
+		ViewId: 1, SenderIdx: 1, MaxSlot: 6, HasMax: true,
+		SelectedReports: []uint32{0, 1},
+	}
+	rec := prepareFollowerRecoveryForTest(t, r, msg, true)
+
+	from, to, active := r.recoveryMissingRange(rec)
+	if !active || from != 3 || to != 3 {
+		t.Fatalf("first missing range=%d..%d active=%v, want 3..3", from, to, active)
+	}
+	r.mu.Lock()
+	busAt(r, 3, 4, 4)
+	r.mu.Unlock()
+	from, to, active = r.recoveryMissingRange(rec)
+	if !active || from != 5 || to != 5 {
+		t.Fatalf("second missing range=%d..%d active=%v, want 5..5", from, to, active)
+	}
+}
+
+func TestStaleRecoveryTokenCannotInstallState(t *testing.T) {
+	r := testReplica(0)
+	msg := &BusStartView{ViewId: 1, SenderIdx: 1, MaxSlot: 0, HasMax: true}
+	rec := prepareFollowerRecoveryForTest(t, r, msg, false)
+	state := &BusNewState{
+		ViewId: 1, FromSlot: 0, ToSlot: 0, FetchId: 8, SenderIdx: 1,
+		Entries: []StateEntry{{
+			Slot: 0, ClientId: 1, ReqId: 1, IsBus: true,
+			Payload: marshalRequests([]RequestMessage{{ClientId: 1, RequestId: 1, Op: []byte("x")}}),
+		}},
+	}
+	wrongLeader := fetchReq{peer: 2, from: 0, to: 0, view: 1, fetchID: 8, installGen: rec.generation}
+	if r.applyStateEntries(state, wrongLeader) {
+		t.Fatal("state from a non-leader peer was accepted during follower recovery")
+	}
+	staleView := fetchReq{peer: 1, from: 0, to: 0, view: 0, fetchID: 8, installGen: rec.generation}
+	if r.applyStateEntries(state, staleView) {
+		t.Fatal("state from a stale view was accepted")
+	}
+	stale := fetchReq{peer: 1, from: 0, to: 0, view: 1, fetchID: 8, installGen: rec.generation + 1}
+	if r.applyStateEntries(state, stale) {
+		t.Fatal("state from stale recovery token was accepted")
+	}
+	r.mu.Lock()
+	if r.slotStateLocked(0) != slotEmpty {
+		r.mu.Unlock()
+		t.Fatal("stale recovery token mutated the log")
+	}
+	r.mu.Unlock()
+
+	active := stale
+	active.installGen = rec.generation
+	if !r.applyStateEntries(state, active) {
+		t.Fatal("state for active recovery token was rejected")
+	}
+	if !r.finishRecoveryIfComplete(rec) {
+		t.Fatal("complete active recovery did not finish")
+	}
+}
+
+func TestNewViewDuringRecoveryKeepsPreviousLastNormalView(t *testing.T) {
+	r := testReplica(0)
+	r.mu.Lock()
+	busAt(r, 0, 1, 1)
+	r.advanceNextExpectedLocked()
+	r.setStableLocked(0)
+	r.mu.Unlock()
+
+	msg := &BusStartView{
+		ViewId: 1, SenderIdx: 1, StableSlot: 0, HasStable: true,
+		MaxSlot: 1, HasMax: true, SelectedReports: []uint32{0, 1},
+	}
+	rec := prepareFollowerRecoveryForTest(t, r, msg, true)
+	r.startViewChange(2)
+	select {
+	case <-rec.abort:
+	default:
+		t.Fatal("starting view 2 did not cancel the incomplete view-1 recovery")
+	}
+
+	r.mu.Lock()
+	incomplete := r.buildViewChangeLocked(2)
+	status, lastNormal := r.status, r.lastNormalView
+	r.mu.Unlock()
+	if status != statusViewChange || lastNormal != 0 || incomplete.LastNormalView != 0 {
+		t.Fatalf("status=%v local/report lastNormal=%d/%d, want viewchange and 0/0",
+			status, lastNormal, incomplete.LastNormalView)
+	}
+
+	// A complete replica from the previous normal view still contributes slot
+	// 1. The incomplete recovering report must not claim view 1 and outrank it.
+	complete := report(2, 0, 0, []uint64{1}, nil)
+	complete.ViewId = 2
+	plan := mergeSuffix([]*BusViewChange{incomplete, complete})
+	if !plan.hasMax || plan.maxSlot != 1 || plan.donors[1] != 2 {
+		t.Fatalf("next merge lost complete replica's slot 1: %+v", plan)
+	}
+}
+
+func TestRecoveredRepliesUseNewView(t *testing.T) {
+	r := testReplica(0)
+	r.mu.Lock()
+	busAt(r, 0, 1, 1)
+	busAt(r, 1, 2, 2)
+	r.advanceNextExpectedLocked()
+	r.setStableLocked(0)
+	r.pendingReplies = nil
+	r.mu.Unlock()
+
+	msg := &BusStartView{
+		ViewId: 1, SenderIdx: 1, StableSlot: 0, HasStable: true,
+		MaxSlot: 2, HasMax: true, SelectedReports: []uint32{0, 1},
+	}
+	rec := prepareFollowerRecoveryForTest(t, r, msg, true)
+	state := &BusNewState{
+		ViewId: 1, FromSlot: 2, ToSlot: 2, FetchId: 9, SenderIdx: 1,
+		Entries: []StateEntry{{
+			Slot: 2, ClientId: 1, ReqId: 3, IsBus: true,
+			Payload: marshalRequests([]RequestMessage{{ClientId: 1, RequestId: 3, Op: []byte("x")}}),
+		}},
+	}
+	req := fetchReq{
+		peer: 1, from: 2, to: 2, view: 1, fetchID: 9,
+		installGen: rec.generation, cancel: rec.abort,
+	}
+	if !r.applyStateEntries(state, req) || !r.finishRecoveryIfComplete(rec) {
+		t.Fatal("could not install complete recovered suffix")
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	got := repliesBySlot(t, r, 1)
+	want := map[uint64]int{1: 1, 2: 1}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("recovery replies by slot=%v, want %v", got, want)
+	}
+}
+
+func TestStartViewDoesNotBecomeNormalBeforeStateArrives(t *testing.T) {
+	r := testReplica(0)
+	var peer bytes.Buffer
+	r.mu.Lock()
+	r.peerWriters[1] = &lockedWriter{w: bufio.NewWriter(&peer)}
+	r.mu.Unlock()
+
+	go r.stateFetchLoop()
+	done := make(chan struct{})
+	go func() {
+		r.installStartView(&BusStartView{
+			ViewId: 1, SenderIdx: 1, MaxSlot: 0, HasMax: true,
+			SelectedReports: []uint32{1},
+		})
+		close(done)
+	}()
+
+	deadline := time.Now().Add(time.Second)
+	for {
+		r.mu.Lock()
+		status, lastNormal := r.status, r.lastNormalView
+		r.mu.Unlock()
+		if status == statusRecovering && r.fetchSeq.Load() > 0 {
+			if lastNormal != 0 {
+				t.Fatalf("lastNormalView=%d before state arrived, want 0", lastNormal)
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("replica never entered recovery or requested state")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	fetchID := r.fetchSeq.Load()
+	r.newStateCh <- &BusNewState{
+		ViewId: 1, FromSlot: 0, ToSlot: 0, FetchId: fetchID, SenderIdx: 1,
+		Entries: []StateEntry{{
+			Slot: 0, ClientId: 1, ReqId: 1, IsBus: true,
+			Payload: marshalRequests([]RequestMessage{{ClientId: 1, RequestId: 1, Op: []byte("x")}}),
+		}},
+	}
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("complete state transfer did not finish StartView installation")
+	}
+	close(r.fetchQ)
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.status != statusNormal || r.lastNormalView != 1 || r.nextExpected != 1 {
+		t.Fatalf("status=%v lastNormalView=%d nextExpected=%d, want normal/1/1",
+			r.status, r.lastNormalView, r.nextExpected)
+	}
+	got := repliesBySlot(t, r, 1)
+	if !reflect.DeepEqual(got, map[uint64]int{0: 1}) {
+		t.Fatalf("recovery replies by slot=%v, want map[0:1]", got)
+	}
+}
+
+func TestStartViewRequiresCurrentViewLeader(t *testing.T) {
+	r := testReplica(0) // replica 1 leads view 1
+	base := BusStartView{ViewId: 1, SenderIdx: 0, SelectedReports: []uint32{0, 1}}
+	r.handleStartView(&base)
+	base.SenderIdx = 99
+	r.handleStartView(&base)
+	if n := len(r.startViewQ); n != 0 {
+		t.Fatalf("queued %d invalid StartViews", n)
+	}
+	base.SenderIdx = 1
+	r.handleStartView(&base)
+	if n := len(r.startViewQ); n != 1 {
+		t.Fatalf("queued %d valid StartViews, want 1", n)
+	}
+}
+
+func TestLaterStartViewResponseRetainsSelectedReports(t *testing.T) {
+	r := testReplica(1)
+	r.mu.Lock()
+	r.viewId.Store(1)
+	r.lastNormalView = 1
+	r.status = statusNormal
+	r.startViewView = 1
+	r.startViewUsed = []uint32{0, 1}
+	r.mu.Unlock()
+
+	msg := r.startViewMsg()
+	if msg == nil {
+		t.Fatal("normal leader did not produce StartView")
+	}
+	if !reflect.DeepEqual(msg.SelectedReports, []uint32{0, 1}) {
+		t.Errorf("selected reports=%v, want [0 1]", msg.SelectedReports)
 	}
 }
 
@@ -1337,7 +1809,38 @@ func TestSilentLeaderSuspectedOnTimeout(t *testing.T) {
 	if !suspicionFires(r, 2*time.Second) {
 		t.Fatal("a silent leader was never suspected")
 	}
-	if r.view() != 1 || r.status != statusViewChange {
-		t.Fatalf("view=%d status=%v, want view 1 in viewchange", r.view(), r.status)
+	r.mu.Lock()
+	view, status := r.view(), r.status
+	r.mu.Unlock()
+	if view != 1 || status != statusViewChange {
+		t.Fatalf("view=%d status=%v, want view 1 in viewchange", view, status)
+	}
+}
+
+func TestRecoveringReplicaSuspectsSilentLeader(t *testing.T) {
+	r := testReplica(1) // view 0's leader is replica 0
+	r.suspectTimeout = 20 * time.Millisecond
+	abort := make(chan struct{})
+	r.mu.Lock()
+	r.status = statusRecovering
+	r.recovery = &viewRecovery{
+		view: 0, generation: 1, leader: 0, abort: abort,
+	}
+	r.lastHeartbeatNs = nowNs()
+	r.mu.Unlock()
+
+	if !suspicionFires(r, 2*time.Second) {
+		t.Fatal("a silent leader was never suspected while its follower was recovering")
+	}
+	r.mu.Lock()
+	view, status := r.view(), r.status
+	r.mu.Unlock()
+	if view != 1 || status != statusViewChange {
+		t.Fatalf("view=%d status=%v, want view 1 in viewchange", view, status)
+	}
+	select {
+	case <-abort:
+	default:
+		t.Fatal("starting the newer view did not cancel the old recovery")
 	}
 }
