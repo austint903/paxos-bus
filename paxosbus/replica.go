@@ -229,15 +229,12 @@ type replicaStatus uint8
 const (
 	statusNormal replicaStatus = iota
 	statusViewChange
-	statusRecovering
 )
 
 func (s replicaStatus) String() string {
 	switch s {
 	case statusViewChange:
 		return "view-change"
-	case statusRecovering:
-		return "recovering"
 	default:
 		return "normal"
 	}
@@ -1213,20 +1210,34 @@ func (r *Replica) advanceNextExpectedLocked() {
 		r.pruneCommittedLocked()
 		return
 	}
-	for {
-		slot := r.nextExpected
-		e := r.globalLog[slot]
-		if e == nil || e.state == slotEmpty {
-			break
-		}
-		logIdxs := r.appendBusToLogListLocked(slot)
-		if r.busMode && r.durable != nil {
-			r.durableRecordCursorLocked(slot, e, logIdxs)
-		}
-		r.nextExpected++
-		r.foldExecutedLocked(slot, e)
+	for r.advanceNextExpectedOneLocked() {
 	}
 	r.pruneCommittedLocked()
+}
+
+// advanceNextExpectedThroughLocked is the install-only exception to the
+// ViewChange cursor fence. It executes no further than the decided merged
+// suffix, leaving buses recorded after that boundary frozen until Normal is
+// published.
+func (r *Replica) advanceNextExpectedThroughLocked(maxSlot uint64) {
+	for r.nextExpected <= maxSlot && r.advanceNextExpectedOneLocked() {
+	}
+	r.pruneCommittedLocked()
+}
+
+func (r *Replica) advanceNextExpectedOneLocked() bool {
+	slot := r.nextExpected
+	e := r.globalLog[slot]
+	if e == nil || e.state == slotEmpty {
+		return false
+	}
+	logIdxs := r.appendBusToLogListLocked(slot)
+	if r.busMode && r.durable != nil {
+		r.durableRecordCursorLocked(slot, e, logIdxs)
+	}
+	r.nextExpected++
+	r.foldExecutedLocked(slot, e)
+	return true
 }
 
 // defaultRetainSlots bounds how many already-committed slots the replica keeps

@@ -11,7 +11,7 @@ package paxosbus
 // order, only to reconcile which slots hold what, and it can do that from
 // metadata: which slots each replica holds (a bitmap), which of them are agreed
 // no-ops, and a hash of the committed prefix. Entries themselves move only over
-// BusGetState. A follower remains in Recovering until it has installed the
+// BusGetState. A follower remains in ViewChange until it has installed the
 // complete merged range.
 
 import (
@@ -48,7 +48,7 @@ const (
 	mergeFetchAttempts = 3
 
 	// A follower that cannot complete a StartView fetch stays fenced in
-	// Recovering and retries. This delay keeps a disconnected leader from
+	// ViewChange and retries. This delay keeps a disconnected leader from
 	// turning the recovery goroutine into a tight send loop.
 	recoveryRetryDelay = 100 * time.Millisecond
 )
@@ -269,11 +269,12 @@ func (r *Replica) suspicionLoop() {
 	for range ticker.C {
 		r.mu.Lock()
 		lost, last, st := r.leaderLost, r.lastHeartbeatNs, r.status
+		installingStartView := r.recovery != nil
 		r.mu.Unlock()
 		// A follower installing StartView still depends on that view's leader for
-		// state transfer. If the leader dies before recovery completes, the
+		// state transfer. If the leader dies before installation completes, the
 		// follower must be able to start the next view rather than retry forever.
-		if (st != statusNormal && st != statusRecovering) || r.AmLeader() {
+		if (st != statusNormal && !installingStartView) || r.AmLeader() {
 			continue
 		}
 		// Missing heartbeats are the only trigger. A closed socket is tempting to
@@ -713,7 +714,8 @@ func (r *Replica) driveViewChange(vc *vcState) {
 	}
 	r.startViewView = vc.view
 	r.startViewUsed = append(r.startViewUsed[:0], plan.selected...)
-	r.installViewLocked(vc.view, plan.stableSlot, plan.hasStable, plan.noops, false)
+	r.installViewLocked(vc.view, plan.stableSlot, plan.hasStable,
+		plan.maxSlot, plan.hasMax, plan.noops, false)
 	r.vc = nil
 	r.mu.Unlock()
 
@@ -982,7 +984,7 @@ func (r *Replica) installStartView(msg *BusStartView) {
 	r.cancelGapsLocked()
 	r.drainPendingBusesLocked()
 	r.viewId.Store(msg.ViewId)
-	r.status = statusRecovering
+	r.status = statusViewChange
 	// Receiving StartView is proof that this view's leader is alive. Start the
 	// recovery failure detector here so a slow fetch gets a full suspicion
 	// window, while a leader that subsequently disappears can still be replaced.
@@ -1163,7 +1165,7 @@ func (r *Replica) recomputeMaxSlotLocked() {
 func (r *Replica) recoveryMissingRange(rec *viewRecovery) (uint64, uint64, bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if r.recovery != rec || r.status != statusRecovering ||
+	if r.recovery != rec || r.status != statusViewChange ||
 		r.view() != rec.view || r.config.LeaderIndex(rec.view) != rec.leader {
 		return 0, 0, false
 	}
@@ -1193,7 +1195,7 @@ func (r *Replica) recoveryMissingRange(rec *viewRecovery) (uint64, uint64, bool)
 func (r *Replica) finishRecoveryIfComplete(rec *viewRecovery) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if r.recovery != rec || r.status != statusRecovering || r.view() != rec.view {
+	if r.recovery != rec || r.status != statusViewChange || r.view() != rec.view {
 		return false
 	}
 	if rec.hasMax && r.nextExpected <= rec.maxSlot {
@@ -1204,19 +1206,26 @@ func (r *Replica) finishRecoveryIfComplete(rec *viewRecovery) bool {
 		}
 	}
 
-	// Publish Normal only after the canonical range is complete. The mutex keeps
-	// ordinary bus handling out until execution, replay, and reply enqueueing
-	// have all completed; replyLoop performs the network writes off this path.
-	r.lastNormalView = rec.view
-	r.status = statusNormal
-	r.lastHeartbeatNs = nowNs()
-	r.leaderLost = false
-	r.advanceNextExpectedLocked()
+	// Execute only the canonical range while the ViewChange fence is still up.
+	// Replayed replies for speculative execution join that same canonical batch;
+	// both paths stamp replies with the new view already stored by StartView.
+	if rec.hasMax {
+		r.advanceNextExpectedThroughLocked(rec.maxSlot)
+	}
 	r.replayRepliesLocked(rec.replayFrom, rec.replayTo)
 	if rec.hasStable {
 		r.setStableLocked(rec.stable)
 	}
+
+	// Publish Normal only after every canonical reply is queued. The mutex keeps
+	// replyLoop and ordinary bus handling out until publication; the unbounded
+	// sweep then appends replies for buses recorded beyond the merge boundary.
+	r.lastNormalView = rec.view
+	r.status = statusNormal
+	r.lastHeartbeatNs = nowNs()
+	r.leaderLost = false
 	r.recovery = nil
+	r.advanceNextExpectedLocked()
 	Notice("[%s] VIEW-CHANGE done view=%d leader=%d executed=%d",
 		r.self, rec.view, rec.leader, r.nextExpected)
 	return true
@@ -1232,7 +1241,8 @@ func (r *Replica) finishRecoveryIfComplete(rec *viewRecovery) bool {
 // none of them — entries are content-determined by (clientId, busSeq) at a slot,
 // so two replicas holding the same slot hold the same bus.
 func (r *Replica) installViewLocked(view, stable uint64, hasStable bool,
-	noops []uint64, conservative bool) (rewound uint64, didRewind bool) {
+	maxSlot uint64, hasMax bool, noops []uint64,
+	conservative bool) (rewound uint64, didRewind bool) {
 
 	target := r.nextExpected
 	if conservative {
@@ -1279,27 +1289,31 @@ func (r *Replica) installViewLocked(view, stable uint64, hasStable bool,
 	}
 
 	r.viewId.Store(view)
-	r.lastNormalView = view
-	r.status = statusNormal
-	r.lastHeartbeatNs = nowNs()
-	r.leaderLost = false
 	// A new view owes the client a reply for every slot above the commit point,
 	// in two ranges. What we had already executed was replied to under the old
-	// leader and has to be said again; what we had not is drained now and
+	// leader and has to be said again; what the merge added is executed now and
 	// replied to for the first time. Both are stamped with the new view, since
-	// viewId is already stored.
+	// viewId is already stored, but the ViewChange fence remains published.
 	replayFrom, replayTo := suffixBase(r.stableSlot, r.haveStable), r.nextExpected
 	if replayFrom < r.prunedBelow {
 		replayFrom = r.prunedBelow
 	}
-	// Unfrozen: this drains every slot recorded during the view change and, for
-	// entries the merge handed us that we had never executed, sends the client
-	// the reply it never got before the crash.
-	r.advanceNextExpectedLocked()
+	if hasMax {
+		r.advanceNextExpectedThroughLocked(maxSlot)
+	}
 	r.replayRepliesLocked(replayFrom, replayTo)
 	if hasStable {
 		r.setStableLocked(stable)
 	}
+
+	// Only after the canonical reply batch is complete does Normal become
+	// visible. Buses recorded beyond the merge boundary then drain in their
+	// original order, appending their replies after every merged-suffix reply.
+	r.lastNormalView = view
+	r.status = statusNormal
+	r.lastHeartbeatNs = nowNs()
+	r.leaderLost = false
+	r.advanceNextExpectedLocked()
 	return rewound, didRewind
 }
 
@@ -1506,7 +1520,7 @@ func (r *Replica) fetchActive(req fetchReq) bool {
 	r.mu.Lock()
 	active := r.recovery != nil && r.recovery.generation == req.installGen &&
 		r.recovery.view == req.view && r.recovery.leader == req.peer &&
-		r.status == statusRecovering
+		r.status == statusViewChange
 	r.mu.Unlock()
 	return active
 }
@@ -1646,7 +1660,7 @@ func (r *Replica) fetchActiveLocked(req fetchReq) bool {
 	}
 	return r.recovery != nil && r.recovery.generation == req.installGen &&
 		r.recovery.view == req.view && r.recovery.leader == req.peer &&
-		r.status == statusRecovering
+		r.status == statusViewChange
 }
 
 func (r *Replica) handleGetState(msg *BusGetState) {

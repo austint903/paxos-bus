@@ -317,7 +317,7 @@ func TestInstallViewAppliesNoOpAndRewinds(t *testing.T) {
 	r.setStableLocked(1)
 
 	// The merge says slot 2 is a no-op, but we executed a real bus there.
-	rewound, did := r.installViewLocked(1, 1, true, []uint64{2}, false)
+	rewound, did := r.installViewLocked(1, 1, true, 3, true, []uint64{2}, false)
 	if !did || rewound != 2 {
 		t.Fatalf("rewound=%v to %d, want true to 2", did, rewound)
 	}
@@ -354,7 +354,7 @@ func TestInstallViewConservativeRewindsToOwnCommitPoint(t *testing.T) {
 	r.advanceNextExpectedLocked()
 	r.setStableLocked(3) // our commit point; the leader's below is higher
 
-	rewound, did := r.installViewLocked(2, 6, true, nil, true)
+	rewound, did := r.installViewLocked(2, 6, true, 9, true, nil, true)
 	if !did || rewound != 4 {
 		t.Fatalf("rewound=%v to %d, want true to 4 (our stable 3, +1)", did, rewound)
 	}
@@ -390,36 +390,56 @@ func repliesBySlot(t *testing.T, r *Replica, wantView uint64) map[uint64]int {
 	return out
 }
 
+func queuedReplySlots(r *Replica) []uint64 {
+	slots := make([]uint64, len(r.pendingReplies))
+	for i := range r.pendingReplies {
+		slots[i] = r.pendingReplies[i].busSlot
+	}
+	return slots
+}
+
 // A replica keeps executing for as long as it takes to notice the leader died,
 // and those replies name a leader that will never answer — the client's quorum
-// rule discards them. Installing the new view has to say them again, or the
-// requests sit stranded until the client's own request timeout re-boards them.
-func TestInstallViewReplaysRepliesAboveCommitPoint(t *testing.T) {
+// rule discards them. Installing the new view has to say them again before it
+// replies for traffic that arrived beyond the decided merge boundary.
+func TestInstallViewQueuesMergedRepliesBeforePostMergeBus(t *testing.T) {
 	r := testReplica(0)
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	for s := uint64(0); s < 6; s++ {
+	for s := uint64(0); s < 4; s++ {
 		busAt(r, s, s+1, s*10+1, s*10+2)
 	}
 	r.advanceNextExpectedLocked() // executed under the old leader, replies in view 0
 	r.setStableLocked(2)
 	r.pendingReplies = nil // the view-0 replies; the client could never count them
 
-	// A bus that arrived while the cursor was frozen, so this replica has
-	// recorded it but never executed or replied for it.
+	// Slot 4 belongs to the decided merge; slot 5 arrived after its boundary.
+	// Both were recorded with the cursor frozen.
 	r.status = statusViewChange
-	busAt(r, 6, 7, 61, 62)
+	busAt(r, 4, 5, 41, 42)
+	busAt(r, 5, 6, 51, 52)
 
-	r.installViewLocked(1, 2, true, nil, false)
+	r.installViewLocked(1, 2, true, 4, true, nil, false)
 
 	got := repliesBySlot(t, r, 1)
-	want := map[uint64]int{3: 2, 4: 2, 5: 2, 6: 2}
+	want := map[uint64]int{3: 2, 4: 2, 5: 2}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("replies by slot = %v, want %v", got, want)
 	}
-	if r.nextExpected != 7 {
-		t.Errorf("cursor at %d, want 7", r.nextExpected)
+	// Newly executed canonical entries retain the existing enqueue-before-replay
+	// behavior; both canonical groups must precede the post-merge bus.
+	wantOrder := []uint64{4, 4, 3, 3, 5, 5}
+	if gotOrder := queuedReplySlots(r); !reflect.DeepEqual(gotOrder, wantOrder) {
+		t.Errorf("reply slot order = %v, want canonical replies before post-merge bus %v",
+			gotOrder, wantOrder)
+	}
+	if r.nextExpected != 6 {
+		t.Errorf("cursor at %d, want 6", r.nextExpected)
+	}
+	if r.status != statusNormal || r.lastNormalView != 1 {
+		t.Errorf("status=%v lastNormalView=%d, want direct ViewChange to Normal/1",
+			r.status, r.lastNormalView)
 	}
 }
 
@@ -439,7 +459,7 @@ func TestInstallViewReplayDoesNotDoubleCountRewoundSlots(t *testing.T) {
 
 	// The merge says slot 4 is a no-op: the cursor rewinds there, slot 4 loses
 	// its passengers, and slot 5 is re-executed behind it.
-	r.installViewLocked(1, 2, true, []uint64{4}, false)
+	r.installViewLocked(1, 2, true, 5, true, []uint64{4}, false)
 
 	got := repliesBySlot(t, r, 1)
 	want := map[uint64]int{3: 2, 5: 2} // 3 replayed, 5 re-executed, 4 gone
@@ -463,7 +483,7 @@ func TestInstallViewReplaySkipsCommittedPrefix(t *testing.T) {
 	r.setStableLocked(3) // everything executed is committed
 	r.pendingReplies = nil
 
-	r.installViewLocked(1, 3, true, nil, false)
+	r.installViewLocked(1, 3, true, 3, true, nil, false)
 
 	if n := len(r.pendingReplies); n != 0 {
 		t.Errorf("%d replies queued for a fully committed log, want none", n)
@@ -475,7 +495,7 @@ func prepareFollowerRecoveryForTest(t *testing.T, r *Replica, msg *BusStartView,
 	t.Helper()
 	r.mu.Lock()
 	r.viewId.Store(msg.ViewId)
-	r.status = statusRecovering
+	r.status = statusViewChange
 	r.recoveryGen++
 	rec := &viewRecovery{
 		view:       msg.ViewId,
@@ -514,8 +534,8 @@ func TestSelectedFollowerRetainsMergedSuffixAndLateBus(t *testing.T) {
 	rec := prepareFollowerRecoveryForTest(t, r, msg, true)
 
 	r.mu.Lock()
-	if r.status != statusRecovering || r.lastNormalView != 0 {
-		t.Fatalf("status=%v lastNormalView=%d, want recovering in old normal view",
+	if r.status != statusViewChange || r.lastNormalView != 0 {
+		t.Fatalf("status=%v lastNormalView=%d, want view-change with last normal view 0",
 			r.status, r.lastNormalView)
 	}
 	for _, slot := range []uint64{3, 4} {
@@ -529,8 +549,9 @@ func TestSelectedFollowerRetainsMergedSuffixAndLateBus(t *testing.T) {
 		}
 	}
 	// This bus arrives after the one-time cleanup. Finishing recovery must not
-	// erase it merely because it is beyond the old merged MaxSlot.
-	busAt(r, 6, 7, 70)
+	// erase it merely because it is beyond the old merged MaxSlot, and its reply
+	// must follow all replies owed by the canonical suffix.
+	busAt(r, 5, 6, 70)
 	r.mu.Unlock()
 
 	if !r.finishRecoveryIfComplete(rec) {
@@ -541,8 +562,18 @@ func TestSelectedFollowerRetainsMergedSuffixAndLateBus(t *testing.T) {
 	if r.status != statusNormal || r.lastNormalView != 1 {
 		t.Errorf("status=%v lastNormalView=%d, want normal in view 1", r.status, r.lastNormalView)
 	}
-	if r.slotStateLocked(6) != slotReceived {
+	if r.slotStateLocked(5) != slotReceived {
 		t.Error("bus arriving after recovery began was deleted")
+	}
+	if r.nextExpected != 6 {
+		t.Errorf("cursor=%d, want canonical range and post-merge bus through slot 5", r.nextExpected)
+	}
+	if got, want := repliesBySlot(t, r, 1), map[uint64]int{3: 1, 4: 1, 5: 1}; !reflect.DeepEqual(got, want) {
+		t.Errorf("replies by slot = %v, want %v", got, want)
+	}
+	if gotOrder, wantOrder := queuedReplySlots(r), []uint64{3, 4, 5}; !reflect.DeepEqual(gotOrder, wantOrder) {
+		t.Errorf("reply slot order = %v, want canonical replay before post-merge bus %v",
+			gotOrder, wantOrder)
 	}
 }
 
@@ -585,7 +616,7 @@ func TestRecoveryNeverRewindsBelowLocalStableFrontier(t *testing.T) {
 	r.advanceNextExpectedLocked()
 	r.setStableLocked(3)
 	r.viewId.Store(1)
-	r.status = statusRecovering
+	r.status = statusViewChange
 	rec := &viewRecovery{
 		view: 1, generation: 1, leader: 1, abort: make(chan struct{}),
 		stable: 1, hasStable: true, maxSlot: 2, hasMax: true,
@@ -614,7 +645,7 @@ func TestRecoveryNeverRewindsBelowLocalStableFrontier(t *testing.T) {
 	r.mu.Unlock()
 }
 
-func TestIncompleteOrFailedRecoveryStaysRecovering(t *testing.T) {
+func TestIncompleteOrFailedStartViewInstallStaysInViewChange(t *testing.T) {
 	r := testReplica(0)
 	r.mu.Lock()
 	busAt(r, 0, 1, 1)
@@ -641,7 +672,7 @@ func TestIncompleteOrFailedRecoveryStaysRecovering(t *testing.T) {
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if r.status != statusRecovering || r.lastNormalView != 0 {
+	if r.status != statusViewChange || r.lastNormalView != 0 {
 		t.Errorf("failed fetch exposed replica as %v in lastNormalView %d",
 			r.status, r.lastNormalView)
 	}
@@ -748,7 +779,7 @@ func TestNewViewDuringRecoveryKeepsPreviousLastNormalView(t *testing.T) {
 	}
 
 	// A complete replica from the previous normal view still contributes slot
-	// 1. The incomplete recovering report must not claim view 1 and outrank it.
+	// 1. The incomplete StartView install report must not claim view 1 and outrank it.
 	complete := report(2, 0, 0, []uint64{1}, nil)
 	complete.ViewId = 2
 	plan := mergeSuffix([]*BusViewChange{incomplete, complete})
@@ -783,15 +814,29 @@ func TestRecoveredRepliesUseNewView(t *testing.T) {
 		peer: 1, from: 2, to: 2, view: 1, fetchID: 9,
 		installGen: rec.generation, cancel: rec.abort,
 	}
-	if !r.applyStateEntries(state, req) || !r.finishRecoveryIfComplete(rec) {
-		t.Fatal("could not install complete recovered suffix")
+	if !r.applyStateEntries(state, req) {
+		t.Fatal("could not install recovered suffix entry")
+	}
+	r.mu.Lock()
+	if r.status != statusViewChange || r.lastNormalView != 0 {
+		r.mu.Unlock()
+		t.Fatal("follower left ViewChange before finishing the canonical suffix")
+	}
+	busAt(r, 3, 4, 4) // arrived beyond the BusStartView boundary
+	r.mu.Unlock()
+	if !r.finishRecoveryIfComplete(rec) {
+		t.Fatal("could not finish complete recovered suffix")
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	got := repliesBySlot(t, r, 1)
-	want := map[uint64]int{1: 1, 2: 1}
+	want := map[uint64]int{1: 1, 2: 1, 3: 1}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("recovery replies by slot=%v, want %v", got, want)
+	}
+	if gotOrder, wantOrder := queuedReplySlots(r), []uint64{2, 1, 3}; !reflect.DeepEqual(gotOrder, wantOrder) {
+		t.Errorf("reply slot order = %v, want canonical execution/replay before post-merge bus %v",
+			gotOrder, wantOrder)
 	}
 }
 
@@ -817,7 +862,7 @@ func TestStartViewDoesNotBecomeNormalBeforeStateArrives(t *testing.T) {
 		r.mu.Lock()
 		status, lastNormal := r.status, r.lastNormalView
 		r.mu.Unlock()
-		if status == statusRecovering && r.fetchSeq.Load() > 0 {
+		if status == statusViewChange && r.fetchSeq.Load() > 0 {
 			if lastNormal != 0 {
 				t.Fatalf("lastNormalView=%d before state arrived, want 0", lastNormal)
 			}
@@ -1817,12 +1862,24 @@ func TestSilentLeaderSuspectedOnTimeout(t *testing.T) {
 	}
 }
 
-func TestRecoveringReplicaSuspectsSilentLeader(t *testing.T) {
+func TestPreStartViewChangeDoesNotResuspectSilentLeader(t *testing.T) {
+	r := testReplica(0) // replica 1 leads view 1
+	r.suspectTimeout = 20 * time.Millisecond
+	r.startViewChange(1)
+
+	go r.suspicionLoop()
+	time.Sleep(50 * time.Millisecond)
+	if view := r.view(); view != 1 {
+		t.Fatalf("pre-StartView view change advanced to view %d, want view 1", view)
+	}
+}
+
+func TestReplicaInstallingStartViewSuspectsSilentLeader(t *testing.T) {
 	r := testReplica(1) // view 0's leader is replica 0
 	r.suspectTimeout = 20 * time.Millisecond
 	abort := make(chan struct{})
 	r.mu.Lock()
-	r.status = statusRecovering
+	r.status = statusViewChange
 	r.recovery = &viewRecovery{
 		view: 0, generation: 1, leader: 0, abort: abort,
 	}
@@ -1830,7 +1887,7 @@ func TestRecoveringReplicaSuspectsSilentLeader(t *testing.T) {
 	r.mu.Unlock()
 
 	if !suspicionFires(r, 2*time.Second) {
-		t.Fatal("a silent leader was never suspected while its follower was recovering")
+		t.Fatal("a silent leader was never suspected during its follower's StartView install")
 	}
 	r.mu.Lock()
 	view, status := r.view(), r.status
