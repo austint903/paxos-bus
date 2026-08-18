@@ -749,6 +749,114 @@ func TestStaleRecoveryTokenCannotInstallState(t *testing.T) {
 	}
 }
 
+func TestViewChangeFetchCannotCrossIntoNewView(t *testing.T) {
+	r := testReplica(0)
+	cleanupViewChangeTest(t, r)
+	oldVC := newVCState(4, r.config.N)
+	r.mu.Lock()
+	r.viewId.Store(oldVC.view)
+	r.status = statusViewChange
+	r.vc = oldVC
+	r.mu.Unlock()
+
+	plan := mergePlan{
+		donors: map[uint64]uint32{
+			0: 1,
+			1: 2,
+		},
+	}
+	result := make(chan bool, 1)
+	go func() {
+		result <- r.fetchMergedState(oldVC, &plan)
+	}()
+
+	var first fetchReq
+	select {
+	case first = <-r.fetchQ:
+	case <-time.After(time.Second):
+		t.Fatal("view-change merge did not queue its first donor fetch")
+	}
+	if first.view != oldVC.view {
+		t.Errorf("first fetch view=%d, want immutable originating view %d",
+			first.view, oldVC.view)
+	}
+	if first.vc != oldVC {
+		t.Errorf("first fetch owner=%p, want exact vcState %p", first.vc, oldVC)
+	}
+	if first.cancel != oldVC.abort {
+		t.Error("first fetch did not carry the originating cancellation channel")
+	}
+
+	// Retire view 4 while its first donor is still outstanding. Completing that
+	// fetch afterward reproduces the old race: the abandoned loop used to move
+	// to its next donor and snapshot the now-current view 5.
+	newVC := newVCState(5, r.config.N)
+	r.mu.Lock()
+	close(oldVC.abort)
+	r.viewId.Store(newVC.view)
+	r.vc = newVC
+	r.mu.Unlock()
+	first.done <- false
+
+	select {
+	case stale := <-r.fetchQ:
+		// Release an implementation without cancellation-aware waiting before
+		// failing, so the test does not strand its goroutine on the second fetch.
+		stale.done <- false
+		<-result
+		t.Fatalf("retired view-4 merge queued another donor fetch as view %d", stale.view)
+	case ok := <-result:
+		if ok {
+			t.Fatal("retired view-change merge reported success")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("retired view-change merge did not stop promptly")
+	}
+	if queued := len(r.fetchQ); queued != 0 {
+		t.Fatalf("retired view-change merge left %d donor fetches queued", queued)
+	}
+}
+
+func TestViewChangeFetchRequiresExactVCState(t *testing.T) {
+	r := testReplica(0)
+	cleanupViewChangeTest(t, r)
+	retired := newVCState(4, r.config.N)
+	active := newVCState(4, r.config.N)
+	r.mu.Lock()
+	r.viewId.Store(active.view)
+	r.status = statusViewChange
+	r.vc = active
+	r.mu.Unlock()
+
+	state := &BusNewState{
+		ViewId: 4, FromSlot: 0, ToSlot: 0, FetchId: 91, SenderIdx: 1,
+		Entries: []StateEntry{{
+			Slot: 0, ClientId: 1, ReqId: 1, IsBus: true,
+			Payload: marshalRequests([]RequestMessage{{ClientId: 1, RequestId: 1, Op: []byte("x")}}),
+		}},
+	}
+	staleReq := fetchReq{
+		peer: 1, from: 0, to: 0, view: 4, fetchID: 91,
+		vc: retired, cancel: retired.abort,
+	}
+	if r.applyStateEntries(state, staleReq) {
+		t.Fatal("response owned by a replaced vcState was accepted")
+	}
+	r.mu.Lock()
+	if got := r.slotStateLocked(0); got != slotEmpty {
+		r.mu.Unlock()
+		t.Fatalf("replaced vcState mutated slot 0 to %v", got)
+	}
+	r.mu.Unlock()
+
+	activeReq := staleReq
+	activeReq.vc = active
+	activeReq.cancel = active.abort
+	if !r.applyStateEntries(state, activeReq) {
+		t.Fatal("response owned by the exact active vcState was rejected")
+	}
+}
+
 func TestNewViewDuringRecoveryKeepsPreviousLastNormalView(t *testing.T) {
 	r := testReplica(0)
 	r.mu.Lock()
