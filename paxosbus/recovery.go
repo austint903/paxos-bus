@@ -267,36 +267,49 @@ func (r *Replica) suspicionLoop() {
 	ticker := time.NewTicker(suspicionTick)
 	defer ticker.Stop()
 	for range ticker.C {
-		r.mu.Lock()
-		lost, last, st := r.leaderLost, r.lastHeartbeatNs, r.status
-		installingStartView := r.recovery != nil
-		r.mu.Unlock()
-		// A follower installing StartView still depends on that view's leader for
-		// state transfer. If the leader dies before installation completes, the
-		// follower must be able to start the next view rather than retry forever.
-		if (st != statusNormal && !installingStartView) || r.AmLeader() {
-			continue
-		}
-		// Missing heartbeats are the only trigger. A closed socket is tempting to
-		// act on — it arrives one one-way delay after a kill instead of a whole
-		// timeout — but it answers the wrong question: it says this replica's
-		// link to the leader broke, which a partition produces just as readily as
-		// a crash, and a crash that takes the machine or its power down produces
-		// no close at all. Detection that keyed on it would be fast only for the
-		// failures polite enough to close their sockets. So the socket state is
-		// logged as context and nothing more.
-		silentFor := time.Duration(nowNs() - last)
-		if silentFor < r.suspectTimeout {
-			continue
-		}
-		sock := "socket up"
-		if lost {
-			sock = "socket already closed"
-		}
-		Warning("[%s] SUSPECT leader %d (heartbeat timeout, silent for %v, %s)",
-			r.self, r.leaderIdx(), silentFor.Truncate(time.Millisecond), sock)
-		r.startViewChange(r.view() + 1)
+		r.suspectLeaderIfTimedOut()
 	}
+}
+
+// suspectLeaderIfTimedOut performs one atomic failure-detector check. Keeping
+// the status check and transition under r.mu prevents an old Normal-state tick
+// from advancing a StartView installation that began concurrently.
+func (r *Replica) suspectLeaderIfTimedOut() bool {
+	r.mu.Lock()
+	view := r.view()
+	// ViewChange liveness, including an active StartView installation, belongs
+	// to the longer per-view fallback. Heartbeat suspicion is only a Normal
+	// state failure detector.
+	if r.status != statusNormal || r.config.LeaderIndex(view) == r.idx {
+		r.mu.Unlock()
+		return false
+	}
+
+	// Missing heartbeats are the only trigger. A closed socket is tempting to
+	// act on — it arrives one one-way delay after a kill instead of a whole
+	// timeout — but it answers the wrong question: it says this replica's link
+	// to the leader broke, which a partition produces just as readily as a crash,
+	// and a crash that takes the machine or its power down produces no close at
+	// all. The socket state is therefore context for the log, never a trigger.
+	silentFor := time.Duration(nowNs() - r.lastHeartbeatNs)
+	if silentFor < r.suspectTimeout {
+		r.mu.Unlock()
+		return false
+	}
+	lost := r.leaderLost
+	start := r.beginViewChangeLocked(view + 1)
+	r.mu.Unlock()
+	if start == nil {
+		return false
+	}
+	sock := "socket up"
+	if lost {
+		sock = "socket already closed"
+	}
+	Warning("[%s] SUSPECT leader %d (heartbeat timeout, silent for %v, %s)",
+		r.self, r.config.LeaderIndex(view), silentFor.Truncate(time.Millisecond), sock)
+	r.publishViewChange(start)
+	return true
 }
 
 // ── View change ─────────────────────────────────────────────────────────────
@@ -316,6 +329,28 @@ type vcState struct {
 	reportSent bool
 }
 
+// viewChangeWatchdog is the replica-wide liveness fallback for one exact view
+// change. Each arm gets a new identity and generation; an expired callback must
+// still match both under r.mu before it may advance the view. time.AfterFunc is
+// used once per arm so cancellation never relies on Timer.Reset or channel
+// draining, and Stop retires a replaced timer without leaving a waiter behind.
+type viewChangeWatchdog struct {
+	view       uint64
+	generation uint64
+	timer      *time.Timer
+}
+
+// viewChangeStart carries the state needed to announce a transition after the
+// state itself has been published atomically under r.mu.
+type viewChangeStart struct {
+	view      uint64
+	leader    int
+	stable    uint64
+	executed  uint64
+	maxFilled uint64
+	vc        *vcState
+}
+
 func newVCState(view uint64, n int) *vcState {
 	return &vcState{
 		view:     view,
@@ -333,11 +368,34 @@ func (r *Replica) cancelRecoveryLocked() {
 	r.recovery = nil
 }
 
-func (r *Replica) startViewChange(newView uint64) {
-	r.mu.Lock()
-	if newView <= r.view() {
-		r.mu.Unlock()
+func (r *Replica) cancelViewChangeWatchdogLocked() {
+	watchdog := r.viewChangeWatchdog
+	if watchdog == nil {
 		return
+	}
+	r.viewChangeWatchdog = nil
+	watchdog.timer.Stop()
+}
+
+func (r *Replica) armViewChangeWatchdogLocked(view uint64) {
+	r.cancelViewChangeWatchdogLocked()
+	r.viewChangeWatchdogGen++
+	watchdog := &viewChangeWatchdog{
+		view:       view,
+		generation: r.viewChangeWatchdogGen,
+	}
+	r.viewChangeWatchdog = watchdog
+	watchdog.timer = time.AfterFunc(r.viewChangeFallbackTimeout, func() {
+		r.expireViewChangeWatchdog(watchdog)
+	})
+}
+
+// beginViewChangeLocked cancels all work belonging to the old view, installs
+// the new ViewChange state, and arms that view's fallback atomically. The
+// caller publishes the request after dropping r.mu.
+func (r *Replica) beginViewChangeLocked(newView uint64) *viewChangeStart {
+	if newView <= r.view() {
+		return nil
 	}
 	if r.vc != nil {
 		close(r.vc.abort)
@@ -349,6 +407,7 @@ func (r *Replica) startViewChange(newView uint64) {
 	r.leaderLost = false
 	r.sync = nil
 	r.lastHeartbeatNs = nowNs()
+	r.armViewChangeWatchdogLocked(newView)
 	// Retire in-flight gap agreement immediately. Messages already in flight
 	// carry the old view and are ignored; the view-change merge decides their
 	// slots rather than allowing an old retry goroutine to keep working.
@@ -358,21 +417,56 @@ func (r *Replica) startViewChange(newView uint64) {
 	vc := newVCState(newView, r.config.N)
 	vc.requests[uint32(r.idx)] = struct{}{} // our own suspicion is one request
 	r.vc = vc
-	stable, next, maxFilled := r.stableSlot, r.nextExpected, r.maxSlotSeen
-	r.mu.Unlock()
+	return &viewChangeStart{
+		view:      newView,
+		leader:    leader,
+		stable:    r.stableSlot,
+		executed:  r.nextExpected,
+		maxFilled: r.maxSlotSeen,
+		vc:        vc,
+	}
+}
 
+func (r *Replica) publishViewChange(start *viewChangeStart) {
 	Notice("[%s] VIEW-CHANGE start view=%d new_leader=%d stable=%d executed=%d max_filled=%d",
-		r.self, newView, leader, stable, next, maxFilled)
+		r.self, start.view, start.leader, start.stable, start.executed, start.maxFilled)
 
 	// Everyone who hears this joins the same view immediately instead of waiting
 	// out their own timer, so a quorum of requests forms in about half a round
 	// trip when replicas notice together (the VR-revisited optimisation).
 	r.broadcastToPeers(MsgBusViewChangeRequest,
-		&BusViewChangeRequest{ViewId: newView, SenderIdx: uint32(r.idx)})
+		&BusViewChangeRequest{ViewId: start.view, SenderIdx: uint32(r.idx)})
 
-	if leader == r.idx {
-		go r.driveViewChange(vc)
+	if start.leader == r.idx {
+		go r.driveViewChange(start.vc)
 	}
+}
+
+func (r *Replica) startViewChange(newView uint64) {
+	r.mu.Lock()
+	start := r.beginViewChangeLocked(newView)
+	r.mu.Unlock()
+	if start != nil {
+		r.publishViewChange(start)
+	}
+}
+
+func (r *Replica) expireViewChangeWatchdog(watchdog *viewChangeWatchdog) {
+	r.mu.Lock()
+	if r.viewChangeWatchdog != watchdog ||
+		r.viewChangeWatchdogGen != watchdog.generation ||
+		r.view() != watchdog.view || r.status != statusViewChange {
+		r.mu.Unlock()
+		return
+	}
+	start := r.beginViewChangeLocked(watchdog.view + 1)
+	r.mu.Unlock()
+	if start == nil {
+		return
+	}
+	Warning("[%s] view-change fallback expired for view %d, moving to view %d",
+		r.self, watchdog.view, start.view)
+	r.publishViewChange(start)
 }
 
 // handleViewChangeRequest counts requests for this view and, on the f+1st,
@@ -985,9 +1079,9 @@ func (r *Replica) installStartView(msg *BusStartView) {
 	r.drainPendingBusesLocked()
 	r.viewId.Store(msg.ViewId)
 	r.status = statusViewChange
-	// Receiving StartView is proof that this view's leader is alive. Start the
-	// recovery failure detector here so a slow fetch gets a full suspicion
-	// window, while a leader that subsequently disappears can still be replaced.
+	// Acceptance starts a fresh full fallback interval for the reconciliation.
+	// Invalid, stale, and duplicate StartViews return above without touching it.
+	r.armViewChangeWatchdogLocked(msg.ViewId)
 	r.lastHeartbeatNs = nowNs()
 	r.leaderLost = false
 	r.recoveryGen++
@@ -1221,6 +1315,7 @@ func (r *Replica) finishRecoveryIfComplete(rec *viewRecovery) bool {
 	// replyLoop and ordinary bus handling out until publication; the unbounded
 	// sweep then appends replies for buses recorded beyond the merge boundary.
 	r.lastNormalView = rec.view
+	r.cancelViewChangeWatchdogLocked()
 	r.status = statusNormal
 	r.lastHeartbeatNs = nowNs()
 	r.leaderLost = false
@@ -1310,6 +1405,7 @@ func (r *Replica) installViewLocked(view, stable uint64, hasStable bool,
 	// visible. Buses recorded beyond the merge boundary then drain in their
 	// original order, appending their replies after every merged-suffix reply.
 	r.lastNormalView = view
+	r.cancelViewChangeWatchdogLocked()
 	r.status = statusNormal
 	r.lastHeartbeatNs = nowNs()
 	r.leaderLost = false

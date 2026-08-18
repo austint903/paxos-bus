@@ -314,18 +314,21 @@ type Replica struct {
 	gaps map[gapKey]*gapState
 
 	// Failure recovery.
-	syncInterval      time.Duration
-	suspectTimeout    time.Duration
-	viewChangeTimeout time.Duration
-	gapRetryTimeout   time.Duration
-	lastHeartbeatNs   int64
-	sync              *syncRound
-	vc                *vcState
-	fetchQ            chan fetchReq
-	serveQ            chan *BusGetState
-	newStateCh        chan *BusNewState
-	startViewQ        chan *BusStartView
-	fetchSeq          atomic.Uint64
+	syncInterval              time.Duration
+	suspectTimeout            time.Duration
+	viewChangeTimeout         time.Duration
+	viewChangeFallbackTimeout time.Duration
+	gapRetryTimeout           time.Duration
+	lastHeartbeatNs           int64
+	sync                      *syncRound
+	vc                        *vcState
+	viewChangeWatchdog        *viewChangeWatchdog
+	viewChangeWatchdogGen     uint64
+	fetchQ                    chan fetchReq
+	serveQ                    chan *BusGetState
+	newStateCh                chan *BusNewState
+	startViewQ                chan *BusStartView
+	fetchSeq                  atomic.Uint64
 
 	logDir     string
 	durable    *durableLog // BusMessage Log: slot -> bus (replica.log)
@@ -367,24 +370,31 @@ type Replica struct {
 // free — the rejoining leader lands on rewindToStableAndRefetch, which repairs a
 // divergence the view change cannot see on its own.
 //
+// The view-change timeout is the designated new leader's report-collection
+// deadline. The longer view-change fallback is replica-wide: every replica in
+// ViewChange advances if that exact view remains stuck, and accepting StartView
+// gives reconciliation a fresh fallback interval.
+//
 // The gap retry timeout is independent of the leader-first recovery probe. It
 // only controls how often an already-installed no-op commit is rebroadcast
 // while the leader waits for f distinct follower acknowledgements.
 type RecoveryOptions struct {
-	SyncIntervalMs      uint64
-	SuspectTimeoutMs    uint64
-	ViewChangeTimeoutMs uint64
-	GapRetryTimeoutMs   uint64
-	RetainSlots         uint64
-	RetainBytes         uint64
+	SyncIntervalMs              uint64
+	SuspectTimeoutMs            uint64
+	ViewChangeTimeoutMs         uint64
+	ViewChangeFallbackTimeoutMs uint64
+	GapRetryTimeoutMs           uint64
+	RetainSlots                 uint64
+	RetainBytes                 uint64
 }
 
 const (
-	defaultSyncIntervalMs      = 100
-	defaultSuspectTimeoutMs    = 2000
-	defaultViewChangeTimeoutMs = 15000
-	defaultGapRetryTimeoutMs   = 1500
-	defaultRetainBytes         = 256 << 20
+	defaultSyncIntervalMs              = 100
+	defaultSuspectTimeoutMs            = 2000
+	defaultViewChangeTimeoutMs         = 15000
+	defaultViewChangeFallbackTimeoutMs = 20000
+	defaultGapRetryTimeoutMs           = 1500
+	defaultRetainBytes                 = 256 << 20
 )
 
 func (o *RecoveryOptions) withDefaults() RecoveryOptions {
@@ -397,6 +407,9 @@ func (o *RecoveryOptions) withDefaults() RecoveryOptions {
 	}
 	if out.ViewChangeTimeoutMs == 0 {
 		out.ViewChangeTimeoutMs = defaultViewChangeTimeoutMs
+	}
+	if out.ViewChangeFallbackTimeoutMs == 0 {
+		out.ViewChangeFallbackTimeoutMs = defaultViewChangeFallbackTimeoutMs
 	}
 	if out.GapRetryTimeoutMs == 0 {
 		out.GapRetryTimeoutMs = defaultGapRetryTimeoutMs
@@ -425,37 +438,38 @@ func NewReplica(config *Config, idx int, label, logDir string, mode dropMode, ev
 		redial[i] = make(chan struct{}, 1)
 	}
 	r := &Replica{
-		config:            config,
-		idx:               idx,
-		self:              self,
-		gapDeltaNs:        int64(gapDeltaMs) * 1e6,
-		clients:           make(map[uint64]*clientLine),
-		globalLog:         make(map[uint64]*globalEntry),
-		dedup:             make(map[reqKey]uint64),
-		replySenders:      make(map[uint64]*replySender),
-		replyWake:         make(chan struct{}, 1),
-		cursorNextN:       make(map[uint64]uint64),
-		slotMeta:          make(map[uint64]slotMetaEntry),
-		peerWriters:       make([]*lockedWriter, config.N),
-		peerRedial:        redial,
-		gaps:              make(map[gapKey]*gapState),
-		logDir:            logDir,
-		dropMode:          mode,
-		dropEvery:         every,
-		retainSlots:       opts.RetainSlots,
-		retainBytes:       opts.RetainBytes,
-		ringSize:          opts.RetainSlots + 2,
-		hashRing:          make([]uint64, opts.RetainSlots+2),
-		logIdxRing:        make([]uint64, opts.RetainSlots+2),
-		prefixHash:        fnvOffset64,
-		syncInterval:      time.Duration(opts.SyncIntervalMs) * time.Millisecond,
-		suspectTimeout:    time.Duration(opts.SuspectTimeoutMs) * time.Millisecond,
-		viewChangeTimeout: time.Duration(opts.ViewChangeTimeoutMs) * time.Millisecond,
-		gapRetryTimeout:   time.Duration(opts.GapRetryTimeoutMs) * time.Millisecond,
-		fetchQ:            make(chan fetchReq, 64),
-		serveQ:            make(chan *BusGetState, 64),
-		newStateCh:        make(chan *BusNewState, 8),
-		startViewQ:        make(chan *BusStartView, 8),
+		config:                    config,
+		idx:                       idx,
+		self:                      self,
+		gapDeltaNs:                int64(gapDeltaMs) * 1e6,
+		clients:                   make(map[uint64]*clientLine),
+		globalLog:                 make(map[uint64]*globalEntry),
+		dedup:                     make(map[reqKey]uint64),
+		replySenders:              make(map[uint64]*replySender),
+		replyWake:                 make(chan struct{}, 1),
+		cursorNextN:               make(map[uint64]uint64),
+		slotMeta:                  make(map[uint64]slotMetaEntry),
+		peerWriters:               make([]*lockedWriter, config.N),
+		peerRedial:                redial,
+		gaps:                      make(map[gapKey]*gapState),
+		logDir:                    logDir,
+		dropMode:                  mode,
+		dropEvery:                 every,
+		retainSlots:               opts.RetainSlots,
+		retainBytes:               opts.RetainBytes,
+		ringSize:                  opts.RetainSlots + 2,
+		hashRing:                  make([]uint64, opts.RetainSlots+2),
+		logIdxRing:                make([]uint64, opts.RetainSlots+2),
+		prefixHash:                fnvOffset64,
+		syncInterval:              time.Duration(opts.SyncIntervalMs) * time.Millisecond,
+		suspectTimeout:            time.Duration(opts.SuspectTimeoutMs) * time.Millisecond,
+		viewChangeTimeout:         time.Duration(opts.ViewChangeTimeoutMs) * time.Millisecond,
+		viewChangeFallbackTimeout: time.Duration(opts.ViewChangeFallbackTimeoutMs) * time.Millisecond,
+		gapRetryTimeout:           time.Duration(opts.GapRetryTimeoutMs) * time.Millisecond,
+		fetchQ:                    make(chan fetchReq, 64),
+		serveQ:                    make(chan *BusGetState, 64),
+		newStateCh:                make(chan *BusNewState, 8),
+		startViewQ:                make(chan *BusStartView, 8),
 	}
 	if logDir != "" {
 		if err := os.MkdirAll(logDir, 0o755); err != nil {
@@ -480,8 +494,9 @@ func NewReplica(config *Config, idx int, label, logDir string, mode dropMode, ev
 	}
 	Notice("[%s] started (view=0, f=%d, quorum=%d, leader=%s, gap_delta=%dms)",
 		r.self, config.F, config.QuorumSize(), leader, r.gapDeltaNs/1e6)
-	Notice("[%s] recovery: sync=%v suspect=%v view_change_timeout=%v gap_retry_timeout=%v retain_slots=%d",
-		r.self, r.syncInterval, r.suspectTimeout, r.viewChangeTimeout, r.gapRetryTimeout, r.retainSlots)
+	Notice("[%s] recovery: sync=%v suspect=%v view_change_timeout=%v view_change_fallback_timeout=%v gap_retry_timeout=%v retain_slots=%d",
+		r.self, r.syncInterval, r.suspectTimeout, r.viewChangeTimeout,
+		r.viewChangeFallbackTimeout, r.gapRetryTimeout, r.retainSlots)
 	if r.dropMode != dropNone && r.dropEvery > 0 {
 		Notice("[%s] artificial drop enabled: mode=%s every=%d (drop slot when reqId%%%d==0)",
 			r.self, r.dropMode, r.dropEvery, r.dropEvery)

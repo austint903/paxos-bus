@@ -25,6 +25,8 @@ func main() {
 		"how long without a leader heartbeat before suspecting it and starting a view change; missing heartbeats are the ONLY trigger, so this alone sets detection time for every kind of failure")
 	viewChangeTimeoutMs := flag.Uint64("view-change-timeout-ms", 15000,
 		"how long the new leader waits for a view-change quorum before moving to the next view")
+	viewChangeFallbackTimeoutMs := flag.Uint64("view-change-fallback-timeout-ms", 20000,
+		"how long any replica may remain in one view change before moving to the next view")
 	gapRetryTimeoutMs := flag.Uint64("gap-retry-timeout-ms", 1500,
 		"how long the leader waits for a no-op quorum before rebroadcasting the same gap commit")
 	retainSlots := flag.Uint64("retain-slots", 1<<14,
@@ -57,12 +59,13 @@ func main() {
 
 	replica := paxosbus.NewReplica(config, *index, *label, *logDir, mode, *dropEvery, *gapDeltaMs,
 		paxosbus.RecoveryOptions{
-			SyncIntervalMs:      *syncIntervalMs,
-			SuspectTimeoutMs:    *suspectTimeoutMs,
-			ViewChangeTimeoutMs: *viewChangeTimeoutMs,
-			GapRetryTimeoutMs:   *gapRetryTimeoutMs,
-			RetainSlots:         *retainSlots,
-			RetainBytes:         *retainMB << 20,
+			SyncIntervalMs:              *syncIntervalMs,
+			SuspectTimeoutMs:            *suspectTimeoutMs,
+			ViewChangeTimeoutMs:         *viewChangeTimeoutMs,
+			ViewChangeFallbackTimeoutMs: *viewChangeFallbackTimeoutMs,
+			GapRetryTimeoutMs:           *gapRetryTimeoutMs,
+			RetainSlots:                 *retainSlots,
+			RetainBytes:                 *retainMB << 20,
 		})
 	if err := replica.Run(); err != nil {
 		fmt.Fprintf(os.Stderr, "replica failed: %v\n", err)

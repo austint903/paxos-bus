@@ -1748,6 +1748,308 @@ func vcRequestsSent(r *Replica) (n int, sent bool) {
 	return len(r.vc.requests), r.vc.reportSent
 }
 
+func cleanupViewChangeTest(t *testing.T, r *Replica) {
+	t.Helper()
+	t.Cleanup(func() {
+		r.mu.Lock()
+		if r.vc != nil {
+			close(r.vc.abort)
+			r.vc = nil
+		}
+		r.cancelRecoveryLocked()
+		r.cancelViewChangeWatchdogLocked()
+		r.mu.Unlock()
+	})
+}
+
+func currentViewChangeWatchdog(t *testing.T, r *Replica) *viewChangeWatchdog {
+	t.Helper()
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.viewChangeWatchdog == nil {
+		t.Fatal("view-change fallback is not armed")
+	}
+	return r.viewChangeWatchdog
+}
+
+func TestViewChangeFallbackDefaultsAndConfiguration(t *testing.T) {
+	r := testReplica(0)
+	if r.viewChangeTimeout != 15*time.Second {
+		t.Fatalf("default leader report timeout = %v, want 15s", r.viewChangeTimeout)
+	}
+	if r.viewChangeFallbackTimeout != 20*time.Second {
+		t.Fatalf("default view-change fallback = %v, want 20s", r.viewChangeFallbackTimeout)
+	}
+
+	r = NewReplica(r.config, 0, "", "", dropNone, 0, 0, RecoveryOptions{
+		RetainSlots:                 64,
+		ViewChangeTimeoutMs:         7,
+		ViewChangeFallbackTimeoutMs: 11,
+	})
+	if r.viewChangeTimeout != 7*time.Millisecond ||
+		r.viewChangeFallbackTimeout != 11*time.Millisecond {
+		t.Fatalf("configured timeouts = leader %v fallback %v, want 7ms/11ms",
+			r.viewChangeTimeout, r.viewChangeFallbackTimeout)
+	}
+}
+
+func TestViewChangeFallbackStartsOnEveryReplica(t *testing.T) {
+	for idx := 0; idx < 3; idx++ {
+		t.Run(fmt.Sprintf("replica-%d", idx), func(t *testing.T) {
+			r := testReplica(idx)
+			cleanupViewChangeTest(t, r)
+			r.startViewChange(1)
+
+			watchdog := currentViewChangeWatchdog(t, r)
+			r.mu.Lock()
+			view, status := r.view(), r.status
+			r.mu.Unlock()
+			if view != 1 || status != statusViewChange || watchdog.view != 1 {
+				t.Fatalf("view=%d status=%v watchdog.view=%d, want view-change/1 with watchdog/1",
+					view, status, watchdog.view)
+			}
+		})
+	}
+}
+
+func TestAcceptedStartViewResetsFallback(t *testing.T) {
+	r := testReplica(0) // replica 1 leads view 1
+	cleanupViewChangeTest(t, r)
+	r.startViewChange(1)
+	old := currentViewChangeWatchdog(t, r)
+
+	// Receipt only queues the valid message. Acceptance in installStartView is
+	// the point that replaces the watchdog with a fresh full interval.
+	r.handleStartView(&BusStartView{ViewId: 1, SenderIdx: 1, MaxSlot: 0, HasMax: true})
+	if got := currentViewChangeWatchdog(t, r); got != old {
+		t.Fatal("StartView receipt reset the fallback before install acceptance")
+	}
+	msg := <-r.startViewQ
+	done := make(chan struct{})
+	go func() {
+		r.installStartView(msg)
+		close(done)
+	}()
+
+	// The missing canonical slot makes the installer publish recovery and block
+	// on its fetch, giving the test a deterministic acceptance signal.
+	<-r.fetchQ
+	fresh := currentViewChangeWatchdog(t, r)
+	if fresh == old || fresh.view != 1 || fresh.generation <= old.generation {
+		t.Fatalf("watchdog was not freshly rearmed: old=%p/%d fresh=%p/%d view=%d",
+			old, old.generation, fresh, fresh.generation, fresh.view)
+	}
+
+	// Even if the replaced timer's callback was already queued, its identity is
+	// stale and cannot consume the fresh interval.
+	r.expireViewChangeWatchdog(old)
+	if got := currentViewChangeWatchdog(t, r); got != fresh || r.view() != 1 {
+		t.Fatal("replaced fallback advanced or disturbed the accepted StartView")
+	}
+
+	// Expiring the active fallback cancels the blocked install through rec.abort.
+	r.expireViewChangeWatchdog(fresh)
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("fallback did not cancel the active StartView install")
+	}
+}
+
+func TestRejectedStartViewsDoNotResetFallback(t *testing.T) {
+	r := testReplica(0)
+	cleanupViewChangeTest(t, r)
+	r.startViewChange(1)
+	want := currentViewChangeWatchdog(t, r)
+
+	// Invalid sender for current view.
+	r.handleStartView(&BusStartView{ViewId: 1, SenderIdx: 0})
+	// Valid leader for an already stale view.
+	r.handleStartView(&BusStartView{ViewId: 0, SenderIdx: 0})
+
+	// A current-view StartView is a duplicate while that view's installation is
+	// already active.
+	r.mu.Lock()
+	r.recovery = &viewRecovery{
+		view: 1, generation: 1, leader: 1, abort: make(chan struct{}),
+	}
+	r.mu.Unlock()
+	r.handleStartView(&BusStartView{ViewId: 1, SenderIdx: 1})
+
+	if got := currentViewChangeWatchdog(t, r); got != want {
+		t.Fatalf("rejected StartView replaced watchdog %p with %p", want, got)
+	}
+	if n := len(r.startViewQ); n != 0 {
+		t.Fatalf("queued %d invalid/stale/duplicate StartViews", n)
+	}
+}
+
+func TestViewChangeHeartbeatDoesNotResetFallback(t *testing.T) {
+	r := testReplica(0)
+	cleanupViewChangeTest(t, r)
+	r.startViewChange(1)
+	want := currentViewChangeWatchdog(t, r)
+
+	// The current leader's sync traffic may update heartbeat bookkeeping, but
+	// ViewChange liveness belongs exclusively to the fallback watchdog.
+	r.handleSyncPrepare(&BusSyncPrepare{ViewId: 1, SenderIdx: 1})
+	r.handleSyncCommit(&BusSyncCommit{ViewId: 1, SenderIdx: 1})
+	if got := currentViewChangeWatchdog(t, r); got != want {
+		t.Fatalf("heartbeat traffic replaced watchdog %p with %p", want, got)
+	}
+}
+
+func TestRecoveryCompletionCancelsFallbackAndFencesStaleExpiry(t *testing.T) {
+	r := testReplica(0)
+	cleanupViewChangeTest(t, r)
+	r.startViewChange(1)
+	watchdog := currentViewChangeWatchdog(t, r)
+
+	r.mu.Lock()
+	if r.vc != nil {
+		close(r.vc.abort)
+		r.vc = nil
+	}
+	r.recoveryGen++
+	rec := &viewRecovery{
+		view: 1, generation: r.recoveryGen, leader: 1, abort: make(chan struct{}),
+	}
+	r.recovery = rec
+	r.mu.Unlock()
+
+	if !r.finishRecoveryIfComplete(rec) {
+		t.Fatal("empty canonical range did not complete recovery")
+	}
+	r.mu.Lock()
+	status, current := r.status, r.viewChangeWatchdog
+	r.mu.Unlock()
+	if status != statusNormal || current != nil {
+		t.Fatalf("completion published status=%v watchdog=%p, want normal/nil", status, current)
+	}
+
+	// A callback that raced Timer.Stop must observe the cleared identity and may
+	// not move a now-Normal replica.
+	r.expireViewChangeWatchdog(watchdog)
+	if view := r.view(); view != 1 {
+		t.Fatalf("stale fallback advanced Normal replica to view %d", view)
+	}
+}
+
+func TestNewerViewReplacesAndFencesOldFallback(t *testing.T) {
+	r := testReplica(0)
+	cleanupViewChangeTest(t, r)
+	r.startViewChange(1)
+	old := currentViewChangeWatchdog(t, r)
+	r.startViewChange(3)
+	fresh := currentViewChangeWatchdog(t, r)
+	if fresh == old || fresh.view != 3 {
+		t.Fatalf("newer view retained old watchdog: old=%p fresh=%p fresh.view=%d",
+			old, fresh, fresh.view)
+	}
+
+	r.expireViewChangeWatchdog(old)
+	if view := r.view(); view != 3 {
+		t.Fatalf("old fallback advanced newer view to %d", view)
+	}
+	if got := currentViewChangeWatchdog(t, r); got != fresh {
+		t.Fatal("old fallback replaced the newer view's watchdog")
+	}
+}
+
+func TestFallbackExpiryAdvancesAndBroadcastsViewChangeRequest(t *testing.T) {
+	r := testReplica(0)
+	cleanupViewChangeTest(t, r)
+	var peers [3]bytes.Buffer
+	r.mu.Lock()
+	for idx := 1; idx < 3; idx++ {
+		r.peerWriters[idx] = &lockedWriter{w: bufio.NewWriter(&peers[idx])}
+	}
+	r.mu.Unlock()
+
+	r.startViewChange(1)
+	oldVC := r.vc
+	for idx := 1; idx < 3; idx++ {
+		peers[idx].Reset() // discard view 1's ordinary request
+	}
+	r.expireViewChangeWatchdog(currentViewChangeWatchdog(t, r))
+
+	if view := r.view(); view != 2 {
+		t.Fatalf("fallback advanced to view %d, want 2", view)
+	}
+	select {
+	case <-oldVC.abort:
+	default:
+		t.Fatal("fallback did not cancel the old view-change work")
+	}
+	for idx := 1; idx < 3; idx++ {
+		code, err := peers[idx].ReadByte()
+		if err != nil {
+			t.Fatalf("peer %d received no fallback broadcast: %v", idx, err)
+		}
+		if code != MsgBusViewChangeRequest {
+			t.Fatalf("peer %d message code=%d, want view-change request %d",
+				idx, code, MsgBusViewChangeRequest)
+		}
+		var msg BusViewChangeRequest
+		if err := msg.Unmarshal(&peers[idx]); err != nil {
+			t.Fatalf("peer %d bad request: %v", idx, err)
+		}
+		if msg.ViewId != 2 || msg.SenderIdx != 0 {
+			t.Fatalf("peer %d request=%+v, want view=2 sender=0", idx, msg)
+		}
+	}
+}
+
+func TestConfiguredFallbackTimerExpires(t *testing.T) {
+	cfg := &Config{N: 3, F: 1, Replicas: []string{"a:1", "b:2", "c:3"}}
+	r := NewReplica(cfg, 0, "", "", dropNone, 0, 0, RecoveryOptions{
+		RetainSlots:                 64,
+		ViewChangeFallbackTimeoutMs: 10,
+	})
+	cleanupViewChangeTest(t, r)
+	writes := make(chan struct{}, 4)
+	r.mu.Lock()
+	r.peerWriters[1] = &lockedWriter{w: bufio.NewWriter(&retrySignalWriter{writes: writes})}
+	r.mu.Unlock()
+
+	r.startViewChange(1)
+	<-writes // view 1 request
+	select {
+	case <-writes: // fallback's view 2 request
+	case <-time.After(time.Second):
+		t.Fatal("configured fallback timer did not expire")
+	}
+	if view := r.view(); view != 2 {
+		t.Fatalf("configured fallback ended in view %d, want 2", view)
+	}
+}
+
+func TestLeaderReportDeadlineRemainsSeparateFromFallback(t *testing.T) {
+	cfg := &Config{N: 3, F: 1, Replicas: []string{"a:1", "b:2", "c:3"}}
+	r := NewReplica(cfg, 1, "", "", dropNone, 0, 0, RecoveryOptions{
+		RetainSlots:                 64,
+		ViewChangeTimeoutMs:         10,
+		ViewChangeFallbackTimeoutMs: 60_000,
+	})
+	cleanupViewChangeTest(t, r)
+	r.startViewChange(1) // replica 1 is the designated leader for view 1
+
+	deadline := time.After(time.Second)
+	ticker := time.NewTicker(time.Millisecond)
+	defer ticker.Stop()
+	for r.view() != 2 {
+		select {
+		case <-ticker.C:
+		case <-deadline:
+			t.Fatal("leader report deadline did not advance view 1")
+		}
+	}
+	watchdog := currentViewChangeWatchdog(t, r)
+	if watchdog.view != 2 {
+		t.Fatalf("leader deadline did not replace fallback for view 2: %+v", watchdog)
+	}
+}
+
 func TestViewChangeReportWaitsForRequestQuorum(t *testing.T) {
 	r := testReplica(0) // view 1's leader is replica 1, so this one is a follower
 	r.startViewChange(1)
@@ -1874,7 +2176,7 @@ func TestPreStartViewChangeDoesNotResuspectSilentLeader(t *testing.T) {
 	}
 }
 
-func TestReplicaInstallingStartViewSuspectsSilentLeader(t *testing.T) {
+func TestReplicaInstallingStartViewIgnoresSuspectTimeout(t *testing.T) {
 	r := testReplica(1) // view 0's leader is replica 0
 	r.suspectTimeout = 20 * time.Millisecond
 	abort := make(chan struct{})
@@ -1886,18 +2188,24 @@ func TestReplicaInstallingStartViewSuspectsSilentLeader(t *testing.T) {
 	r.lastHeartbeatNs = nowNs()
 	r.mu.Unlock()
 
-	if !suspicionFires(r, 2*time.Second) {
-		t.Fatal("a silent leader was never suspected during its follower's StartView install")
+	// Make the heartbeat old enough to trigger immediately if the old special
+	// recovery suspicion path still exists. The atomic check is deterministic;
+	// no suspicion-loop sleep is needed.
+	r.mu.Lock()
+	r.lastHeartbeatNs = nowNs() - int64(time.Second)
+	r.mu.Unlock()
+	if r.suspectLeaderIfTimedOut() {
+		t.Fatal("suspect timeout advanced an active StartView install")
 	}
 	r.mu.Lock()
 	view, status := r.view(), r.status
 	r.mu.Unlock()
-	if view != 1 || status != statusViewChange {
-		t.Fatalf("view=%d status=%v, want view 1 in viewchange", view, status)
+	if view != 0 || status != statusViewChange {
+		t.Fatalf("view=%d status=%v, want view 0 still in viewchange", view, status)
 	}
 	select {
 	case <-abort:
+		t.Fatal("suspect timeout canceled the active StartView recovery")
 	default:
-		t.Fatal("starting the newer view did not cancel the old recovery")
 	}
 }
