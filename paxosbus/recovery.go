@@ -87,41 +87,48 @@ func (r *Replica) syncLoop() {
 	ticker := time.NewTicker(r.syncInterval)
 	defer ticker.Stop()
 	for range ticker.C {
-		var (
-			prep   BusSyncPrepare
-			commit *BusSyncCommit
-		)
-		r.mu.Lock()
-		if !r.AmLeader() || r.status != statusNormal {
-			r.sync = nil
-			r.mu.Unlock()
-			continue
-		}
-		view := r.view()
-		prep = BusSyncPrepare{ViewId: view, SenderIdx: uint32(r.idx)}
-		if r.nextExpected > 0 {
-			slot := r.nextExpected - 1
-			if h, ok := r.prefixHashAtLocked(slot); ok {
-				prep.SlotToSync, prep.HasSlot, prep.PrefixHash = slot, true, h
-				r.sync = &syncRound{
-					view: view,
-					slot: slot,
-					acks: map[uint32]struct{}{uint32(r.idx): {}},
-				}
-				commit = r.maybeCommitSyncLocked()
-			}
-		}
-		if !prep.HasSlot {
-			// Nothing executed yet: still beat, so followers know we are alive
-			// before any client traffic starts.
-			r.sync = nil
-		}
-		r.mu.Unlock()
+		r.syncOnce()
+	}
+}
 
-		r.broadcastToPeers(MsgBusSyncPrepare, &prep)
-		if commit != nil {
-			r.broadcastToPeers(MsgBusSyncCommit, commit)
+// syncOnce is one independent heartbeat-timer tick. Keeping the status gate in
+// a single helper makes the view-change publication boundary directly testable
+// without relying on ticker timing; peer writes remain off r.mu as before.
+func (r *Replica) syncOnce() {
+	var (
+		prep   BusSyncPrepare
+		commit *BusSyncCommit
+	)
+	r.mu.Lock()
+	if !r.AmLeader() || r.status != statusNormal {
+		r.sync = nil
+		r.mu.Unlock()
+		return
+	}
+	view := r.view()
+	prep = BusSyncPrepare{ViewId: view, SenderIdx: uint32(r.idx)}
+	if r.nextExpected > 0 {
+		slot := r.nextExpected - 1
+		if h, ok := r.prefixHashAtLocked(slot); ok {
+			prep.SlotToSync, prep.HasSlot, prep.PrefixHash = slot, true, h
+			r.sync = &syncRound{
+				view: view,
+				slot: slot,
+				acks: map[uint32]struct{}{uint32(r.idx): {}},
+			}
+			commit = r.maybeCommitSyncLocked()
 		}
+	}
+	if !prep.HasSlot {
+		// Nothing executed yet: still beat, so followers know we are alive
+		// before any client traffic starts.
+		r.sync = nil
+	}
+	r.mu.Unlock()
+
+	r.broadcastToPeers(MsgBusSyncPrepare, &prep)
+	if commit != nil {
+		r.broadcastToPeers(MsgBusSyncCommit, commit)
 	}
 }
 
@@ -706,21 +713,56 @@ func (r *Replica) driveViewChange(vc *vcState) {
 	if !r.fetchMergedState(vc, &plan) {
 		return
 	}
+	canonicalMax, hasCanonical := mergeCanonicalBoundary(&plan)
 
 	r.mu.Lock()
-	if r.view() != vc.view {
+	if r.view() != vc.view || r.status != statusViewChange || r.vc != vc {
 		r.mu.Unlock()
 		return
 	}
 	r.startViewView = vc.view
 	r.startViewUsed = append(r.startViewUsed[:0], plan.selected...)
-	r.installViewLocked(vc.view, plan.stableSlot, plan.hasStable,
-		plan.maxSlot, plan.hasMax, plan.noops, false)
-	r.vc = nil
+	r.installCanonicalViewLocked(vc.view, plan.stableSlot, plan.hasStable,
+		canonicalMax, hasCanonical, plan.noops, false)
+	msg := r.initialStartViewMsgLocked(vc.view, &plan, canonicalMax, hasCanonical)
 	r.mu.Unlock()
 
-	Notice("[%s] VIEW-CHANGE done view=%d leader=self", r.self, vc.view)
-	r.broadcastStartView()
+	// Multicast the immutable decision while the ViewChange fence is still
+	// published. A later bus can arrive while a peer send blocks, but it cannot
+	// enter this message or advance the cursor. The heartbeat timer is gated by
+	// the same status and therefore remains silent too.
+	r.broadcastStartView(msg)
+
+	// A newer view may have started while the network sends above ran off-lock.
+	// Only the exact view-change instance that produced this decision may expose
+	// it as Normal and release the post-merge buses.
+	r.mu.Lock()
+	if r.view() != vc.view || r.status != statusViewChange || r.vc != vc {
+		r.mu.Unlock()
+		return
+	}
+	r.vc = nil
+	r.publishNormalViewLocked(vc.view)
+	executed := r.nextExpected
+	r.mu.Unlock()
+
+	Notice("[%s] VIEW-CHANGE done view=%d leader=self executed=%d", r.self, vc.view, executed)
+}
+
+// mergeCanonicalBoundary turns the two-part merge frontier into the inclusive
+// end followers install. A stable-only merge still contains its committed
+// prefix, so StartView must carry HasMax through StableSlot even when there is
+// no suffix above it.
+func mergeCanonicalBoundary(plan *mergePlan) (uint64, bool) {
+	var maxSlot uint64
+	hasMax := false
+	if plan.hasStable {
+		maxSlot, hasMax = plan.stableSlot, true
+	}
+	if plan.hasMax && (!hasMax || plan.maxSlot > maxSlot) {
+		maxSlot, hasMax = plan.maxSlot, true
+	}
+	return maxSlot, hasMax
 }
 
 // fetchMergedState brings the new leader's own log up to the merge before it
@@ -804,8 +846,7 @@ func (r *Replica) fetchMergedState(vc *vcState, plan *mergePlan) bool {
 // committed prefix and its hash, how far the merged suffix runs, which reports
 // selected that result, and which slots are no-ops. A follower pulls everything
 // it lacks before exposing the view as normal.
-func (r *Replica) broadcastStartView() {
-	msg := r.startViewMsg()
+func (r *Replica) broadcastStartView(msg *BusStartView) {
 	if msg == nil {
 		return
 	}
@@ -815,6 +856,29 @@ func (r *Replica) broadcastStartView() {
 		}
 		r.sendToPeer(j, MsgBusStartView, msg)
 	}
+}
+
+// initialStartViewMsgLocked snapshots exactly the merge that was decided. It is
+// deliberately independent of nextExpected: real buses outside the merge stay
+// resident while the initial multicast runs, and later StartView responses may
+// legitimately include them only after Normal publishes and sweeps them.
+func (r *Replica) initialStartViewMsgLocked(view uint64, plan *mergePlan,
+	maxSlot uint64, hasMax bool) *BusStartView {
+	msg := &BusStartView{
+		ViewId:          view,
+		SenderIdx:       uint32(r.idx),
+		MaxSlot:         maxSlot,
+		HasMax:          hasMax,
+		SelectedReports: append([]uint32(nil), plan.selected...),
+		NoOpSlots:       append([]uint64(nil), plan.noops...),
+	}
+	if plan.hasStable {
+		msg.StableSlot, msg.HasStable = plan.stableSlot, true
+		if h, ok := r.prefixHashAtLocked(plan.stableSlot); ok {
+			msg.PrefixHash = h
+		}
+	}
+	return msg
 }
 
 func (r *Replica) sendStartView(peer int) {
@@ -1232,7 +1296,8 @@ func (r *Replica) finishRecoveryIfComplete(rec *viewRecovery) bool {
 }
 
 // installViewLocked makes the local log agree with a decided view and returns
-// the replica to normal operation.
+// the replica to normal operation. The new-leader path uses the two phases
+// separately so it can multicast StartView between them.
 //
 // conservative is for a replica that did not take part in deciding this view:
 // it cannot tell which of its speculative slots the merge contradicts, so it
@@ -1243,8 +1308,36 @@ func (r *Replica) finishRecoveryIfComplete(rec *viewRecovery) bool {
 func (r *Replica) installViewLocked(view, stable uint64, hasStable bool,
 	maxSlot uint64, hasMax bool, noops []uint64,
 	conservative bool) (rewound uint64, didRewind bool) {
+	if hasStable && (!hasMax || stable > maxSlot) {
+		maxSlot, hasMax = stable, true
+	}
+	rewound, didRewind = r.installCanonicalViewLocked(view, stable, hasStable,
+		maxSlot, hasMax, noops, conservative)
+	r.publishNormalViewLocked(view)
+	return rewound, didRewind
+}
+
+// installCanonicalViewLocked installs and executes exactly the decided range,
+// queues its new-view replies, and deliberately leaves statusViewChange
+// published. Real buses beyond maxSlot remain in the log for the post-Normal
+// sweep; stale no-ops outside the decision do not.
+func (r *Replica) installCanonicalViewLocked(view, stable uint64, hasStable bool,
+	maxSlot uint64, hasMax bool, noops []uint64,
+	conservative bool) (rewound uint64, didRewind bool) {
 
 	target := r.nextExpected
+	canonicalNext := uint64(0)
+	if hasMax && maxSlot != ^uint64(0) {
+		canonicalNext = maxSlot + 1
+	}
+	// Work executed before the ViewChange fence may extend beyond the reports
+	// selected by this merge. Give it back before replaying replies so the
+	// initial StartView and its canonical reply batch stop at the same boundary.
+	// rewindToLocked leaves the real entries resident; publication sweeps them
+	// again under the new view.
+	if (!hasMax || maxSlot != ^uint64(0)) && target > canonicalNext {
+		target = canonicalNext
+	}
 	if conservative {
 		// Back to *our* commit point, not the leader's. Ours is the last slot we
 		// know a quorum agreed with us on; between it and the leader's, higher,
@@ -1278,6 +1371,17 @@ func (r *Replica) installViewLocked(view, stable uint64, hasStable bool,
 			Warning("[%s] cannot rewind to slot %d: outside the hash window", r.self, target)
 		}
 	}
+	if !conservative {
+		for slot, entry := range r.globalLog {
+			outside := !hasMax || (maxSlot != ^uint64(0) && slot > maxSlot)
+			if !outside || entry == nil || entry.state != slotNoOp {
+				continue
+			}
+			r.releaseEntryBytesLocked(entry)
+			delete(r.globalLog, slot)
+		}
+		r.recomputeMaxSlotLocked()
+	}
 
 	for _, s := range noops {
 		if s < r.nextExpected {
@@ -1305,16 +1409,18 @@ func (r *Replica) installViewLocked(view, stable uint64, hasStable bool,
 	if hasStable {
 		r.setStableLocked(stable)
 	}
+	return rewound, didRewind
+}
 
-	// Only after the canonical reply batch is complete does Normal become
-	// visible. Buses recorded beyond the merge boundary then drain in their
-	// original order, appending their replies after every merged-suffix reply.
+// publishNormalViewLocked is the leader's publication point after StartView has
+// been multicast. The mutex makes status publication and the post-merge sweep
+// atomic with respect to heartbeat ticks and ordinary bus intake.
+func (r *Replica) publishNormalViewLocked(view uint64) {
 	r.lastNormalView = view
 	r.status = statusNormal
 	r.lastHeartbeatNs = nowNs()
 	r.leaderLost = false
 	r.advanceNextExpectedLocked()
-	return rewound, didRewind
 }
 
 // replayRepliesLocked re-sends the replies for slots this replica had already

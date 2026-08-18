@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"reflect"
+	"sync"
 	"testing"
 	"time"
 )
@@ -396,6 +397,283 @@ func queuedReplySlots(r *Replica) []uint64 {
 		slots[i] = r.pendingReplies[i].busSlot
 	}
 	return slots
+}
+
+// firstWriteGate lets a test stop the initial StartView in the peer send itself,
+// exposing the exact state between canonical installation and Normal
+// publication without ticker sleeps or production hooks.
+type firstWriteGate struct {
+	first       chan []byte
+	release     chan struct{}
+	blockOnce   sync.Once
+	releaseOnce sync.Once
+}
+
+func newFirstWriteGate() *firstWriteGate {
+	return &firstWriteGate{
+		first:   make(chan []byte, 1),
+		release: make(chan struct{}),
+	}
+}
+
+func (w *firstWriteGate) Write(p []byte) (int, error) {
+	block := false
+	w.blockOnce.Do(func() { block = true })
+	if block {
+		cp := append([]byte(nil), p...)
+		w.first <- cp
+		<-w.release
+	}
+	return len(p), nil
+}
+
+func (w *firstWriteGate) open() {
+	w.releaseOnce.Do(func() { close(w.release) })
+}
+
+func blockLeaderStartView(t *testing.T, r *Replica, vc *vcState,
+	reports ...*BusViewChange) (*firstWriteGate, []byte, <-chan struct{}) {
+	t.Helper()
+	gate := newFirstWriteGate()
+	t.Cleanup(gate.open)
+	r.mu.Lock()
+	r.peerWriters[0] = &lockedWriter{w: bufio.NewWriter(gate)}
+	r.mu.Unlock()
+	for _, report := range reports {
+		vc.reports <- report
+	}
+	done := make(chan struct{})
+	go func() {
+		r.driveViewChange(vc)
+		close(done)
+	}()
+	select {
+	case wire := <-gate.first:
+		return gate, wire, done
+	case <-time.After(time.Second):
+		t.Fatal("leader never reached the initial StartView multicast")
+		return nil, nil, nil
+	}
+}
+
+func decodeStartViewWrite(t *testing.T, wire []byte) *BusStartView {
+	t.Helper()
+	if len(wire) == 0 || wire[0] != MsgBusStartView {
+		t.Fatalf("first peer message code=%v, want StartView %d", wire, MsgBusStartView)
+	}
+	var msg BusStartView
+	if err := msg.Unmarshal(bytes.NewReader(wire[1:])); err != nil {
+		t.Fatalf("decode initial StartView: %v", err)
+	}
+	return &msg
+}
+
+func waitForViewChangeDrive(t *testing.T, done <-chan struct{}) {
+	t.Helper()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("leader did not finish view change after multicast returned")
+	}
+}
+
+func TestLeaderMulticastsCanonicalStartViewBeforeNormal(t *testing.T) {
+	r := testReplica(1) // replica 1 leads view 1
+	var laterPeer bytes.Buffer
+
+	r.mu.Lock()
+	busAt(r, 0, 1, 1)
+	busAt(r, 1, 2, 2)
+	busAt(r, 2, 3, 3)
+	r.setNoOpLocked(3)
+	r.advanceNextExpectedLocked()
+	if r.nextExpected != 4 {
+		r.mu.Unlock()
+		t.Fatalf("setup cursor=%d, want 4", r.nextExpected)
+	}
+	r.setStableLocked(0)
+	r.pendingReplies = nil
+	r.viewId.Store(1)
+	r.status = statusViewChange
+	vc := newVCState(1, r.config.N)
+	r.vc = vc
+	r.peerWriters[2] = &lockedWriter{w: bufio.NewWriter(&laterPeer)}
+	r.mu.Unlock()
+
+	gate, wire, done := blockLeaderStartView(t, r, vc,
+		report(1, 0, 0, []uint64{1}, nil),
+		report(2, 0, 0, []uint64{1}, nil))
+	msg := decodeStartViewWrite(t, wire)
+	if !msg.HasMax || msg.MaxSlot != 1 {
+		t.Fatalf("initial StartView max=%d/%v, want decided boundary 1/true", msg.MaxSlot, msg.HasMax)
+	}
+
+	r.mu.Lock()
+	if r.status != statusViewChange || r.lastNormalView != 0 {
+		r.mu.Unlock()
+		t.Fatalf("before multicast returned status=%v lastNormal=%d, want ViewChange/0",
+			r.status, r.lastNormalView)
+	}
+	if r.nextExpected != 2 {
+		r.mu.Unlock()
+		t.Fatalf("before multicast returned cursor=%d, want canonical end 2", r.nextExpected)
+	}
+	if got := queuedReplySlots(r); !reflect.DeepEqual(got, []uint64{1}) {
+		r.mu.Unlock()
+		t.Fatalf("before multicast returned reply slots=%v, want merged suffix [1]", got)
+	}
+	if _, executed := r.dedup[reqKey{1, 3}]; executed {
+		r.mu.Unlock()
+		t.Fatal("already-executed post-merge bus remained executed before Normal")
+	}
+	if r.slotStateLocked(2) != slotReceived {
+		r.mu.Unlock()
+		t.Fatal("already-executed post-merge real bus was not retained for the later sweep")
+	}
+	if r.slotStateLocked(3) != slotEmpty {
+		r.mu.Unlock()
+		t.Fatal("stale post-merge no-op survived the canonical install")
+	}
+	// This bus arrives while the first peer send is blocked. It must remain
+	// frozen and absent from the immutable StartView snapshot too.
+	busAt(r, 3, 4, 4)
+	if r.nextExpected != 2 {
+		r.mu.Unlock()
+		t.Fatalf("bus arriving during multicast advanced cursor to %d", r.nextExpected)
+	}
+	r.mu.Unlock()
+
+	// A deterministic heartbeat tick at this boundary is ineligible: the
+	// multicast has not returned and status is still ViewChange.
+	r.syncOnce()
+	if laterPeer.Len() != 0 {
+		t.Fatal("heartbeat reached a later peer before StartView publication")
+	}
+
+	gate.open()
+	waitForViewChangeDrive(t, done)
+
+	r.mu.Lock()
+	if r.status != statusNormal || r.lastNormalView != 1 {
+		r.mu.Unlock()
+		t.Fatalf("after multicast status=%v lastNormal=%d, want Normal/1",
+			r.status, r.lastNormalView)
+	}
+	if r.nextExpected != 4 {
+		r.mu.Unlock()
+		t.Fatalf("post-Normal cursor=%d, want post-merge buses drained through 3", r.nextExpected)
+	}
+	if got, want := queuedReplySlots(r), []uint64{1, 2, 3}; !reflect.DeepEqual(got, want) {
+		r.mu.Unlock()
+		t.Fatalf("reply order=%v, want merged suffix before post-merge buses %v", got, want)
+	}
+	r.mu.Unlock()
+
+	// Later catch-up responses retain the established behavior: after the
+	// post-merge sweep they describe the leader's current full executed prefix.
+	later := r.startViewMsg()
+	if later == nil || !later.HasMax || later.MaxSlot != 3 {
+		t.Fatalf("later StartView max=%v, want current boundary 3", later)
+	}
+
+	beforeHeartbeat := laterPeer.Len()
+	if beforeHeartbeat == 0 {
+		t.Fatal("initial StartView never reached the later peer")
+	}
+	r.syncOnce()
+	afterHeartbeat := laterPeer.Bytes()
+	if len(afterHeartbeat) <= beforeHeartbeat || afterHeartbeat[beforeHeartbeat] != MsgBusSyncPrepare {
+		t.Fatal("next eligible heartbeat tick did not send SyncPrepare after Normal publication")
+	}
+}
+
+func TestLeaderStableOnlyMergeAdvertisesCommittedBoundary(t *testing.T) {
+	r := testReplica(1)
+	r.mu.Lock()
+	for slot := uint64(0); slot < 3; slot++ {
+		busAt(r, slot, slot+1, slot+1)
+	}
+	r.advanceNextExpectedLocked()
+	r.setStableLocked(1)
+	r.pendingReplies = nil
+	r.viewId.Store(1)
+	r.status = statusViewChange
+	vc := newVCState(1, r.config.N)
+	r.vc = vc
+	r.mu.Unlock()
+
+	gate, wire, done := blockLeaderStartView(t, r, vc,
+		report(1, 0, 1, nil, nil),
+		report(2, 0, 1, nil, nil))
+	msg := decodeStartViewWrite(t, wire)
+	if !msg.HasStable || msg.StableSlot != 1 || !msg.HasMax || msg.MaxSlot != 1 {
+		t.Fatalf("stable-only StartView stable=%d/%v max=%d/%v, want 1/true and 1/true",
+			msg.StableSlot, msg.HasStable, msg.MaxSlot, msg.HasMax)
+	}
+	if !r.validStartView(msg) {
+		t.Fatal("stable-only StartView is not valid for follower installation")
+	}
+	r.mu.Lock()
+	if r.status != statusViewChange || r.nextExpected != 2 {
+		r.mu.Unlock()
+		t.Fatalf("stable-only merge exposed status=%v cursor=%d before multicast returned",
+			r.status, r.nextExpected)
+	}
+	r.mu.Unlock()
+
+	gate.open()
+	waitForViewChangeDrive(t, done)
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.status != statusNormal || r.nextExpected != 3 {
+		t.Fatalf("stable-only publication status=%v cursor=%d, want Normal/3", r.status, r.nextExpected)
+	}
+	if got := queuedReplySlots(r); !reflect.DeepEqual(got, []uint64{2}) {
+		t.Fatalf("stable-only post-merge replies=%v, want [2]", got)
+	}
+}
+
+func TestStaleLeaderDriveCannotPublishNormalAfterNewerView(t *testing.T) {
+	r := testReplica(1)
+	r.mu.Lock()
+	for slot := uint64(0); slot < 3; slot++ {
+		busAt(r, slot, slot+1, slot+1)
+	}
+	r.advanceNextExpectedLocked()
+	r.setStableLocked(0)
+	r.pendingReplies = nil
+	r.viewId.Store(1)
+	r.status = statusViewChange
+	vc := newVCState(1, r.config.N)
+	r.vc = vc
+	r.mu.Unlock()
+
+	gate, _, done := blockLeaderStartView(t, r, vc,
+		report(1, 0, 0, []uint64{1}, nil),
+		report(2, 0, 0, []uint64{1}, nil))
+
+	// The old drive retains its local writer while blocked. Remove it from the
+	// replica so the real startViewChange path can publish view 2 without its own
+	// multicast waiting behind that writer.
+	r.mu.Lock()
+	r.peerWriters[0] = nil
+	r.mu.Unlock()
+	r.startViewChange(2)
+	gate.open()
+	waitForViewChangeDrive(t, done)
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.view() != 2 || r.status != statusViewChange || r.lastNormalView != 0 {
+		t.Fatalf("stale drive published view 1: view=%d status=%v lastNormal=%d",
+			r.view(), r.status, r.lastNormalView)
+	}
+	if r.nextExpected != 2 {
+		t.Fatalf("stale drive swept post-merge bus in newer view; cursor=%d, want 2", r.nextExpected)
+	}
+	if got := queuedReplySlots(r); !reflect.DeepEqual(got, []uint64{1}) {
+		t.Fatalf("stale drive queued post-merge replies=%v, want canonical [1] only", got)
+	}
 }
 
 // A replica keeps executing for as long as it takes to notice the leader died,
