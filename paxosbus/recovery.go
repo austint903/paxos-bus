@@ -47,9 +47,9 @@ const (
 	// entries a donor failed to produce before declaring those slots no-ops.
 	mergeFetchAttempts = 3
 
-	// A follower that cannot complete a StartView fetch stays fenced in
-	// ViewChange and retries. This delay keeps a disconnected leader from
-	// turning the recovery goroutine into a tight send loop.
+	// A replica that cannot complete a state-transfer fetch stays fenced in
+	// ViewChange and retries. This delay keeps a disconnected donor from turning
+	// either the leader's merge or a follower's recovery into a tight send loop.
 	recoveryRetryDelay = 100 * time.Millisecond
 )
 
@@ -804,13 +804,18 @@ func (r *Replica) driveViewChange(vc *vcState) {
 		r.self, vc.view, len(reports), plan.stableSlot, plan.maxSlot,
 		len(plan.noops), len(plan.donors))
 
-	if !r.fetchMergedState(vc, &plan) {
+	r.mu.Lock()
+	watchdog := r.viewChangeWatchdog
+	active := r.mergeActiveLocked(vc, watchdog)
+	r.mu.Unlock()
+	if !active || !r.fetchMergedState(vc, watchdog, &plan) {
 		return
 	}
 	canonicalMax, hasCanonical := mergeCanonicalBoundary(&plan)
 
 	r.mu.Lock()
-	if r.view() != vc.view || r.status != statusViewChange || r.vc != vc {
+	if !r.mergeActiveLocked(vc, watchdog) ||
+		!r.committedPrefixCompleteLocked(plan.stableSlot, plan.hasStable) {
 		r.mu.Unlock()
 		return
 	}
@@ -831,7 +836,8 @@ func (r *Replica) driveViewChange(vc *vcState) {
 	// Only the exact view-change instance that produced this decision may expose
 	// it as Normal and release the post-merge buses.
 	r.mu.Lock()
-	if r.view() != vc.view || r.status != statusViewChange || r.vc != vc {
+	if !r.mergeActiveLocked(vc, watchdog) ||
+		!r.committedPrefixCompleteLocked(plan.stableSlot, plan.hasStable) {
 		r.mu.Unlock()
 		return
 	}
@@ -859,34 +865,116 @@ func mergeCanonicalBoundary(plan *mergePlan) (uint64, bool) {
 	return maxSlot, hasMax
 }
 
+// mergeActiveLocked reports whether reconciliation still belongs to the exact
+// view change and fallback interval that selected the merge. In particular, a
+// replacement watchdog for the same numeric view does not extend this work.
+func (r *Replica) mergeActiveLocked(vc *vcState, watchdog *viewChangeWatchdog) bool {
+	if vc == nil || watchdog == nil {
+		return false
+	}
+	select {
+	case <-vc.abort:
+		return false
+	default:
+	}
+	return r.vc == vc && r.view() == vc.view && r.status == statusViewChange &&
+		r.viewChangeWatchdog == watchdog &&
+		r.viewChangeWatchdogGen == watchdog.generation && watchdog.view == vc.view
+}
+
+func (r *Replica) mergeActive(vc *vcState, watchdog *viewChangeWatchdog) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.mergeActiveLocked(vc, watchdog)
+}
+
+// committedPrefixMissingLocked returns the first locally absent committed slot.
+// Slots below nextExpected have already executed and may have been reclaimed;
+// every slot at or above the frozen cursor must still have a concrete entry.
+func (r *Replica) committedPrefixMissingLocked(stable uint64, hasStable bool) (uint64, bool) {
+	if !hasStable || r.nextExpected > stable {
+		return 0, false
+	}
+	for slot := r.nextExpected; ; slot++ {
+		if entry := r.globalLog[slot]; entry == nil || entry.state == slotEmpty {
+			return slot, true
+		}
+		if slot == stable {
+			return 0, false
+		}
+	}
+}
+
+func (r *Replica) committedPrefixCompleteLocked(stable uint64, hasStable bool) bool {
+	_, missing := r.committedPrefixMissingLocked(stable, hasStable)
+	return !missing
+}
+
+func (r *Replica) waitMergeRetry(vc *vcState, watchdog *viewChangeWatchdog) bool {
+	if !r.mergeActive(vc, watchdog) {
+		return false
+	}
+	timer := time.NewTimer(recoveryRetryDelay)
+	defer timer.Stop()
+	select {
+	case <-vc.abort:
+		return false
+	case <-timer.C:
+		return r.mergeActive(vc, watchdog)
+	}
+}
+
 // fetchMergedState brings the new leader's own log up to the merge before it
 // announces anything: the committed prefix first, then every suffix entry it is
-// missing. Slots a donor cannot produce become no-ops — the leader is entitled
-// to close a hole nobody can fill, and the alternative is a view change that
-// never finishes.
-func (r *Replica) fetchMergedState(vc *vcState, plan *mergePlan) bool {
-	if plan.hasStable && plan.hasCatchUp && int(plan.catchUp) != r.idx {
-		r.mu.Lock()
-		from := r.nextExpected
-		r.mu.Unlock()
-		if from <= plan.stableSlot {
-			Notice("[%s] view %d: catching up committed prefix [%d,%d] from replica %d",
-				r.self, vc.view, from, plan.stableSlot, plan.catchUp)
-			select {
-			case <-vc.abort:
+// missing. A committed-prefix miss is retried for exactly as long as the
+// existing per-view fallback remains active; it can never be converted to a
+// no-op. Slots above the commit point retain the bounded/no-op behavior because
+// nobody in the selected quorum can have committed them.
+func (r *Replica) fetchMergedState(vc *vcState, watchdog *viewChangeWatchdog,
+	plan *mergePlan) bool {
+
+	if plan.hasStable {
+		for {
+			r.mu.Lock()
+			active := r.mergeActiveLocked(vc, watchdog)
+			from, missing := r.committedPrefixMissingLocked(plan.stableSlot, true)
+			r.mu.Unlock()
+			if !active {
 				return false
-			default:
 			}
-			r.fetchRangeBlocking(vc, int(plan.catchUp), from, plan.stableSlot)
-			select {
-			case <-vc.abort:
+			if !missing {
+				break
+			}
+
+			if plan.hasCatchUp && int(plan.catchUp) != r.idx {
+				Notice("[%s] view %d: catching up committed prefix [%d,%d] from replica %d",
+					r.self, vc.view, from, plan.stableSlot, plan.catchUp)
+				r.fetchRangeBlocking(vc, int(plan.catchUp), from, plan.stableSlot)
+			} else {
+				Warning("[%s] view %d: committed prefix [%d,%d] is missing with no remote donor",
+					r.self, vc.view, from, plan.stableSlot)
+			}
+
+			r.mu.Lock()
+			active = r.mergeActiveLocked(vc, watchdog)
+			complete := r.committedPrefixCompleteLocked(plan.stableSlot, true)
+			r.mu.Unlock()
+			if !active {
 				return false
-			default:
+			}
+			if complete {
+				break
+			}
+			if !r.waitMergeRetry(vc, watchdog) {
+				return false
 			}
 		}
 	}
 
 	for attempt := 0; attempt < mergeFetchAttempts; attempt++ {
+		if !r.mergeActive(vc, watchdog) {
+			return false
+		}
 		byDonor := make(map[uint32][2]uint64) // donor -> [lo, hi] of what it still owes
 		r.mu.Lock()
 		for slot, donor := range plan.donors {
@@ -911,22 +999,18 @@ func (r *Replica) fetchMergedState(vc *vcState, plan *mergePlan) bool {
 		}
 		r.mu.Unlock()
 		if len(byDonor) == 0 {
-			return true
+			return r.mergeActive(vc, watchdog)
 		}
 		for donor, rng := range byDonor {
-			select {
-			case <-vc.abort:
+			if !r.mergeActive(vc, watchdog) {
 				return false
-			default:
 			}
 			if int(donor) == r.idx {
 				continue
 			}
 			r.fetchRangeBlocking(vc, int(donor), rng[0], rng[1])
-			select {
-			case <-vc.abort:
+			if !r.mergeActive(vc, watchdog) {
 				return false
-			default:
 			}
 		}
 	}
@@ -948,7 +1032,7 @@ func (r *Replica) fetchMergedState(vc *vcState, plan *mergePlan) bool {
 		plan.noops = append(plan.noops, stuck...)
 		sort.Slice(plan.noops, func(i, j int) bool { return plan.noops[i] < plan.noops[j] })
 	}
-	return true
+	return r.mergeActive(vc, watchdog)
 }
 
 // broadcastStartView announces the installed view. It carries no entries: the
