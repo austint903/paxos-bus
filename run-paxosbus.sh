@@ -35,7 +35,7 @@ usage() {
     echo "  -F <n>        drop a slot when reqId % n == 0 (default: $DROP_EVERY, 0=off)"
     echo "  -K <seconds>  kill the leader this far into the data phase, to exercise view change (0=off)"
     echo "  -N <kills>    how many successive leaders to kill (default: $KILL_COUNT; needs f spare replicas, so >1 wants -n 5)"
-    echo "  -n <count>    odd number of replicas, 1 through 32 (default: $NUM_REPLICAS)"
+    echo "  -n <count>    odd number of replicas, 3 through 31 (default: $NUM_REPLICAS)"
     echo "  -R <slots>    committed slots kept in memory (default: $RETAIN_SLOTS; small values force disk-backed state transfer)"
     exit 1
 }
@@ -64,8 +64,8 @@ if ! [[ "$NUM_REPLICAS" =~ ^[0-9]+$ ]]; then
     exit 1
 fi
 NUM_REPLICAS=$((10#$NUM_REPLICAS))
-if (( NUM_REPLICAS < 1 || NUM_REPLICAS > 32 || NUM_REPLICAS % 2 == 0 )); then
-    echo "ERROR: -n must be odd and between 1 and 32 (got: $NUM_REPLICAS)" >&2
+if (( NUM_REPLICAS < 3 || NUM_REPLICAS > 31 || NUM_REPLICAS % 2 == 0 )); then
+    echo "ERROR: -n must be odd and between 3 and 31 (got: $NUM_REPLICAS)" >&2
     exit 1
 fi
 
