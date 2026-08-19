@@ -757,6 +757,8 @@ func TestViewChangeFetchCannotCrossIntoNewView(t *testing.T) {
 	r.viewId.Store(oldVC.view)
 	r.status = statusViewChange
 	r.vc = oldVC
+	r.armViewChangeWatchdogLocked(oldVC.view)
+	watchdog := r.viewChangeWatchdog
 	r.mu.Unlock()
 
 	plan := mergePlan{
@@ -767,7 +769,7 @@ func TestViewChangeFetchCannotCrossIntoNewView(t *testing.T) {
 	}
 	result := make(chan bool, 1)
 	go func() {
-		result <- r.fetchMergedState(oldVC, &plan)
+		result <- r.fetchMergedState(oldVC, watchdog, &plan)
 	}()
 
 	var first fetchReq
@@ -814,6 +816,194 @@ func TestViewChangeFetchCannotCrossIntoNewView(t *testing.T) {
 	}
 	if queued := len(r.fetchQ); queued != 0 {
 		t.Fatalf("retired view-change merge left %d donor fetches queued", queued)
+	}
+}
+
+func TestLeaderRetriesCommittedPrefixBeforePublishingStartView(t *testing.T) {
+	r := testReplica(1) // replica 1 leads view 1
+	cleanupViewChangeTest(t, r)
+	var peer bytes.Buffer
+	r.mu.Lock()
+	busAt(r, 0, 1, 1)
+	r.advanceNextExpectedLocked()
+	r.setStableLocked(0)
+	r.releaseEntryBytesLocked(r.globalLog[0])
+	delete(r.globalLog, 0) // an executed/reclaimed slot still counts as present
+	r.prunedBelow = 1
+	r.peerWriters[0] = &lockedWriter{w: bufio.NewWriter(&peer)}
+	start := r.beginViewChangeLocked(1)
+	watchdog := r.viewChangeWatchdog
+	r.mu.Unlock()
+	if start == nil || watchdog == nil {
+		t.Fatal("could not start leader view change")
+	}
+
+	// The new leader has executed and reclaimed slot 0. Replica 2 proves two
+	// more slots are committed and is the furthest-executed selected donor.
+	start.vc.reports <- &BusViewChange{
+		ViewId: 1, SenderIdx: 1, LastNormalView: 0,
+		StableSlot: 0, HasStable: true, NextExpected: 1, BitmapBase: 1,
+	}
+	start.vc.reports <- &BusViewChange{
+		ViewId: 1, SenderIdx: 2, LastNormalView: 0,
+		StableSlot: 2, HasStable: true, NextExpected: 3, BitmapBase: 3,
+	}
+
+	done := make(chan struct{})
+	go func() {
+		r.driveViewChange(start.vc)
+		close(done)
+	}()
+
+	var first fetchReq
+	select {
+	case first = <-r.fetchQ:
+	case <-time.After(time.Second):
+		t.Fatal("leader did not request its missing committed prefix")
+	}
+	if first.peer != 2 || first.from != 1 || first.to != 2 {
+		t.Fatalf("first committed-prefix fetch=%+v, want peer 2 range [1,2]", first)
+	}
+	first.done <- false // timeout, disconnect, or queue worker failure
+
+	r.mu.Lock()
+	status, currentWatchdog := r.status, r.viewChangeWatchdog
+	r.mu.Unlock()
+	if status != statusViewChange || currentWatchdog != watchdog {
+		t.Fatalf("failed fetch published status=%v watchdog=%p, want view-change with original %p",
+			status, currentWatchdog, watchdog)
+	}
+	if peer.Len() != 0 {
+		t.Fatal("leader broadcast StartView after the failed committed-prefix fetch")
+	}
+
+	var retry fetchReq
+	select {
+	case retry = <-r.fetchQ:
+	case <-time.After(time.Second):
+		t.Fatal("leader did not retry its missing committed prefix")
+	}
+	if retry.peer != 2 || retry.from != 1 || retry.to != 2 || retry.fetchID == first.fetchID {
+		t.Fatalf("retry fetch=%+v, want a new peer-2 request for [1,2]", retry)
+	}
+	reply := &BusNewState{
+		ViewId: 1, FromSlot: 1, ToSlot: 2, FetchId: retry.fetchID, SenderIdx: 2,
+		Entries: []StateEntry{
+			{Slot: 1, ClientId: 1, ReqId: 2, Payload: []byte("one")},
+			{Slot: 2, ClientId: 1, ReqId: 3, Payload: []byte("two")},
+		},
+	}
+	if !r.applyStateEntries(reply, retry) {
+		t.Fatal("active retry response was rejected")
+	}
+	retry.done <- true
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("leader did not finish after receiving the committed prefix")
+	}
+	r.mu.Lock()
+	status, view, lastNormal := r.status, r.view(), r.lastNormalView
+	next, stable, haveStable := r.nextExpected, r.stableSlot, r.haveStable
+	currentWatchdog = r.viewChangeWatchdog
+	r.mu.Unlock()
+	if status != statusNormal || view != 1 || lastNormal != 1 ||
+		next != 3 || !haveStable || stable != 2 || currentWatchdog != nil {
+		t.Fatalf("completed merge state=%v view=%d lastNormal=%d next=%d stable=%d/%v watchdog=%p",
+			status, view, lastNormal, next, stable, haveStable, currentWatchdog)
+	}
+	code, err := peer.ReadByte()
+	if err != nil {
+		t.Fatalf("leader did not broadcast StartView after completing the prefix: %v", err)
+	}
+	if code != MsgBusStartView {
+		t.Fatalf("published message code=%d, want StartView %d", code, MsgBusStartView)
+	}
+	var msg BusStartView
+	if err := msg.Unmarshal(&peer); err != nil {
+		t.Fatalf("bad published StartView: %v", err)
+	}
+	if msg.ViewId != 1 || !msg.HasStable || msg.StableSlot != 2 {
+		t.Fatalf("published StartView=%+v, want view 1 stable slot 2", msg)
+	}
+}
+
+func TestCommittedPrefixRetryStopsAtViewChangeWatchdog(t *testing.T) {
+	r := testReplica(1) // replica 1 leads view 1, but not view 2
+	cleanupViewChangeTest(t, r)
+	var peer bytes.Buffer
+	r.mu.Lock()
+	r.peerWriters[0] = &lockedWriter{w: bufio.NewWriter(&peer)}
+	start := r.beginViewChangeLocked(1)
+	watchdog := r.viewChangeWatchdog
+	r.mu.Unlock()
+	if start == nil || watchdog == nil {
+		t.Fatal("could not start leader view change")
+	}
+	start.vc.reports <- &BusViewChange{
+		ViewId: 1, SenderIdx: 1, LastNormalView: 0, NextExpected: 0,
+	}
+	start.vc.reports <- &BusViewChange{
+		ViewId: 1, SenderIdx: 2, LastNormalView: 0,
+		StableSlot: 1, HasStable: true, NextExpected: 2, BitmapBase: 2,
+	}
+
+	done := make(chan struct{})
+	go func() {
+		r.driveViewChange(start.vc)
+		close(done)
+	}()
+	select {
+	case <-r.fetchQ:
+	case <-time.After(time.Second):
+		t.Fatal("leader did not begin committed-prefix recovery")
+	}
+
+	// Expiry starts view 2 and closes the exact vcState the blocked fetch owns.
+	// It must not install or announce the incomplete view 1 on its way out.
+	r.expireViewChangeWatchdog(watchdog)
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("committed-prefix retry did not stop when its watchdog expired")
+	}
+	r.mu.Lock()
+	status, view, lastNormal := r.status, r.view(), r.lastNormalView
+	startViewView, currentVC := r.startViewView, r.vc
+	currentWatchdog := r.viewChangeWatchdog
+	r.mu.Unlock()
+	if status != statusViewChange || view != 2 || lastNormal != 0 || startViewView == 1 {
+		t.Fatalf("expired merge published state=%v view=%d lastNormal=%d startViewView=%d",
+			status, view, lastNormal, startViewView)
+	}
+	if currentVC == nil || currentWatchdog == nil {
+		t.Fatalf("watchdog did not create fresh view-change state: vc=%p watchdog=%p",
+			currentVC, currentWatchdog)
+	}
+	if currentVC == start.vc || currentVC.view != 2 ||
+		currentWatchdog == watchdog || currentWatchdog.view != 2 {
+		t.Fatalf("watchdog did not fence merge into a fresh view: vc=%p/%v watchdog=%p/%v",
+			currentVC, currentVC.view, currentWatchdog, currentWatchdog.view)
+	}
+	code, err := peer.ReadByte()
+	if err != nil {
+		t.Fatalf("fallback did not publish the next view-change request: %v", err)
+	}
+	if code != MsgBusViewChangeRequest {
+		t.Fatalf("message after expiry=%d, want only view-change request %d",
+			code, MsgBusViewChangeRequest)
+	}
+	var request BusViewChangeRequest
+	if err := request.Unmarshal(&peer); err != nil {
+		t.Fatalf("bad fallback view-change request: %v", err)
+	}
+	if request.ViewId != 2 || peer.Len() != 0 {
+		t.Fatalf("fallback request=%+v trailing_bytes=%d; incomplete view likely published",
+			request, peer.Len())
+	}
+	if queued := len(r.fetchQ); queued != 0 {
+		t.Fatalf("expired committed-prefix merge queued %d retries", queued)
 	}
 }
 
