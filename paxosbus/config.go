@@ -8,6 +8,8 @@ import (
 	"strings"
 )
 
+const maxReplicaCount = 32
+
 type Config struct {
 	N        int
 	F        int
@@ -58,8 +60,14 @@ func ReadConfig(path string) (*Config, error) {
 		return nil, fmt.Errorf("config: no replica lines in %s", path)
 	}
 	c.N = len(c.Replicas)
-	if c.N < 2*c.F+1 {
-		return nil, fmt.Errorf("config: n=%d too small for f=%d (need 2f+1)", c.N, c.F)
+	if c.N > maxReplicaCount {
+		return nil, fmt.Errorf("config: n=%d exceeds %d-replica reply-mask limit", c.N, maxReplicaCount)
+	}
+	// QuorumSize is F+1. Requiring exactly 2F+1 replicas makes that a
+	// majority, so every commit and view-change quorum intersects.
+	expectedF := (c.N - 1) / 2
+	if c.N%2 == 0 || c.F != expectedF {
+		return nil, fmt.Errorf("config: n=%d and f=%d are invalid (need n=2f+1, f=%d)", c.N, c.F, expectedF)
 	}
 	return c, nil
 }
