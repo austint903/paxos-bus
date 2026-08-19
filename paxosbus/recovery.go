@@ -872,7 +872,17 @@ func (r *Replica) fetchMergedState(vc *vcState, plan *mergePlan) bool {
 		if from <= plan.stableSlot {
 			Notice("[%s] view %d: catching up committed prefix [%d,%d] from replica %d",
 				r.self, vc.view, from, plan.stableSlot, plan.catchUp)
-			r.fetchRangeBlocking(int(plan.catchUp), from, plan.stableSlot)
+			select {
+			case <-vc.abort:
+				return false
+			default:
+			}
+			r.fetchRangeBlocking(vc, int(plan.catchUp), from, plan.stableSlot)
+			select {
+			case <-vc.abort:
+				return false
+			default:
+			}
 		}
 	}
 
@@ -903,16 +913,21 @@ func (r *Replica) fetchMergedState(vc *vcState, plan *mergePlan) bool {
 		if len(byDonor) == 0 {
 			return true
 		}
-		select {
-		case <-vc.abort:
-			return false
-		default:
-		}
 		for donor, rng := range byDonor {
+			select {
+			case <-vc.abort:
+				return false
+			default:
+			}
 			if int(donor) == r.idx {
 				continue
 			}
-			r.fetchRangeBlocking(int(donor), rng[0], rng[1])
+			r.fetchRangeBlocking(vc, int(donor), rng[0], rng[1])
+			select {
+			case <-vc.abort:
+				return false
+			default:
+			}
 		}
 	}
 
@@ -1627,6 +1642,7 @@ type fetchReq struct {
 	view       uint64
 	fetchID    uint64
 	installGen uint64
+	vc         *vcState
 	cancel     <-chan struct{}
 	done       chan bool
 }
@@ -1656,10 +1672,36 @@ func (r *Replica) enqueueFetch(peer int, from, to uint64, done chan bool) {
 	}
 }
 
-func (r *Replica) fetchRangeBlocking(peer int, from, to uint64) bool {
+func (r *Replica) fetchRangeBlocking(vc *vcState, peer int, from, to uint64) bool {
+	if peer < 0 || peer >= r.config.N || peer == r.idx || from > to {
+		return peer == r.idx || from > to
+	}
 	done := make(chan bool, 1)
-	r.enqueueFetch(peer, from, to, done)
-	return <-done
+	req := fetchReq{
+		peer:    peer,
+		from:    from,
+		to:      to,
+		view:    vc.view,
+		fetchID: r.fetchSeq.Add(1),
+		vc:      vc,
+		cancel:  vc.abort,
+		done:    done,
+	}
+	select {
+	case <-vc.abort:
+		return false
+	case r.fetchQ <- req:
+	default:
+		Warning("[%s] state-fetch queue full, dropping view-change request [%d,%d]",
+			r.self, from, to)
+		return false
+	}
+	select {
+	case ok := <-done:
+		return ok
+	case <-vc.abort:
+		return false
+	}
 }
 
 func (r *Replica) fetchRecoveryRange(rec *viewRecovery, from, to uint64) bool {
@@ -1715,6 +1757,12 @@ func (r *Replica) fetchActive(req fetchReq) bool {
 	}
 	if r.view() != req.view {
 		return false
+	}
+	if req.vc != nil {
+		r.mu.Lock()
+		active := r.fetchActiveLocked(req)
+		r.mu.Unlock()
+		return active
 	}
 	if req.installGen == 0 {
 		return true
@@ -1856,6 +1904,15 @@ func (r *Replica) applyStateEntries(m *BusNewState, req fetchReq) bool {
 func (r *Replica) fetchActiveLocked(req fetchReq) bool {
 	if r.view() != req.view {
 		return false
+	}
+	if req.vc != nil {
+		select {
+		case <-req.vc.abort:
+			return false
+		default:
+		}
+		return r.vc == req.vc && req.vc.view == req.view &&
+			r.status == statusViewChange
 	}
 	if req.installGen == 0 {
 		return true
