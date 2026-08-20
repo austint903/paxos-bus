@@ -1348,13 +1348,26 @@ func (r *Replica) durableRecordCursorLocked(slot uint64, e *globalEntry, logIdxs
 	r.durable.recordBus(slot, clientId, reqId, logIdxs, e.state == slotNoOp)
 }
 
+// executeLocked is a deliberate no-op standing in for the state-machine apply
+// step a real SMR replica performs. It runs under r.mu at the moment the cursor
+// commits the slot and the request is given its spot in the request log list,
+// immediately before the client ack is enqueued, so the commit path here has
+// the same shape it would with a real state machine behind it. A real
+// implementation would apply req.Op at logIndex and return a result, which
+// would ride back to the client in RequestReplyMessage.Result (nil today).
+func (r *Replica) executeLocked(req *RequestMessage, logIndex uint64) {
+}
+
 // appendBusToLogListLocked appends the slot's bus passengers to the request log
 // list, deduplicating across all buses: a request re-boarded after missing
 // quorum keeps the log index it was first assigned. It returns the ordered log
 // index of every passenger (duplicates included) so the caller can record which
 // indexes this bus covers, and persists each newly appended request to the
-// durable request log list. A reply is still enqueued for every passenger,
-// including duplicates, so clients short replies for quorum get them.
+// durable request log list. Each newly appended request is executed once as it
+// takes its spot; duplicates are not re-executed, but a reply is still enqueued
+// for every passenger, including duplicates, so clients short replies for
+// quorum get them. Once per append, that is: a rewind releases the index and
+// re-executes, as it does any speculative execution.
 func (r *Replica) appendBusToLogListLocked(slot uint64) []uint64 {
 	e := r.globalLog[slot]
 	if e == nil || e.state == slotNoOp {
@@ -1373,6 +1386,7 @@ func (r *Replica) appendBusToLogListLocked(slot uint64) []uint64 {
 			if r.reqListLog != nil {
 				r.reqListLog.recordReq(li, req.ClientId, req.RequestId, req.Op)
 			}
+			r.executeLocked(req, li)
 		}
 		logIdxs = append(logIdxs, li)
 		r.enqueueReply(req.ClientId, req.RequestId, slot, li)
