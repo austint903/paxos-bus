@@ -19,15 +19,13 @@ import (
 	"io"
 )
 
-// diskRecord covers all three shapes written to the bus log: an unbatched
-// request (req_id + op), a bus (bus + log_indexes) and a hole placeholder.
+// diskRecord covers bus records and hole placeholders.
 type diskRecord struct {
 	Slot       uint64   `json:"slot"`
 	Client     uint64   `json:"client"`
 	ReqId      uint64   `json:"req_id"`
 	Bus        *uint64  `json:"bus"`
 	LogIndexes []uint64 `json:"log_indexes"`
-	Op         string   `json:"op"`
 	NoOp       bool     `json:"noop"`
 	Pending    bool     `json:"pending"`
 }
@@ -158,13 +156,8 @@ func (r *Replica) readSlotFromDisk(slot uint64) (StateEntry, bool) {
 	}
 
 	if rec.Bus == nil {
-		// Unbatched request: the op is stored inline.
-		op, err := hex.DecodeString(rec.Op)
-		if err != nil {
-			return StateEntry{}, false
-		}
-		ent.Payload = op
-		return ent, true
+		Warning("[%s] bus-log record for slot %d has no bus identity", r.self, slot)
+		return StateEntry{}, false
 	}
 
 	reqs, ok := r.readRequestsFromDisk(rec.LogIndexes)

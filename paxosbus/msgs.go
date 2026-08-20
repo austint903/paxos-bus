@@ -38,8 +38,8 @@ func unmarshalRequests(p []byte) ([]RequestMessage, error) {
 
 const (
 	MsgBusSync uint8 = iota + 1
-	MsgBusRequest
-	MsgBusReply
+	_                // retired: direct, unbatched request
+	_                // retired: direct, unbatched reply
 	MsgBusGapRequest
 	MsgBusGapReply
 	MsgBusGapCommit
@@ -80,22 +80,6 @@ type BusSyncMessage struct {
 	IntervalMs uint64 // bus interval; expect msg n at FirstMsgNs + (n-1)*IntervalMs
 }
 
-type BusRequestMessage struct {
-	ClientId   uint64
-	RequestId  uint64
-	SendTimeNs uint64
-	Op         []byte
-}
-
-type BusReplyMessage struct {
-	ClientId   uint64
-	RequestId  uint64
-	LogSlotNum uint64
-	ViewId     uint64
-	ReplicaIdx uint32
-	Result     []byte
-}
-
 func (m *BusSyncMessage) New() fastrpc.Serializable {
 	return new(BusSyncMessage)
 }
@@ -116,74 +100,6 @@ func (m *BusSyncMessage) Unmarshal(wire io.Reader) error {
 	m.ClientId = binary.LittleEndian.Uint64(b[0:8])
 	m.FirstMsgNs = binary.LittleEndian.Uint64(b[8:16])
 	m.IntervalMs = binary.LittleEndian.Uint64(b[16:24])
-	return nil
-}
-
-func (m *BusRequestMessage) New() fastrpc.Serializable {
-	return new(BusRequestMessage)
-}
-
-func (m *BusRequestMessage) Marshal(wire io.Writer) {
-	var b [28]byte
-	binary.LittleEndian.PutUint64(b[0:8], m.ClientId)
-	binary.LittleEndian.PutUint64(b[8:16], m.RequestId)
-	binary.LittleEndian.PutUint64(b[16:24], m.SendTimeNs)
-	binary.LittleEndian.PutUint32(b[24:28], uint32(len(m.Op)))
-	wire.Write(b[:])
-	if len(m.Op) > 0 {
-		wire.Write(m.Op)
-	}
-}
-
-func (m *BusRequestMessage) Unmarshal(wire io.Reader) error {
-	var b [28]byte
-	if _, err := io.ReadFull(wire, b[:]); err != nil {
-		return err
-	}
-	m.ClientId = binary.LittleEndian.Uint64(b[0:8])
-	m.RequestId = binary.LittleEndian.Uint64(b[8:16])
-	m.SendTimeNs = binary.LittleEndian.Uint64(b[16:24])
-	opLen := binary.LittleEndian.Uint32(b[24:28])
-	m.Op = make([]byte, opLen)
-	if _, err := io.ReadFull(wire, m.Op); err != nil {
-		return err
-	}
-	return nil
-}
-
-func (m *BusReplyMessage) New() fastrpc.Serializable {
-	return new(BusReplyMessage)
-}
-
-func (m *BusReplyMessage) Marshal(wire io.Writer) {
-	var b [40]byte
-	binary.LittleEndian.PutUint64(b[0:8], m.ClientId)
-	binary.LittleEndian.PutUint64(b[8:16], m.RequestId)
-	binary.LittleEndian.PutUint64(b[16:24], m.LogSlotNum)
-	binary.LittleEndian.PutUint64(b[24:32], m.ViewId)
-	binary.LittleEndian.PutUint32(b[32:36], m.ReplicaIdx)
-	binary.LittleEndian.PutUint32(b[36:40], uint32(len(m.Result)))
-	wire.Write(b[:])
-	if len(m.Result) > 0 {
-		wire.Write(m.Result)
-	}
-}
-
-func (m *BusReplyMessage) Unmarshal(wire io.Reader) error {
-	var b [40]byte
-	if _, err := io.ReadFull(wire, b[:]); err != nil {
-		return err
-	}
-	m.ClientId = binary.LittleEndian.Uint64(b[0:8])
-	m.RequestId = binary.LittleEndian.Uint64(b[8:16])
-	m.LogSlotNum = binary.LittleEndian.Uint64(b[16:24])
-	m.ViewId = binary.LittleEndian.Uint64(b[24:32])
-	m.ReplicaIdx = binary.LittleEndian.Uint32(b[32:36])
-	resLen := binary.LittleEndian.Uint32(b[36:40])
-	m.Result = make([]byte, resLen)
-	if _, err := io.ReadFull(wire, m.Result); err != nil {
-		return err
-	}
 	return nil
 }
 
@@ -812,8 +728,7 @@ type BusGetState struct {
 }
 
 // StateEntry is one slot's content. Payload is the marshaled request list for a
-// bus (see marshalRequests) or the bare op for an unbatched request; a no-op
-// carries none.
+// bus (see marshalRequests); a no-op carries none.
 type StateEntry struct {
 	Slot     uint64
 	ClientId uint64

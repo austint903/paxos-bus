@@ -35,15 +35,15 @@ NUMERIC_TS = re.compile(r"^(\d{4})(\d{2})(\d{2})-(\d{2})(\d{2})(\d{2})-(\d{4}) \
 
 RE_CLIENT    = re.compile(r"\[Client (\d+)([^\]]*)\]")
 RE_REPLY     = re.compile(r"REPLY from replica=(\d+)\s+rtt=(\d+)us")
-# Request-generator (-r) REPLY line also carries the bus slot the request rode.
+# Each request REPLY line carries the bus slot the request rode.
 # Counting distinct bus_slot values gives the number of buses that actually
 # carried a (committed-or-not) passenger, i.e. the layer-1 throughput, while the
 # committed-request count is the layer-2 throughput. The ratio of the two is the
 # headline "~1000 requests per bus" batching factor.
 RE_REPLY_BUS = re.compile(r"req=\d+\s+bus_slot=(\d+)\s+log_index=\d+")
 RE_COMMITTED = re.compile(r"COMMITTED req=(\d+) slot=(\d+) rtt=(\d+)us total=(\d+)us attempts=(\d+)")
-# Request-generator (-r) COMMITTED line is keyed on log_index, not the bus slot,
-# and has no attempts field (retry granularity is the request, not the bus).
+# Each request COMMITTED line is keyed on log_index, not the bus slot, and has
+# no attempts field (retry granularity is the request, not the bus).
 RE_COMMITTED_R = re.compile(r"COMMITTED req=(\d+) log_index=(\d+) rtt=(\d+)us total=(\d+)us")
 RE_NOQUORUM  = re.compile(r"NO-QUORUM req=(\d+)")
 # -r retry is per request: requests that miss quorum re-board the next bus.
@@ -136,7 +136,7 @@ def main():
     send_fail = {}       # client -> ts of first failed send (≈ last successful send)
     totals = {}          # client -> [total_us] for requests with attempts > 1
     attempts = {}        # client -> count of NO-QUORUM resends
-    reboards = {}        # client -> count of requests re-boarded by per-request timeouts (-r)
+    reboards = {}        # client -> count of requests re-boarded by per-request timeouts
     sent_per_s = {}      # client -> [sent in each 1s window]
     drops = {}           # replica -> count
     gaps = {}            # replica -> count

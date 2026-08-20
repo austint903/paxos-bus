@@ -1380,7 +1380,6 @@ func (r *Replica) prepareRecoveryLocked(rec *viewRecovery, msg *BusStartView,
 	r.recomputeMaxSlotLocked()
 	for _, slot := range msg.NoOpSlots {
 		if r.setNoOpLocked(slot) {
-			r.durableAppendLocked(slot, nil, true)
 			r.winNoops++
 		}
 	}
@@ -1971,13 +1970,11 @@ func (r *Replica) applyStateEntries(m *BusNewState, req fetchReq) bool {
 		e := &m.Entries[i]
 		if e.IsNoOp {
 			if r.setNoOpLocked(e.Slot) {
-				r.durableAppendLocked(e.Slot, nil, true)
 				r.winNoops++
 			}
 			continue
 		}
 		if r.storeRecoveredLocked(e.Slot, e.ClientId, e.ReqId, e.Payload, e.IsBus) {
-			r.durableAppendLocked(e.Slot, e.Payload, false)
 			r.winRecovered++
 		}
 	}

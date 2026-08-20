@@ -11,11 +11,10 @@ import (
 func main() {
 	configPath := flag.String("c", "", "path to replica config file")
 	clientId := flag.Uint64("I", 0, "client ID (unique per client; 0-indexed)")
-	intervalMs := flag.Uint64("p", 1, "message interval in milliseconds (bus interval under -r)")
-	resendMs := flag.Uint64("t", 2000, "resend-on-no-quorum timeout in ms (per-request timeout under -r; 0 uses the 2000 ms default)")
+	intervalMs := flag.Uint64("p", 1, "bus interval in milliseconds")
+	resendMs := flag.Uint64("t", 2000, "per-request no-quorum re-board timeout in ms (0 uses the 2000 ms default)")
 	label := flag.String("l", "", "location label shown in every log line, e.g. asia-east1")
-	requestGen := flag.Bool("r", false, "request-generator mode: batch requests onto buses (two-layer log)")
-	genIntervalUs := flag.Uint64("g", 1, "request generation interval in microseconds (-r only)")
+	genIntervalUs := flag.Uint64("g", 500, "request generation interval in microseconds")
 	verbose := flag.Bool("v", false, "log every per-replica REPLY line (3 log writes per request at high rates; COMMITTED lines are always logged)")
 	startDelayMs := flag.Uint64("w", 5000, "delay in ms between sync and the data phase; every client must sync within this window")
 	maxOwdMs := flag.Float64("owd", 0, "max one-way delay to any replica in ms; buses depart this early so they arrive on the announced schedule (0 = auto-measure as max TCP dial RTT / 2)")
@@ -30,7 +29,7 @@ func main() {
 
 	if *configPath == "" || !idSet || *intervalMs == 0 {
 		fmt.Fprintf(os.Stderr,
-			"usage: %s -c <config-file> -I <client-id> [-p <interval-ms>] [-t <resend-ms>] [-l <label>] [-r] [-g <gen-us>]\n",
+			"usage: %s -c <config-file> -I <client-id> [-p <bus-interval-ms>] [-t <resend-ms>] [-l <label>] [-g <gen-us>]\n",
 			os.Args[0])
 		os.Exit(1)
 	}
@@ -42,7 +41,7 @@ func main() {
 	}
 
 	client := paxosbus.NewClient(config, *clientId, *intervalMs, *resendMs, *label,
-		*requestGen, *genIntervalUs, *verbose, *startDelayMs, *maxOwdMs)
+		*genIntervalUs, *verbose, *startDelayMs, *maxOwdMs)
 	if err := client.Connect(); err != nil {
 		fmt.Fprintf(os.Stderr, "cannot connect: %v\n", err)
 		os.Exit(1)

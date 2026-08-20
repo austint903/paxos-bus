@@ -176,7 +176,6 @@ func testReplica(idx int) *Replica {
 	cfg := &Config{N: 3, F: 1, Replicas: []string{"a:1", "b:2", "c:3"}}
 	r := NewReplica(cfg, idx, "", "", dropNone, 0, 0, RecoveryOptions{RetainSlots: 64})
 	r.clients[1] = &clientLine{baseNs: 0, intervalNs: ms}
-	r.busMode = true
 	return r
 }
 
@@ -1781,7 +1780,6 @@ func testReplicaN(idx, n, f int) *Replica {
 	}
 	r := NewReplica(cfg, idx, "", "", dropNone, 0, 0, RecoveryOptions{RetainSlots: 64})
 	r.clients[1] = &clientLine{baseNs: 0, intervalNs: ms}
-	r.busMode = true
 	return r
 }
 

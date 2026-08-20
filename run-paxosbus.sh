@@ -5,7 +5,7 @@ set -euo pipefail
 # Mirrors prevImplementation/run-paxosbus.sh minus the gap-agreement knobs.
 
 # ── Message rate and topology ───────────────────────────────────────────────
-MSG_INTERVAL_MS=1      # change this: 1000=1s  100=100ms  10=10ms  2=2ms  1=1ms (bus interval under -r)
+MSG_INTERVAL_MS=1      # change this: 1000=1s  100=100ms  10=10ms  2=2ms  1=1ms (bus interval)
 NUM_REPLICAS=3
 NUM_CLIENTS=2
 RESEND_MS=2000         # client resend-on-no-quorum timeout (ms; 0 uses the client default)
@@ -13,8 +13,7 @@ DURATION_S="${DURATION_S:-60}"  # seconds of data phase, then auto-stop; 0 = run
 SYNC_WARMUP_S=5        # client sync wait before data starts (matches syncStartDelayMs=5000)
 DROP_MODE=none         # artificial drop scenario: none|leader|followers|all
 DROP_EVERY=0           # drop a slot when reqId % DROP_EVERY == 0 (0 = disabled)
-REQUEST_GEN=0          # 1 = request-generator mode (-r): batch requests onto buses
-GEN_INTERVAL_US=1      # request generation interval in µs (-r only; -g 1 -p 1 ≈ 1000 reqs/bus)
+GEN_INTERVAL_US=500    # request generation interval in µs (-g 500 -p 1 ≈ 2 reqs/bus)
 KILL_AT_S=0            # kill the current leader this many seconds into the data phase (0 = never)
 KILL_COUNT=1           # how many successive leaders to kill (view 0 -> 1 -> 2 ...)
 RETAIN_SLOTS=16384     # committed slots kept in memory; smaller forces state transfer to read the durable log
@@ -24,12 +23,11 @@ GAP_RETRY_TIMEOUT_MS="${GAP_RETRY_TIMEOUT_MS:-1500}" # gap-commit rebroadcast in
 FORCE_BUILD=0
 
 usage() {
-    echo "Usage: $0 [-b] [-r] [-g <gen_us>] [-p <interval_ms>] [-t <resend_ms>] [-d <seconds>] [-D <drop_mode>] [-F <drop_every>] [-K <seconds>] [-N <kills>]"
+    echo "Usage: $0 [-b] [-g <gen_us>] [-p <interval_ms>] [-t <resend_ms>] [-d <seconds>] [-D <drop_mode>] [-F <drop_every>] [-K <seconds>] [-N <kills>]"
     echo "  -b            force rebuild of Docker image"
-    echo "  -r            request-generator mode: batch requests onto buses (two-layer log)"
-    echo "  -g <us>       request generation interval in µs (-r only; default: $GEN_INTERVAL_US)"
-    echo "  -p <ms>       message interval in ms (bus interval under -r) (default: $MSG_INTERVAL_MS)"
-    echo "  -t <ms>       client resend timeout; per-request under -r (default: $RESEND_MS)"
+	 echo "  -g <us>       request generation interval in µs (default: $GEN_INTERVAL_US)"
+	 echo "  -p <ms>       bus interval in ms (default: $MSG_INTERVAL_MS)"
+    echo "  -t <ms>       client no-quorum re-board timeout (default: $RESEND_MS)"
     echo "  -d <seconds>  auto-stop after this many seconds of data phase (default: run until Ctrl+C)"
     echo "  -D <mode>     artificial drop scenario: none|leader|followers|all (default: $DROP_MODE)"
     echo "  -F <n>        drop a slot when reqId % n == 0 (default: $DROP_EVERY, 0=off)"
@@ -40,10 +38,9 @@ usage() {
     exit 1
 }
 
-while getopts "brg:p:t:d:D:F:K:N:n:R:h" opt; do
+while getopts "bg:p:t:d:D:F:K:N:n:R:h" opt; do
     case $opt in
         b) FORCE_BUILD=1 ;;
-        r) REQUEST_GEN=1 ;;
         g) GEN_INTERVAL_US=$OPTARG ;;
         p) MSG_INTERVAL_MS=$OPTARG ;;
         t) RESEND_MS=$OPTARG ;;
@@ -130,11 +127,7 @@ if [[ "$DROP_MODE" != "none" && "$DROP_EVERY" -gt 0 ]]; then
 else
     echo "Mode: NORMAL (no artificial drops)"
 fi
-if [[ $REQUEST_GEN -eq 1 ]]; then
-    echo "Path: REQUEST-GEN (-r, gen=${GEN_INTERVAL_US}us, bus=${MSG_INTERVAL_MS}ms)"
-else
-    echo "Path: DEFAULT (one request per bus)"
-fi
+echo "Path: request generation (gen=${GEN_INTERVAL_US}us, bus=${MSG_INTERVAL_MS}ms)"
 echo ""
 
 # ── Per-run log directory (durable copy of every node's stream) ──────────────
@@ -150,7 +143,6 @@ mkdir -p "$RUN_LOG_DIR"
     echo "resend_ms=$RESEND_MS"
     echo "drop_mode=$DROP_MODE"
     echo "drop_every=$DROP_EVERY"
-    echo "request_gen=$REQUEST_GEN"
     echo "gen_interval_us=$GEN_INTERVAL_US"
     echo "gap_retry_timeout_ms=$GAP_RETRY_TIMEOUT_MS"
     echo "kill_at_s=$KILL_AT_S"
@@ -194,10 +186,7 @@ echo "Waiting 2s for replicas to bind..."
 sleep 2
 
 # ── Clients ───────────────────────────────────────────────────────────────────
-CLIENT_FLAGS=(-t "$RESEND_MS")
-if [[ $REQUEST_GEN -eq 1 ]]; then
-    CLIENT_FLAGS+=(-r -g "$GEN_INTERVAL_US")
-fi
+CLIENT_FLAGS=(-t "$RESEND_MS" -g "$GEN_INTERVAL_US")
 for i in $(seq 0 $((NUM_CLIENTS - 1))); do
     NAME="paxosbus-client-$i"
     IP="172.29.0.$((BASE_CLIENT_OCTET + i))"

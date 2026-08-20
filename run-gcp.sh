@@ -28,8 +28,7 @@ DROP_MODE="${DROP_MODE:-none}"   # artificial drop scenario: none|leader|followe
 DROP_EVERY="${DROP_EVERY:-0}"    # drop a slot when reqId % DROP_EVERY == 0 (0 = disabled)
 GAP_RETRY_TIMEOUT_MS="${GAP_RETRY_TIMEOUT_MS:-1500}" # gap-commit rebroadcast interval
 RESEND_MS="${RESEND_MS:-2000}" # client request re-board timeout
-REQUEST_GEN="${REQUEST_GEN:-0}"      # 1 = request-generator mode (= local -r)
-GEN_INTERVAL_US="${GEN_INTERVAL_US:-1}"  # request generation interval in µs (= local -g; REQUEST_GEN only)
+GEN_INTERVAL_US="${GEN_INTERVAL_US:-500}"  # request generation interval in µs
 
 CONTROLLER_VM="pb-controller"
 CONTROLLER_ZONE="us-east1-c"
@@ -93,7 +92,7 @@ set -euo pipefail
 : "${REPO_URL:?}" "${INTERVAL_MS:?}" "${DURATION_S:?}" "${DROP_MODE:?}" "${DROP_EVERY:?}"
 : "${GAP_RETRY_TIMEOUT_MS:?}"
 : "${RESEND_MS:?}"
-: "${REQUEST_GEN:?}" "${GEN_INTERVAL_US:?}"
+: "${GEN_INTERVAL_US:?}"
 : "${REPLICA0_VM:?}" "${REPLICA0_ZONE:?}" "${REPLICA0_IP:?}"
 : "${REPLICA1_VM:?}" "${REPLICA1_ZONE:?}" "${REPLICA1_IP:?}"
 : "${REPLICA2_VM:?}" "${REPLICA2_ZONE:?}" "${REPLICA2_IP:?}"
@@ -189,10 +188,7 @@ sleep 3
 
 echo "[ctrl] Launch 2 clients on $CLIENT_VM (asia) — pinging replicas"
 CLIENT_REGION="${CLIENT_ZONE%-*}"   # asia-east1-c -> asia-east1
-CLIENT_EXTRA=""
-if [[ "$REQUEST_GEN" == "1" ]]; then
-  CLIENT_EXTRA="-r -g $GEN_INTERVAL_US"
-fi
+CLIENT_EXTRA="-g $GEN_INTERVAL_US"
 for id in 1 2; do
   ssh_to "$CLIENT_VM" "$CLIENT_ZONE" "
     rm -f /tmp/paxosbus-client-$id.log
@@ -294,7 +290,6 @@ gcloud compute ssh "$CONTROLLER_VM" --zone="$CONTROLLER_ZONE" --quiet -- "
   DROP_EVERY='$DROP_EVERY' \
   GAP_RETRY_TIMEOUT_MS='$GAP_RETRY_TIMEOUT_MS' \
   RESEND_MS='$RESEND_MS' \
-  REQUEST_GEN='$REQUEST_GEN' \
   GEN_INTERVAL_US='$GEN_INTERVAL_US' \
   REPLICA0_VM='$REPLICA0_VM' REPLICA0_ZONE='$REPLICA0_ZONE' REPLICA0_IP='$REPLICA0_IP' \
   REPLICA1_VM='$REPLICA1_VM' REPLICA1_ZONE='$REPLICA1_ZONE' REPLICA1_IP='$REPLICA1_IP' \
@@ -319,7 +314,6 @@ gcloud compute scp --zone="$CONTROLLER_ZONE" --quiet --recurse \
   echo "drop_every=$DROP_EVERY"
   echo "gap_retry_timeout_ms=$GAP_RETRY_TIMEOUT_MS"
   echo "resend_ms=$RESEND_MS"
-  echo "request_gen=$REQUEST_GEN"
   echo "gen_interval_us=$GEN_INTERVAL_US"
   if [[ "$DROP_MODE" != "none" && "$DROP_EVERY" -gt 0 ]]; then
     echo "mode=drop-$DROP_MODE"

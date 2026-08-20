@@ -53,7 +53,7 @@ for g in $GENS; do
         step_log="$(mktemp)"
         rc=0
         SCALE=large CLIENTS_PER_HOST=3 INTERVAL_MS="$INTERVAL_MS" \
-            DURATION_S="$DURATION_S" REQUEST_GEN=1 GEN_INTERVAL_US="$g" \
+            DURATION_S="$DURATION_S" GEN_INTERVAL_US="$g" \
             "$SCRIPT_DIR/run-cloudlab.sh" >"$step_log" 2>&1 || rc=$?
 
         # collect() ends with '==> Done. Logs: <dir>  (durable ...)' — strip the tail

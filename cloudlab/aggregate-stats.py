@@ -16,8 +16,8 @@ Parses:
   replica-*.log          per-second "1s: received=" lines -> bus-message
                          delivery rate per replica + gap/noop/backlog health.
 
-Works on both request-gen (-r) runs (log_index commits) and plain runs
-(slot commits): anything with "COMMITTED ... total=<n>us" counts.
+Parses bus-mode request commits (log_index commits): anything with
+"COMMITTED ... total=<n>us" counts.
 """
 
 import glob

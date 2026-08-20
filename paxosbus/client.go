@@ -17,8 +17,8 @@ const (
 )
 
 // requestOp is the per-request payload: "hello" plus 12 random pad bytes so
-// the on-wire request (28-byte header + 17-byte op = 45 bytes) matches the
-// 45-byte swiftpaxos Propose that the paxos/epaxos baselines send
+// each request carried by a bus (28-byte header + 17-byte op = 45 bytes)
+// matches the 45-byte swiftpaxos Propose that the paxos/epaxos baselines send
 // (commandsize 16). Shared across requests; never mutated after init.
 var requestOp = func() []byte {
 	op := make([]byte, 17)
@@ -40,16 +40,6 @@ type voteKey struct {
 	viewId   uint64
 }
 
-type inflightEntry struct {
-	sendTimeNs      int64
-	firstSendTimeNs int64
-	masks           map[uint64]uint32 // viewId -> replicas that replied in it
-	replyCount      int
-	origReqId       uint64
-	attempts        uint32
-	committed       bool
-}
-
 type reqInflight struct {
 	sendTimeNs  int64
 	firstSendNs int64
@@ -63,14 +53,6 @@ const gcCommittedNs = 2 * int64(time.Second)
 type lockedWriter struct {
 	mu sync.Mutex
 	w  *bufio.Writer
-}
-
-func (lw *lockedWriter) send(code uint8, msg *BusRequestMessage) error {
-	lw.mu.Lock()
-	defer lw.mu.Unlock()
-	lw.w.WriteByte(code)
-	msg.Marshal(lw.w)
-	return lw.w.Flush()
 }
 
 func (lw *lockedWriter) sendMsg(code uint8, msg wireMsg) error {
@@ -159,7 +141,6 @@ type Client struct {
 	resendMs   uint64
 	self       string
 
-	requestGen    bool
 	genIntervalUs uint64
 	reqTimeoutNs  int64
 	verbose       bool
@@ -180,9 +161,7 @@ type Client struct {
 	writers    []*lockedWriter
 	busSenders []*connSender
 
-	mu        sync.Mutex
-	inflight  map[uint64]*inflightEntry
-	requestId uint64
+	mu sync.Mutex
 
 	pendingMu sync.Mutex
 	pending   []RequestMessage
@@ -204,7 +183,7 @@ type Client struct {
 }
 
 func NewClient(config *Config, clientId, intervalMs, resendMs uint64, label string,
-	requestGen bool, genIntervalUs uint64, verbose bool, startDelayMs uint64,
+	genIntervalUs uint64, verbose bool, startDelayMs uint64,
 	maxOwdMs float64) *Client {
 	self := "Client " + strconv.FormatUint(clientId, 10)
 	if label != "" {
@@ -222,7 +201,6 @@ func NewClient(config *Config, clientId, intervalMs, resendMs uint64, label stri
 		intervalMs:    intervalMs,
 		resendMs:      resendMs,
 		self:          self,
-		requestGen:    requestGen,
 		genIntervalUs: genIntervalUs,
 		reqTimeoutNs:  int64(resendMs) * 1e6,
 		verbose:       verbose,
@@ -233,25 +211,16 @@ func NewClient(config *Config, clientId, intervalMs, resendMs uint64, label stri
 		readers:       make([]*bufio.Reader, config.N),
 		writers:       make([]*lockedWriter, config.N),
 		busSenders:    make([]*connSender, config.N),
-		inflight:      make(map[uint64]*inflightEntry),
 		rInflight:     make(map[uint64]*reqInflight),
 	}
 	resend := ""
 	if resendMs > 0 {
 		resend = "  resend=on"
 	}
-	if requestGen {
-		Notice("[%s] started  request-gen  gen=%dus  bus=%dms  replicas=%d  f=%d  quorum=%d (f+1, must include leader)%s",
-			c.self, genIntervalUs, intervalMs, config.N, config.F, config.QuorumSize(), resend)
-		if resendMs > 0 {
-			Notice("[%s] req-timeout=%dms", c.self, resendMs)
-		}
-		return c
-	}
-	Notice("[%s] started  interval=%dms  replicas=%d  f=%d  quorum=%d (f+1, must include leader)%s",
-		c.self, intervalMs, config.N, config.F, config.QuorumSize(), resend)
+	Notice("[%s] started  request-gen  gen=%dus  bus=%dms  replicas=%d  f=%d  quorum=%d (f+1, must include leader)%s",
+		c.self, genIntervalUs, intervalMs, config.N, config.F, config.QuorumSize(), resend)
 	if resendMs > 0 {
-		Notice("[%s] resend-on-no-quorum timeout=%dms", c.self, resendMs)
+		Notice("[%s] req-timeout=%dms", c.self, resendMs)
 	}
 	return c
 }
@@ -338,26 +307,14 @@ func (c *Client) Run() {
 		time.Sleep(time.Duration(sleep))
 	}
 
-	if c.requestGen {
-		Notice("[%s] sync wait done, starting request-gen data phase (gen=%dus bus=%dms)",
-			c.self, c.genIntervalUs, c.intervalMs)
-		if c.reqTimeoutNs > 0 {
-			go c.reqTimeoutLoop()
-		}
-		go c.janitorLoop()
-		go c.genLoop()
-		c.busLoop()
-		return
-	}
-
-	Notice("[%s] sync wait done, starting open-loop data phase (interval=%dms)",
-		c.self, c.intervalMs)
-
-	if c.resendMs > 0 {
-		go c.resendLoop()
+	Notice("[%s] sync wait done, starting request-gen data phase (gen=%dus bus=%dms)",
+		c.self, c.genIntervalUs, c.intervalMs)
+	if c.reqTimeoutNs > 0 {
+		go c.reqTimeoutLoop()
 	}
 	go c.janitorLoop()
-	c.sendLoop()
+	go c.genLoop()
+	c.busLoop()
 }
 
 // genLoop produces requests at a fixed rate into c.pending, stamping SendTimeNs
@@ -517,56 +474,10 @@ func (c *Client) reqTimeoutLoop() {
 	}
 }
 
-// sendLoop is the open-loop mode, sending one unbatched request per interval on
-// the same schedule busLoop uses
-func (c *Client) sendLoop() {
-	c.runOnSchedule(c.firstSendWallNs(), int64(c.intervalMs)*1e6, func() {
-		c.mu.Lock()
-		c.requestId++
-		reqId := c.requestId
-		c.mu.Unlock()
-		c.sendRequest(reqId, reqId, 0, 1)
-	})
-}
-
-// sendRequest sends one request to every replica, keeping origReqId and attempts
-// across resends so that latency is still measured from the first attempt
-func (c *Client) sendRequest(reqId, origReqId uint64, firstSendNs int64, attempts uint32) {
-	now := nowNs()
-	if firstSendNs == 0 {
-		firstSendNs = now
-	}
-	c.mu.Lock()
-	c.inflight[reqId] = &inflightEntry{
-		sendTimeNs:      now,
-		firstSendTimeNs: firstSendNs,
-		masks:           make(map[uint64]uint32),
-		origReqId:       origReqId,
-		attempts:        attempts,
-	}
-	c.winSent++
-	c.mu.Unlock()
-
-	msg := BusRequestMessage{
-		ClientId:   c.clientId,
-		RequestId:  reqId,
-		SendTimeNs: uint64(now),
-		Op:         requestOp,
-	}
-	for i, lw := range c.writers {
-		if err := lw.send(MsgBusRequest, &msg); err != nil {
-			Warning("[%s] send to replica %d failed: %v", c.self, i, err)
-		}
-	}
-}
-
 // receiveLoop reads replies from one replica, with one goroutine per connection
 func (c *Client) receiveLoop(rid int) {
 	reader := c.readers[rid]
-	var (
-		busReply BusReplyMessage
-		reqReply RequestReplyMessage
-	)
+	var reqReply RequestReplyMessage
 	for {
 		msgType, err := reader.ReadByte()
 		if err != nil {
@@ -574,12 +485,6 @@ func (c *Client) receiveLoop(rid int) {
 			return
 		}
 		switch msgType {
-		case MsgBusReply:
-			if err := busReply.Unmarshal(reader); err != nil {
-				Warning("[%s] bad reply from replica %d: %v", c.self, rid, err)
-				return
-			}
-			c.handleBusReply(&busReply)
 		case MsgRequestReply:
 			if err := reqReply.Unmarshal(reader); err != nil {
 				Warning("[%s] bad request reply from replica %d: %v", c.self, rid, err)
@@ -652,114 +557,11 @@ func (c *Client) handleRequestReply(msg *RequestReplyMessage) {
 	}
 }
 
-// handleBusReply counts one replica's vote for a bus, where the bitmask makes
-// duplicate replies idempotent
-func (c *Client) handleBusReply(msg *BusReplyMessage) {
-	now := nowNs()
-
-	c.mu.Lock()
-	e, ok := c.inflight[msg.RequestId]
-	if !ok {
-		c.mu.Unlock()
-		return
-	}
-	bit := uint32(1) << msg.ReplicaIdx
-	mask := e.masks[msg.ViewId]
-	if mask&bit != 0 {
-		c.mu.Unlock()
-		return
-	}
-	mask |= bit
-	e.masks[msg.ViewId] = mask
-	e.replyCount++
-	replyRttUs := (now - e.sendTimeNs) / 1000
-
-	justCommitted := !e.committed && c.quorumReached(mask, msg.ViewId)
-	var rttUs, totalUs int64
-	var origReqId uint64
-	var attempts uint32
-	if justCommitted {
-		e.committed = true
-		rttUs = (now - e.sendTimeNs) / 1000
-		totalUs = (now - e.firstSendTimeNs) / 1000
-		origReqId, attempts = e.origReqId, e.attempts
-		c.recordCommitLocked(rttUs)
-	}
-	postQuorum := 0
-	if e.committed && !justCommitted {
-		postQuorum = 1
-	}
-	if e.replyCount >= c.config.N {
-		delete(c.inflight, msg.RequestId)
-	}
-	c.mu.Unlock()
-
-	if c.verbose {
-		Notice("[%s] REPLY from replica=%d  rtt=%dus  req=%d  slot=%d  post_quorum=%d",
-			c.self, msg.ReplicaIdx, replyRttUs, msg.RequestId, msg.LogSlotNum, postQuorum)
-	}
-	if justCommitted {
-		Notice("[%s] COMMITTED req=%d slot=%d rtt=%dus total=%dus attempts=%d",
-			c.self, origReqId, msg.LogSlotNum, rttUs, totalUs, attempts)
-	}
-}
-
-func (c *Client) resendLoop() {
-	resendNs := int64(c.resendMs) * 1e6
-	tick := time.Duration(c.resendMs) * time.Millisecond / 4
-	if tick < time.Millisecond {
-		tick = time.Millisecond
-	}
-	ticker := time.NewTicker(tick)
-	for range ticker.C {
-		now := nowNs()
-		type resend struct {
-			oldReqId, newReqId, origReqId uint64
-			firstSendNs                   int64
-			attempts                      uint32
-			totalResends                  uint64
-		}
-		var expired []resend
-
-		c.mu.Lock()
-		for reqId, e := range c.inflight {
-			if e.committed {
-				continue
-			}
-			if now-e.sendTimeNs < resendNs {
-				continue
-			}
-			c.requestId++
-			newReqId := c.requestId
-			c.resendCount++
-			c.winResends++
-			expired = append(expired, resend{
-				oldReqId: reqId, newReqId: newReqId, origReqId: e.origReqId,
-				firstSendNs: e.firstSendTimeNs, attempts: e.attempts,
-				totalResends: c.resendCount,
-			})
-			delete(c.inflight, reqId)
-		}
-		c.mu.Unlock()
-
-		for _, rs := range expired {
-			Notice("[%s] NO-QUORUM req=%d  resending as req=%d  attempt=%d  total_resends=%d",
-				c.self, rs.oldReqId, rs.newReqId, rs.attempts+1, rs.totalResends)
-			c.sendRequest(rs.newReqId, rs.origReqId, rs.firstSendNs, rs.attempts+1)
-		}
-	}
-}
-
 func (c *Client) janitorLoop() {
 	ticker := time.NewTicker(500 * time.Millisecond)
 	for range ticker.C {
 		now := nowNs()
 		c.mu.Lock()
-		for seq, e := range c.inflight {
-			if e.committed && now-e.sendTimeNs >= gcCommittedNs {
-				delete(c.inflight, seq)
-			}
-		}
 		for rid, e := range c.rInflight {
 			if e.committed && now-e.sendTimeNs >= gcCommittedNs {
 				delete(c.rInflight, rid)
@@ -773,10 +575,7 @@ func (c *Client) emitStats() {
 	c.mu.Lock()
 	sent, committed, resends := c.winSent, c.winCommitted, c.winResends
 	rttSum := c.winRttSumUs
-	inflight := len(c.inflight)
-	if c.requestGen {
-		inflight = len(c.rInflight)
-	}
+	inflight := len(c.rInflight)
 	cumCommitted, cumRttSum := c.committedCount, c.totalRttUs
 	c.winSent, c.winCommitted, c.winResends, c.winRttSumUs = 0, 0, 0, 0
 	c.mu.Unlock()

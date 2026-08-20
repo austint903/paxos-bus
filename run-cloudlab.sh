@@ -47,7 +47,7 @@ set -euo pipefail
 #   ./run-cloudlab.sh setup                  # (re)run setup.sh on all nodes, then exit
 #
 # Env knobs (mirror run-gcp.sh):
-#   INTERVAL_MS DURATION_S DROP_MODE DROP_EVERY REQUEST_GEN GEN_INTERVAL_US
+#   INTERVAL_MS DURATION_S DROP_MODE DROP_EVERY GEN_INTERVAL_US
 #   GAP_RETRY_TIMEOUT_MS             gap-commit rebroadcast interval (default 1500)
 #   SCALE=small|large           same as --scale (flag wins)
 #   NUM_CLIENTS                 [small] clients on the client cluster (default 1)
@@ -72,7 +72,6 @@ INTERVAL_MS="${INTERVAL_MS:-1}"
 DURATION_S="${DURATION_S:-60}"
 DROP_MODE="${DROP_MODE:-none}"
 DROP_EVERY="${DROP_EVERY:-0}"
-REQUEST_GEN="${REQUEST_GEN:-1}"
 GEN_INTERVAL_US="${GEN_INTERVAL_US:-500}"
 GAP_RETRY_TIMEOUT_MS="${GAP_RETRY_TIMEOUT_MS:-1500}"
 NUM_CLIENTS="${NUM_CLIENTS:-1}"
@@ -441,9 +440,7 @@ launch() {
     # parallel: every client must send its sync inside every other client's
     # START_DELAY_MS window (slot mapping diverges otherwise), so the launch
     # spread has to stay well under it — sequential ssh per client did not.
-    local extra=""
-    [[ "$REQUEST_GEN" == "1" ]] && extra="-r -g $GEN_INTERVAL_US"
-    extra="$extra -t $RESEND_MS"
+    local extra="-g $GEN_INTERVAL_US -t $RESEND_MS"
     local pos cpids=()
     for pos in "${!CLIENT_HOST_IDXS[@]}"; do
         local ridx="${CLIENT_HOST_IDXS[$pos]}"
@@ -591,8 +588,7 @@ collect() {
         echo "resend_ms=$RESEND_MS"
         echo "drop_mode=$DROP_MODE"
         echo "drop_every=$DROP_EVERY"
-        echo "request_gen=$REQUEST_GEN"
-        echo "gen_interval_us=$GEN_INTERVAL_US"
+		echo "gen_interval_us=$GEN_INTERVAL_US"
         echo "gap_retry_timeout_ms=$GAP_RETRY_TIMEOUT_MS"
         echo "client_hosts=$(for pos in "${!CLIENT_HOST_IDXS[@]}"; do printf '%s ' "${RLABEL[${CLIENT_HOST_IDXS[$pos]}]}"; done)"
         echo "replicas=${RLABEL[*]}"
