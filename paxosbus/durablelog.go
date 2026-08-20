@@ -114,8 +114,9 @@ func recordBody(slot, clientId, reqId uint64, op []byte, noop bool) string {
 // busRecordBody is one line of the BusMessage Log: which bus occupies this
 // global slot and which request-log-list indexes its passengers map to. The
 // request payloads themselves live in the separate request log list (see
-// reqListRecordBody); the bus log only references them by index, so a request
-// carried by several buses (re-boarded after missing quorum) is stored once.
+// reqListRecordBody); the bus log only references them by index. A request
+// carried by several buses (re-boarded after missing quorum) is appended once
+// per bus, so the same request appears at several indexes, one per arrival.
 func busRecordBody(slot, clientId, busSeq uint64, logIdxs []uint64, noop bool) string {
 	var sb strings.Builder
 	fmt.Fprintf(&sb, "{\"slot\":%d,\"client\":%d,\"bus\":%d,\"log_indexes\":[", slot, clientId, busSeq)
@@ -129,9 +130,11 @@ func busRecordBody(slot, clientId, busSeq uint64, logIdxs []uint64, noop bool) s
 	return sb.String()
 }
 
-// reqListRecordBody is one line of the Request Log List: the deduplicated
-// request stored at log_index. Appended in strict log-index order, so the file
-// is contiguous (no holes) unlike the slot-indexed bus/global logs.
+// reqListRecordBody is one line of the Request Log List: the request stored at
+// log_index. Appended in strict log-index order, so the file is contiguous (no
+// holes) unlike the slot-indexed bus/global logs. One line per arrival, not per
+// distinct request — a re-boarded request is recorded again at its new index,
+// and only its execution is deduplicated (see appendBusToLogListLocked).
 func reqListRecordBody(logIndex, clientId, reqId uint64, op []byte) string {
 	return fmt.Sprintf(
 		"{\"log_index\":%d,\"client\":%d,\"req_id\":%d,\"len\":%d,\"op\":\"%s\"}",

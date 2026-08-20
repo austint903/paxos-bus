@@ -48,10 +48,11 @@ type globalEntry struct {
 	isBus    bool
 	ownerSet bool // clientId/reqId hold this slot's real owner (client id 0 is valid)
 
-	// [logIdxLo, logIdxHi) are the request-log-list indexes this slot was the
-	// first to assign, filled in when the cursor executes it. Reclaiming the
-	// slot releases exactly those dedup entries, and no others — a passenger
-	// that had already been given an index by an earlier bus keeps it.
+	// [logIdxLo, logIdxHi) are the request-log-list indexes this slot appended,
+	// one per passenger, filled in when the cursor executes it. Reclaiming the
+	// slot releases exactly the dedup entries first assigned in that range, and
+	// no others — a re-boarded passenger's entry stays with the slot it first
+	// arrived on, which is the one that executed it.
 	logIdxLo uint64
 	logIdxHi uint64
 
@@ -1350,7 +1351,7 @@ func (r *Replica) durableRecordCursorLocked(slot uint64, e *globalEntry, logIdxs
 
 // executeLocked is a deliberate no-op standing in for the state-machine apply
 // step a real SMR replica performs. It runs under r.mu at the moment the cursor
-// commits the slot and the request is given its spot in the request log list,
+// commits the slot and the request first takes a spot in the request log list,
 // immediately before the client ack is enqueued, so the commit path here has
 // the same shape it would with a real state machine behind it. A real
 // implementation would apply req.Op at logIndex and return a result, which
@@ -1359,15 +1360,22 @@ func (r *Replica) executeLocked(req *RequestMessage, logIndex uint64) {
 }
 
 // appendBusToLogListLocked appends the slot's bus passengers to the request log
-// list, deduplicating across all buses: a request re-boarded after missing
-// quorum keeps the log index it was first assigned. It returns the ordered log
-// index of every passenger (duplicates included) so the caller can record which
-// indexes this bus covers, and persists each newly appended request to the
-// durable request log list. Each newly appended request is executed once as it
-// takes its spot; duplicates are not re-executed, but a reply is still enqueued
-// for every passenger, including duplicates, so clients short replies for
-// quorum get them. Once per append, that is: a rewind releases the index and
-// re-executes, as it does any speculative execution.
+// list. Every passenger takes its own spot, duplicates included: the list is the
+// record of what arrived and in what order, so a request re-boarded after
+// missing quorum is appended again rather than folded into its first entry. It
+// returns the ordered log index of every passenger so the caller can record
+// which indexes this bus covers, and persists each one to the durable request
+// log list.
+//
+// Deduplication happens at execution instead. dedup remembers the index a
+// request first landed at, so a re-board is appended and acked but not executed
+// a second time — the state machine applies each command once, which is the only
+// place the distinction can be observed.
+//
+// The ack carries the index the request executed at, not the spot just appended.
+// A re-board occupies several spots and only the first one ran, and it is what
+// lets a client's votes add up: it counts replies per log index, so a re-board
+// earns its quorum together with the attempt before it (see voteKey, client.go).
 func (r *Replica) appendBusToLogListLocked(slot uint64) []uint64 {
 	e := r.globalLog[slot]
 	if e == nil || e.state == slotNoOp {
@@ -1378,18 +1386,21 @@ func (r *Replica) appendBusToLogListLocked(slot uint64) []uint64 {
 	for i := range e.requests {
 		req := &e.requests[i]
 		key := reqKey{req.ClientId, req.RequestId}
-		li, ok := r.dedup[key]
-		if !ok {
-			li = r.nextLogIndex
-			r.nextLogIndex++
+		li := r.nextLogIndex
+		r.nextLogIndex++
+		if r.reqListLog != nil {
+			r.reqListLog.recordReq(li, req.ClientId, req.RequestId, req.Op)
+		}
+		execIdx, seen := r.dedup[key]
+		if !seen {
+			// First arrival: this spot is where the request executes, and the
+			// one every later re-board of it is acked against.
 			r.dedup[key] = li
-			if r.reqListLog != nil {
-				r.reqListLog.recordReq(li, req.ClientId, req.RequestId, req.Op)
-			}
+			execIdx = li
 			r.executeLocked(req, li)
 		}
 		logIdxs = append(logIdxs, li)
-		r.enqueueReply(req.ClientId, req.RequestId, slot, li)
+		r.enqueueReply(req.ClientId, req.RequestId, slot, execIdx)
 	}
 	e.logIdxHi = r.nextLogIndex
 	return logIdxs
