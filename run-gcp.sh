@@ -7,7 +7,7 @@ set -euo pipefail
 #
 # Optional: REPO_URL (default github.com/austint903/paxos-bus.git),
 #           INTERVAL_MS (default 1), DURATION_S (default 60),
-#           GAP_RETRY_TIMEOUT_MS (default 1500)
+#           GAP_RETRY_TIMEOUT_MS (default 1500), RESEND_MS (default 2000)
 #
 # Architecture:
 #   pb-controller  (us-east1-c, external IP)  → jump host / orchestrator
@@ -27,6 +27,7 @@ DURATION_S="${DURATION_S:-60}"
 DROP_MODE="${DROP_MODE:-none}"   # artificial drop scenario: none|leader|followers|all
 DROP_EVERY="${DROP_EVERY:-0}"    # drop a slot when reqId % DROP_EVERY == 0 (0 = disabled)
 GAP_RETRY_TIMEOUT_MS="${GAP_RETRY_TIMEOUT_MS:-1500}" # gap-commit rebroadcast interval
+RESEND_MS="${RESEND_MS:-2000}" # client request re-board timeout
 REQUEST_GEN="${REQUEST_GEN:-0}"      # 1 = request-generator mode (= local -r)
 GEN_INTERVAL_US="${GEN_INTERVAL_US:-1}"  # request generation interval in µs (= local -g; REQUEST_GEN only)
 
@@ -91,6 +92,7 @@ set -euo pipefail
 
 : "${REPO_URL:?}" "${INTERVAL_MS:?}" "${DURATION_S:?}" "${DROP_MODE:?}" "${DROP_EVERY:?}"
 : "${GAP_RETRY_TIMEOUT_MS:?}"
+: "${RESEND_MS:?}"
 : "${REQUEST_GEN:?}" "${GEN_INTERVAL_US:?}"
 : "${REPLICA0_VM:?}" "${REPLICA0_ZONE:?}" "${REPLICA0_IP:?}"
 : "${REPLICA1_VM:?}" "${REPLICA1_ZONE:?}" "${REPLICA1_IP:?}"
@@ -196,7 +198,7 @@ for id in 1 2; do
     rm -f /tmp/paxosbus-client-$id.log
     cd \$HOME/paxosbus
     nohup ./paxosbus-client \
-      -c paxosbus.conf -I $id -p $INTERVAL_MS -l $CLIENT_REGION $CLIENT_EXTRA \
+      -c paxosbus.conf -I $id -p $INTERVAL_MS -t $RESEND_MS -l $CLIENT_REGION $CLIENT_EXTRA \
       </dev/null >/tmp/paxosbus-client-$id.log 2>&1 &
     disown
     sleep 1
@@ -291,6 +293,7 @@ gcloud compute ssh "$CONTROLLER_VM" --zone="$CONTROLLER_ZONE" --quiet -- "
   DROP_MODE='$DROP_MODE' \
   DROP_EVERY='$DROP_EVERY' \
   GAP_RETRY_TIMEOUT_MS='$GAP_RETRY_TIMEOUT_MS' \
+  RESEND_MS='$RESEND_MS' \
   REQUEST_GEN='$REQUEST_GEN' \
   GEN_INTERVAL_US='$GEN_INTERVAL_US' \
   REPLICA0_VM='$REPLICA0_VM' REPLICA0_ZONE='$REPLICA0_ZONE' REPLICA0_IP='$REPLICA0_IP' \
@@ -315,6 +318,7 @@ gcloud compute scp --zone="$CONTROLLER_ZONE" --quiet --recurse \
   echo "drop_mode=$DROP_MODE"
   echo "drop_every=$DROP_EVERY"
   echo "gap_retry_timeout_ms=$GAP_RETRY_TIMEOUT_MS"
+  echo "resend_ms=$RESEND_MS"
   echo "request_gen=$REQUEST_GEN"
   echo "gen_interval_us=$GEN_INTERVAL_US"
   if [[ "$DROP_MODE" != "none" && "$DROP_EVERY" -gt 0 ]]; then

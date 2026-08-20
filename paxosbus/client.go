@@ -11,7 +11,10 @@ import (
 	"time"
 )
 
-const defaultStartDelayMs = 5000
+const (
+	defaultStartDelayMs     = 5000
+	defaultRequestTimeoutMs = 2000
+)
 
 // requestOp is the per-request payload: "hello" plus 12 random pad bytes so
 // the on-wire request (28-byte header + 17-byte op = 45 bytes) matches the
@@ -209,6 +212,9 @@ func NewClient(config *Config, clientId, intervalMs, resendMs uint64, label stri
 	}
 	if startDelayMs == 0 {
 		startDelayMs = defaultStartDelayMs
+	}
+	if resendMs == 0 {
+		resendMs = defaultRequestTimeoutMs
 	}
 	c := &Client{
 		config:        config,

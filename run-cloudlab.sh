@@ -55,7 +55,7 @@ set -euo pipefail
 #   CLIENT_REPLICA              [small] which replica's cluster runs the clients;
 #                               must be a non-leader (1 or 2, default 1)
 #   RESEND_MS                   per-request no-quorum re-board timeout, ms
-#                               (default 5000 — deliberately large, drops are rare)
+#                               (default 2000; 0 uses the client default)
 #   START_DELAY_MS              client sync->data-phase delay (default 5000 small /
 #                               10000 large). EVERY client must sync inside this
 #                               window at ALL replicas or the slot mapping diverges,
@@ -77,7 +77,7 @@ GEN_INTERVAL_US="${GEN_INTERVAL_US:-500}"
 GAP_RETRY_TIMEOUT_MS="${GAP_RETRY_TIMEOUT_MS:-1500}"
 NUM_CLIENTS="${NUM_CLIENTS:-1}"
 CLIENTS_PER_HOST="${CLIENTS_PER_HOST:-3}"
-RESEND_MS="${RESEND_MS:-5000}"
+RESEND_MS="${RESEND_MS:-2000}"
 SCALE="${SCALE:-small}"
 TRANSPORT="${TRANSPORT:-direct}"
 # Failure-recovery experiment: SIGKILL the leader replica this many seconds into
@@ -443,7 +443,7 @@ launch() {
     # spread has to stay well under it — sequential ssh per client did not.
     local extra=""
     [[ "$REQUEST_GEN" == "1" ]] && extra="-r -g $GEN_INTERVAL_US"
-    [[ "$RESEND_MS" != "0" ]] && extra="$extra -t $RESEND_MS"
+    extra="$extra -t $RESEND_MS"
     local pos cpids=()
     for pos in "${!CLIENT_HOST_IDXS[@]}"; do
         local ridx="${CLIENT_HOST_IDXS[$pos]}"
