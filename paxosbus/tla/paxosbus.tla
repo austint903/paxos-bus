@@ -24,6 +24,8 @@ CONSTANTS MBus,
           MSyncPrepare,   
           MSyncRep,      
           MSyncCommit,    
+          MGetState,
+          MNewState,
           MViewChangeReq, 
           MViewChange,    
           MStartView     
@@ -120,6 +122,23 @@ Logs == [ Slots -> LogValues ]
         sender   |-> r \in Replicas,
         viewID   |-> v \in ViewIDs,
         slot     |-> s \in Slots ]
+
+  GetState                                 \* replica -> leader, asks for [from, to]
+      [ mtype    |-> MGetState,
+        dest     |-> r \in Replicas,
+        sender   |-> r \in Replicas,
+        viewID   |-> v \in ViewIDs,
+        from     |-> s \in 1..(NumSlots+1),
+        to       |-> s \in 0..NumSlots ]
+
+  NewState                                 \* leader -> replica, answers a GetState
+      [ mtype    |-> MNewState,
+        dest     |-> r \in Replicas,
+        sender   |-> r \in Replicas,
+        viewID   |-> v \in ViewIDs,
+        from     |-> s \in 1..(NumSlots+1),
+        to       |-> s \in 0..NumSlots,
+        log      |-> l \in Logs ]
 
   ViewChangeReq
       [ mtype    |-> MViewChangeReq,
@@ -352,7 +371,7 @@ ExecuteSlot(r) ==
 (* `^\textbf{Gap Recovery Handlers}^' *)
 
 \* Replica detecting a gap and then asking leader for it
-AskLeaderForGap(r, s) ==w
+AskLeaderForGap(r, s) ==
   /\ vReplicaStatus[r] = StNormal
   /\ r # Leader(vViewID[r])
   /\ vLog[r][s] = Empty
@@ -489,7 +508,7 @@ StartSync(r) ==
 
 \* Non leader replica receieves the sync message from leader and its log is 
 \* at least up to the slot the leader synced with (k). It then sends reply
-HandleSyncPrepare(r, m) ==
+ReplyToSyncPrepare(r, m) ==
   /\ vReplicaStatus[r] = StNormal
   /\ m.viewID = vViewID[r]
   /\ m.sender = Leader(vViewID[r])
@@ -502,19 +521,23 @@ HandleSyncPrepare(r, m) ==
              slot   |-> m.slot ]})
   /\ UNCHANGED << replicaVars, clientVars >>
 
-\* After getting heartbeat, it is behind so it fetches prefix from the leader to catch up
-FetchSyncPrefix(r, m) ==
+\* After getting heartbeat, it is behind so it asks the leader for the missing range.
+\* The prefix arrives with mnewstate from leader
+RequestSyncPrefix(r, m) ==
   /\ vReplicaStatus[r] = StNormal
   /\ m.viewID = vViewID[r]
   /\ m.sender = Leader(vViewID[r])
   /\ vNextExpected[r] - 1 < m.slot
-  /\ \E s \in vNextExpected[r]..m.slot : vLog[r][s] = Empty
-  /\ vLog' = [ vLog EXCEPT ![r] = FillMissing(@, m.log, m.slot) ]
-  /\ UNCHANGED << vNextExpected, vReplicaStatus, vViewID, vLastNormView,
-                  syncVars, vcVars, gapVars, networkVars, clientVars >>
+  /\ Send({[ mtype  |-> MGetState,
+             dest   |-> m.sender,
+             sender |-> r,
+             viewID |-> m.viewID,
+             from   |-> vNextExpected[r],
+             to     |-> m.slot ]})
+  /\ UNCHANGED << replicaVars, clientVars >>
 
-\* Repairs replica r's log when mismatch with the leader's log, starts from prefix up to K (commit point)
-\* and rebuilds log from there
+\* Repairs replica r's log when mismatch with the leader's log, rewinds to K (commit point)
+\* and rebuild the log.
 RepairSyncMismatch(r, m) ==
   LET k == vSyncPoint[r]
   IN /\ vReplicaStatus[r] = StNormal
@@ -523,13 +546,52 @@ RepairSyncMismatch(r, m) ==
      /\ vNextExpected[r] - 1 >= m.slot
      /\ Prefix(vLog[r], m.slot) # m.log
      /\ k > 0                             \* no commit point: nothing to rewind to
+     /\ MaxFilled(vLog[r]) > k            \* nothing above it
      /\ vLog' = [ vLog EXCEPT ![r] =
-                    [ s \in Slots |-> IF s <= k        THEN vLog[r][s]
-                                      ELSE IF s <= m.slot THEN m.log[s]
-                                      ELSE Empty ] ]
+                    [ s \in Slots |-> IF s <= k THEN vLog[r][s] ELSE Empty ] ]
      /\ vNextExpected' = [ vNextExpected EXCEPT ![r] = k + 1 ]
+     /\ Send({[ mtype  |-> MGetState,
+                dest   |-> m.sender,
+                sender |-> r,
+                viewID |-> m.viewID,
+                from   |-> k + 1,
+                to     |-> MaxFilled(vLog[r]) ]})
      /\ UNCHANGED << vReplicaStatus, vViewID, vLastNormView,
-                     syncVars, vcVars, gapVars, networkVars, clientVars >>
+                     syncVars, vcVars, gapVars, clientVars >>
+
+\* Split msync prepare to 3diff handlers with 3 diff message types
+HandleSyncPrepare(r, m) ==
+  \/ ReplyToSyncPrepare(r, m)
+  \/ RequestSyncPrefix(r, m)
+  \/ RepairSyncMismatch(r, m)
+
+\* Leader handles the sending back state to replica requesting
+HandleGetState(r, m) ==
+  /\ m.viewID = vViewID[r]
+  /\ Send({[ mtype   |-> MNewState,
+             dest    |-> m.sender,
+             sender  |-> r,
+             viewID  |-> m.viewID,
+             from    |-> m.from,
+             to      |-> m.to,
+             log     |-> [ s \in Slots |->
+                           IF s >= m.from /\ s <= m.to THEN vLog[r][s] ELSE Empty ] ]})
+  /\ UNCHANGED << replicaVars, clientVars >>
+
+\* Once leader sends new state, handle it
+HandleNewState(r, m) ==
+  /\ m.viewID = vViewID[r]
+  /\ m.sender = Leader(vViewID[r])
+  /\ \E s \in Slots : /\ s >= m.from
+                      /\ s <= m.to
+                      /\ vLog[r][s] = Empty
+                      /\ m.log[s] # Empty
+  /\ vLog' = [ vLog EXCEPT ![r] =
+                 [ s \in Slots |-> IF s >= m.from /\ s <= m.to /\ vLog[r][s] = Empty
+                                   THEN m.log[s]
+                                   ELSE vLog[r][s] ] ]
+  /\ UNCHANGED << vNextExpected, vReplicaStatus, vViewID, vLastNormView,
+                  syncVars, vcVars, gapVars, networkVars, clientVars >>
 
 \* After leader gets quroum for heartbeats, it can send sync commit and update its own commit point
 HandleSyncRep(r, m) ==
@@ -846,10 +908,10 @@ Next == \* Handle Messages
                                /\ HandleGapCommit(m.dest, m)
         \/ \E m \in messages : /\ m.mtype = MSyncPrepare
                                /\ HandleSyncPrepare(m.dest, m)
-        \/ \E m \in messages : /\ m.mtype = MSyncPrepare
-                               /\ FetchSyncPrefix(m.dest, m)
-        \/ \E m \in messages : /\ m.mtype = MSyncPrepare
-                               /\ RepairSyncMismatch(m.dest, m)
+        \/ \E m \in messages : /\ m.mtype = MGetState
+                               /\ HandleGetState(m.dest, m)
+        \/ \E m \in messages : /\ m.mtype = MNewState
+                               /\ HandleNewState(m.dest, m)
         \/ \E m \in messages : /\ m.mtype = MSyncRep
                                /\ HandleSyncRep(m.dest, m)
         \/ \E m \in messages : /\ m.mtype = MSyncCommit
