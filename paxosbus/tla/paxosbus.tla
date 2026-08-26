@@ -692,6 +692,10 @@ RecordViewChangeReq(r, m) ==
         ELSE UNCHANGED networkVars
      /\ UNCHANGED << coreVars, syncVars, vViewChanges, gapVars, clientVars >>
 
+HandleViewChangeReq(r, m) ==
+  \/ JoinViewChange(r, m)
+  \/ RecordViewChangeReq(r, m)
+
 (*
   `^\textbf{View change merge}^'
 *)
@@ -917,9 +921,7 @@ Next == \* Handle Messages
         \/ \E m \in messages : /\ m.mtype = MSyncCommit
                                /\ HandleSyncCommit(m.dest, m)
         \/ \E m \in messages : /\ m.mtype = MViewChangeReq
-                               /\ JoinViewChange(m.dest, m)
-        \/ \E m \in messages : /\ m.mtype = MViewChangeReq
-                               /\ RecordViewChangeReq(m.dest, m)
+                               /\ HandleViewChangeReq(m.dest, m)
         \/ \E m \in messages : /\ m.mtype = MViewChange
                                /\ HandleViewChange(m.dest, m)
         \/ \E m \in messages : /\ m.mtype = MStartView
