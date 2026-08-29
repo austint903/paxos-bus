@@ -952,6 +952,9 @@ Next == \* Handle Messages
         \* Failure case: real leader failure, or a false suspicion
         \/ \E r \in Replicas : StartViewChange(r)
 
+ReplicaOrderValue == <<"r0", "r1", "r2">>
+ClientOrderValue  == <<"c0", "c1">>
+
 Spec == Init /\ [][Next]_vars
 
 ================================================================================
