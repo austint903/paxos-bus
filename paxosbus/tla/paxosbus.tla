@@ -824,13 +824,6 @@ SlotCommitted(q, s, v) ==
     IN /\ senders \in Quorums
        /\ Leader(v) \in senders
 
-\* Ensures that the durability invariant is meaningful such that v has had a quroum progress through v
-SystemRecovered(v) ==
-  /\ \E R \in Quorums :
-       \A r \in R : /\ vReplicaStatus[r] = StNormal
-                    /\ vLastNormView[r] >= v
-  /\ vLastNormView[Leader(v)] >= v
-
 (* `^\textbf{Invariants}^' *)
 
 \* Type correctness invariant
@@ -888,13 +881,13 @@ Linearizability ==
   \A q1, q2 \in Requests, i \in LogIndices :
     (Committed(q1, i) /\ Committed(q2, i)) => q1 = q2
 
-\* If a request was commited at some previous view, in later view, that request is durable
+\* A committed request remains at the same log index in every later installed view.
 Durability ==
-  \A q \in Requests, i \in LogIndices, v1, v2 \in ViewIDs :
-    ( /\ v1 < v2
-      /\ SystemRecovered(v2)
-      /\ CommittedInView(q, i, v1) )
-    => \E v3 \in v2..MaxViewID : CommittedInView(q, i, v3)
+  \A q \in Requests, i \in LogIndices, v \in ViewIDs, r \in Replicas :
+    ( /\ CommittedInView(q, i, v)
+      /\ vLastNormView[r] > v )
+    => /\ i \in 1..Len(ReqLog(r))
+       /\ ReqLog(r)[i] = q
 
 \* Everything at or below a replica's commit point is committed.
 SyncSafety ==
