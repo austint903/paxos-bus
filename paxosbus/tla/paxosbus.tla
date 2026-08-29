@@ -706,20 +706,24 @@ BestLastNormal(reports)  == Max({ n.lastNormal : n \in reports })
 Survivors(reports)       == { n \in reports : n.lastNormal = BestLastNormal(reports) } \* Logs in max(lastNormalView)
 MergedSyncPoint(reports) == Max({ n.syncPoint : n \in Survivors(reports) })
 MergedMaxSlot(reports)   == Max({ MaxFilled(n.log) : n \in Survivors(reports) } \cup {MergedSyncPoint(reports)})
+StableReport(reports)    == CHOOSE n \in Survivors(reports) :
+                              n.syncPoint = MergedSyncPoint(reports)
 
-\* Merge the entire log. If below commit point, just take value (or no-op if all doesn't have a value)
-\* Above commit point, we do standard merge logic. 
+\* Only merge log above largest stable commit point in largest normal view
 MergedLog(reports) ==
   LET stable    == MergedSyncPoint(reports)
       top       == MergedMaxSlot(reports)
-      donors(s) == { n.log[s] : n \in Survivors(reports) } \ {Empty}
+      stableLog == StableReport(reports).log
+      values(s) == { n.log[s] : n \in Survivors(reports) } \ {Empty}
   IN [ s \in Slots |->
-         IF s > top THEN
+         IF s <= stable THEN
+           stableLog[s]
+         ELSE IF s > top THEN
            Empty
-         ELSE IF s > stable /\ NoOp \in donors(s) THEN
+         ELSE IF NoOp \in values(s) THEN
            NoOp
-         ELSE IF donors(s) \ {NoOp} # {} THEN
-           CHOOSE q \in donors(s) \ {NoOp} : TRUE
+         ELSE IF values(s) \ {NoOp} # {} THEN
+           CHOOSE q \in values(s) \ {NoOp} : TRUE
          ELSE
            NoOp ]
 
@@ -752,15 +756,18 @@ HandleViewChange(r, m) ==
                      gapVars, clientVars >>
 
 
-\* When replica receiving a StartView from the leader, they update their log. We send the entire log, unlike in the code
-\* so it is just one step to install. Replies are then sent for every request in the new merged log
+\* Preserve the receiver's stable prefix and install the merged log above it.
 HandleStartView(r, m) ==
   /\ m.sender = Leader(m.viewID)
   /\ \/ m.viewID > vViewID[r]
      \/ /\ m.viewID = vViewID[r]
         /\ vReplicaStatus[r] = StViewChange
   /\ m.maxSlot >= vSyncPoint[r]
-  /\ vLog'            = [ vLog EXCEPT ![r] = m.log ]
+  /\ \A s \in 1..vSyncPoint[r] : vLog[r][s] = m.log[s]
+  /\ vLog'            = [ vLog EXCEPT ![r] =
+                             [ s \in Slots |-> IF s <= vSyncPoint[r]
+                                                THEN vLog[r][s]
+                                                ELSE m.log[s] ] ]
   /\ vNextExpected'   = [ vNextExpected EXCEPT ![r] = m.maxSlot + 1 ]
   /\ vReplicaStatus'  = [ vReplicaStatus EXCEPT ![r] = StNormal ]
   /\ vViewID'         = [ vViewID EXCEPT ![r] = m.viewID ]
