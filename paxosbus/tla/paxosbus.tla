@@ -1,4 +1,6 @@
 ------------------------------ MODULE paxosbus --------------------------------
+EXTENDS Naturals, Sequences, FiniteSets
+
 \* Deterministic ordering for both replica and client 
 CONSTANTS Replicas, ReplicaOrder
 
@@ -826,6 +828,11 @@ SystemRecovered(v) ==
 
 \* Type correctness invariant
 TypeOK ==
+  /\ \A m \in messages :
+       m.mtype \in {MBus, MRequestReply, MGapRequest, MGapReply,
+                    MGapCommit, MGapCommitRep, MSyncPrepare, MSyncRep,
+                    MSyncCommit, MGetState, MNewState, MViewChangeReq,
+                    MViewChange, MStartView}
   /\ vLog            \in [ Replicas -> Logs ]
   /\ vNextExpected   \in [ Replicas -> 1..(NumSlots + 1) ]
   /\ vReplicaStatus  \in [ Replicas -> {StNormal, StViewChange} ]
@@ -833,8 +840,12 @@ TypeOK ==
   /\ vLastNormView   \in [ Replicas -> ViewIDs ]
   /\ vSyncPoint      \in [ Replicas -> 0..NumSlots ]
   /\ vTentativeSync  \in [ Replicas -> 0..NumSlots ]
+  /\ vSyncReps       \in [ Replicas -> SUBSET messages ]
+  /\ \A r \in Replicas : \A m \in vSyncReps[r] : m.mtype = MSyncRep
   /\ vViewChangeReqs \in [ Replicas -> SUBSET Replicas ]
   /\ vReportSent     \in [ Replicas -> BOOLEAN ]
+  /\ vViewChanges    \in [ Replicas -> SUBSET messages ]
+  /\ \A r \in Replicas : \A m \in vViewChanges[r] : m.mtype = MViewChange
   /\ vGapSlots       \in [ Replicas -> SUBSET Slots ]
   /\ vPending        \in [ Clients -> SUBSET Requests ]
   /\ vBusPayload     \in [ Clients -> [ BusNums -> Buses \cup {Empty} ] ]
