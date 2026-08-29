@@ -939,7 +939,8 @@ Next == \* Handle Messages
                                /\ HandleStartView(m.dest, m)
         \* Client Actions
         \/ \E c \in Clients, op \in Values : ClientGenerates(c, op)
-        \/ \E c \in Clients, q \in Boarded(c) : ClientReboards(c, q)
+        \/ \E c \in Clients :
+             \E q \in Boarded(c) : ClientReboards(c, q)
         \/ \E c \in Clients, n \in BusNums : ClientSendsBus(c, n)
         \* Ordered execution
         \/ \E r \in Replicas : ExecuteSlot(r)
