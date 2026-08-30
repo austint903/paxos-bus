@@ -389,7 +389,7 @@ type RecoveryOptions struct {
 }
 
 const (
-	defaultSyncIntervalMs              = 100
+	defaultSyncIntervalMs              = 500
 	defaultSuspectTimeoutMs            = 2000
 	defaultViewChangeTimeoutMs         = 15000
 	defaultViewChangeFallbackTimeoutMs = 20000

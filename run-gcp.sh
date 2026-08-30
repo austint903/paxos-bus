@@ -65,7 +65,7 @@ RESEND_MS="${RESEND_MS:-2000}"
 SCENARIO="${SCENARIO:-normal}"
 FAILURE_AT_S="${FAILURE_AT_S:-${KILL_LEADER_AT_S:-20}}"
 SUSPECT_TIMEOUT_MS="${SUSPECT_TIMEOUT_MS:-${DETECTION_TIME_MS:-2000}}"
-SYNC_INTERVAL_MS="${SYNC_INTERVAL_MS:-100}"
+SYNC_INTERVAL_MS="${SYNC_INTERVAL_MS:-500}"
 VIEW_CHANGE_TIMEOUT_MS="${VIEW_CHANGE_TIMEOUT_MS:-15000}"
 VIEW_CHANGE_FALLBACK_TIMEOUT_MS="${VIEW_CHANGE_FALLBACK_TIMEOUT_MS:-20000}"
 GAP_RETRY_TIMEOUT_MS="${GAP_RETRY_TIMEOUT_MS:-1500}"
@@ -108,7 +108,7 @@ Failure/recovery:
       --scenario normal|failure   Explicit scenario selection
   -K, --failure-at-s SECONDS      Kill time within data phase (default: 20)
       --detection-time-ms MS      Missing-heartbeat detection time (default: 2000)
-      --sync-interval-ms MS       Leader heartbeat interval (default: 100)
+      --sync-interval-ms MS       Leader heartbeat interval (default: 500)
       --view-change-timeout-ms MS New-leader quorum timeout (default: 15000)
       --view-change-fallback-timeout-ms MS (default: 20000)
 
