@@ -74,10 +74,9 @@ type viewRecovery struct {
 
 // syncRound is one outstanding BusSyncPrepare. Guarded by r.mu.
 type syncRound struct {
-	view uint64
-	slot uint64
-	acks map[uint32]struct{}
-	done bool
+	prepare BusSyncPrepare
+	acks    map[uint32]struct{}
+	done    bool
 }
 
 // syncLoop is the leader's heartbeat and the first phase of the commit point.
@@ -106,23 +105,29 @@ func (r *Replica) syncOnce() {
 		return
 	}
 	view := r.view()
-	prep = BusSyncPrepare{ViewId: view, SenderIdx: uint32(r.idx)}
-	if r.nextExpected > 0 {
-		slot := r.nextExpected - 1
-		if h, ok := r.prefixHashAtLocked(slot); ok {
-			prep.SlotToSync, prep.HasSlot, prep.PrefixHash = slot, true, h
-			r.sync = &syncRound{
-				view: view,
-				slot: slot,
-				acks: map[uint32]struct{}{uint32(r.idx): {}},
-			}
-			commit = r.maybeCommitSyncLocked()
-		}
-	}
-	if !prep.HasSlot {
-		// Nothing executed yet: still beat, so followers know we are alive
-		// before any client traffic starts.
+	if r.sync != nil && r.sync.prepare.ViewId != view {
 		r.sync = nil
+	}
+	if r.sync != nil && !r.sync.done {
+		prep = r.sync.prepare
+	} else {
+		prep = BusSyncPrepare{ViewId: view, SenderIdx: uint32(r.idx)}
+		if r.nextExpected > 0 {
+			slot := r.nextExpected - 1
+			if h, ok := r.prefixHashAtLocked(slot); ok {
+				prep.SlotToSync, prep.HasSlot, prep.PrefixHash = slot, true, h
+				r.sync = &syncRound{
+					prepare: prep,
+					acks:    map[uint32]struct{}{uint32(r.idx): {}},
+				}
+				commit = r.maybeCommitSyncLocked()
+			}
+		}
+		if !prep.HasSlot {
+			// Nothing executed yet: still beat, so followers know we are alive
+			// before any client traffic starts.
+			r.sync = nil
+		}
 	}
 	r.mu.Unlock()
 
@@ -140,8 +145,12 @@ func (r *Replica) maybeCommitSyncLocked() *BusSyncCommit {
 		return nil
 	}
 	s.done = true
-	r.setStableLocked(s.slot)
-	return &BusSyncCommit{ViewId: s.view, StableSlot: s.slot, SenderIdx: uint32(r.idx)}
+	r.setStableLocked(s.prepare.SlotToSync)
+	return &BusSyncCommit{
+		ViewId:     s.prepare.ViewId,
+		StableSlot: s.prepare.SlotToSync,
+		SenderIdx:  uint32(r.idx),
+	}
 }
 
 // setStableLocked advances the commit point, never past what this replica has
@@ -161,6 +170,10 @@ func (r *Replica) setStableLocked(slot uint64) {
 }
 
 func (r *Replica) handleSyncPrepare(msg *BusSyncPrepare) {
+	if !r.validReplicaIndex(msg.SenderIdx) ||
+		int(msg.SenderIdx) != r.config.LeaderIndex(msg.ViewId) {
+		return
+	}
 	if msg.ViewId < r.view() {
 		return
 	}
@@ -170,6 +183,10 @@ func (r *Replica) handleSyncPrepare(msg *BusSyncPrepare) {
 	}
 
 	r.mu.Lock()
+	if msg.ViewId != r.view() {
+		r.mu.Unlock()
+		return
+	}
 	r.lastHeartbeatNs = nowNs()
 	r.leaderLost = false
 	if r.status != statusNormal || !msg.HasSlot {
@@ -177,17 +194,51 @@ func (r *Replica) handleSyncPrepare(msg *BusSyncPrepare) {
 		return
 	}
 	if r.nextExpected == 0 || r.nextExpected-1 < msg.SlotToSync {
-		// Behind. Fetch the missing prefix and skip this round rather than
-		// parking a deferred reply — the next heartbeat is one interval away and
-		// will find us caught up.
-		from := r.nextExpected
+		// Behind. Coalesce retries and newer targets into one sync-driven state
+		// transfer instead of filling fetchQ with the same work.
+		leader := int(msg.SenderIdx)
+		c := &r.syncCatchup
+		var req *fetchReq
+		if !c.active || c.view != msg.ViewId || c.leader != leader {
+			r.clearSyncCatchupLocked()
+			c = &r.syncCatchup
+			c.view = msg.ViewId
+			c.leader = leader
+			c.target = msg.SlotToSync
+			c.prepare = *msg
+			c.active = true
+			fetch := r.newSyncFetchLocked(r.nextExpected, c.target)
+			req = &fetch
+		} else if msg.SlotToSync > c.target {
+			c.target = msg.SlotToSync
+			c.prepare = *msg
+		}
 		r.mu.Unlock()
-		r.enqueueFetch(int(msg.SenderIdx), from, msg.SlotToSync, nil)
+		if req != nil {
+			r.enqueueSyncFetch(*req)
+		}
 		return
 	}
 	h, known := r.prefixHashAtLocked(msg.SlotToSync)
 	stable, haveStable := r.stableSlot, r.haveStable
 	r.mu.Unlock()
+
+	r.answerSyncPrepare(*msg, h, known, stable, haveStable)
+}
+
+// answerSyncPrepare performs the common prefix decision after the caller has
+// established that the requested slot is executed. It deliberately does not
+// refresh the heartbeat clock, so completing a slow fetch is not mistaken for
+// a newly received heartbeat.
+func (r *Replica) answerSyncPrepare(msg BusSyncPrepare, h uint64, known bool,
+	stable uint64, haveStable bool) {
+	r.mu.Lock()
+	current := r.status == statusNormal && msg.ViewId == r.view() &&
+		int(msg.SenderIdx) == r.config.LeaderIndex(msg.ViewId)
+	r.mu.Unlock()
+	if !current {
+		return
+	}
 
 	switch {
 	case !known:
@@ -199,7 +250,7 @@ func (r *Replica) handleSyncPrepare(msg *BusSyncPrepare) {
 	case h != msg.PrefixHash:
 		Warning("[%s] PREFIX MISMATCH at slot=%d (ours=%016x leader=%016x) — rewinding to stable and refetching",
 			r.self, msg.SlotToSync, h, msg.PrefixHash)
-		r.rewindToStableAndRefetch(int(msg.SenderIdx), stable, haveStable)
+		r.rewindToStableAndRefetch(int(msg.SenderIdx), msg.ViewId, stable, haveStable)
 		return
 	}
 
@@ -208,9 +259,13 @@ func (r *Replica) handleSyncPrepare(msg *BusSyncPrepare) {
 }
 
 func (r *Replica) handleSyncReply(msg *BusSyncReply) {
+	if !r.validReplicaIndex(msg.SenderIdx) || int(msg.SenderIdx) == r.idx {
+		return
+	}
 	var commit *BusSyncCommit
 	r.mu.Lock()
-	if s := r.sync; s != nil && !s.done && s.view == msg.ViewId && s.slot == msg.Slot {
+	if s := r.sync; s != nil && !s.done && s.prepare.ViewId == msg.ViewId &&
+		s.prepare.SlotToSync == msg.Slot {
 		s.acks[msg.SenderIdx] = struct{}{}
 		commit = r.maybeCommitSyncLocked()
 	}
@@ -218,6 +273,13 @@ func (r *Replica) handleSyncReply(msg *BusSyncReply) {
 	if commit != nil {
 		r.broadcastToPeers(MsgBusSyncCommit, commit)
 	}
+}
+
+// clearSyncCatchupLocked invalidates any queued or running sync fetch without
+// reusing its generation. Guarded by r.mu.
+func (r *Replica) clearSyncCatchupLocked() {
+	generation := r.syncCatchup.generation + 1
+	r.syncCatchup = syncCatchup{generation: generation}
 }
 
 func (r *Replica) handleSyncCommit(msg *BusSyncCommit) {
@@ -250,11 +312,16 @@ func (r *Replica) handleSyncCommit(msg *BusSyncCommit) {
 // agreement, so no follower could disagree). Rewinding there and refetching is
 // enough. Loud, because the principled fix is for leaderResolve to wait for its
 // quorum before executing.
-func (r *Replica) rewindToStableAndRefetch(peer int, stable uint64, haveStable bool) {
+func (r *Replica) rewindToStableAndRefetch(peer int, view, stable uint64, haveStable bool) {
 	if !haveStable {
 		return
 	}
 	r.mu.Lock()
+	if r.status != statusNormal || r.view() != view ||
+		r.config.LeaderIndex(view) != peer {
+		r.mu.Unlock()
+		return
+	}
 	if !r.rewindToLocked(stable + 1) {
 		r.mu.Unlock()
 		Warning("[%s] cannot rewind to stable slot %d: outside the hash window", r.self, stable)
@@ -413,6 +480,7 @@ func (r *Replica) beginViewChangeLocked(newView uint64) *viewChangeStart {
 	r.status = statusViewChange
 	r.leaderLost = false
 	r.sync = nil
+	r.clearSyncCatchupLocked()
 	r.lastHeartbeatNs = nowNs()
 	r.armViewChangeWatchdogLocked(newView)
 	// Retire in-flight gap agreement immediately. Messages already in flight
@@ -1238,6 +1306,7 @@ func (r *Replica) installStartView(msg *BusStartView) {
 		r.vc = nil
 	}
 	r.sync = nil
+	r.clearSyncCatchupLocked()
 	r.cancelGapsLocked()
 	r.drainPendingBusesLocked()
 	r.viewId.Store(msg.ViewId)
@@ -1724,10 +1793,43 @@ type fetchReq struct {
 	to         uint64
 	view       uint64
 	fetchID    uint64
+	syncGen    uint64
 	installGen uint64
 	vc         *vcState
 	cancel     <-chan struct{}
 	done       chan bool
+}
+
+// newSyncFetchLocked snapshots the current catch-up identity into one fetch.
+// Guarded by r.mu.
+func (r *Replica) newSyncFetchLocked(from, to uint64) fetchReq {
+	c := &r.syncCatchup
+	return fetchReq{
+		peer:    c.leader,
+		from:    from,
+		to:      to,
+		view:    c.view,
+		fetchID: r.fetchSeq.Add(1),
+		syncGen: c.generation,
+	}
+}
+
+// enqueueSyncFetch keeps queue failure from stranding an active catch-up with
+// no request that could ever complete it.
+func (r *Replica) enqueueSyncFetch(req fetchReq) {
+	select {
+	case r.fetchQ <- req:
+		return
+	default:
+	}
+
+	r.mu.Lock()
+	if r.syncCatchupMatchesLocked(req) {
+		r.clearSyncCatchupLocked()
+	}
+	r.mu.Unlock()
+	Warning("[%s] state-fetch queue full, dropping sync request [%d,%d]",
+		r.self, req.from, req.to)
 }
 
 func (r *Replica) enqueueFetch(peer int, from, to uint64, done chan bool) {
@@ -1826,10 +1928,61 @@ func (r *Replica) fetchRecoveryRange(rec *viewRecovery, from, to uint64) bool {
 func (r *Replica) stateFetchLoop() {
 	for req := range r.fetchQ {
 		ok := r.runFetch(req)
+		if req.syncGen != 0 {
+			r.finishSyncFetch(req, ok)
+		}
 		if req.done != nil {
 			req.done <- ok
 		}
 	}
+}
+
+// finishSyncFetch reconciles one completed range with the follower's latest
+// coalesced target. A newer target produces one continuation; reaching it
+// validates the latest retained prepare and replies to the leader.
+func (r *Replica) finishSyncFetch(req fetchReq, ok bool) {
+	var (
+		prepare    BusSyncPrepare
+		hash       uint64
+		known      bool
+		stable     uint64
+		haveStable bool
+	)
+
+	r.mu.Lock()
+	if !r.syncCatchupActiveLocked(req) {
+		r.mu.Unlock()
+		return
+	}
+	if !ok {
+		r.clearSyncCatchupLocked()
+		r.mu.Unlock()
+		return
+	}
+
+	c := &r.syncCatchup
+	if r.nextExpected == 0 || r.nextExpected-1 < c.target {
+		// A successful sparse response is allowed to contain no entry for a
+		// slot. Do not turn that case into an immediate retry loop when the
+		// executed frontier made no progress.
+		if r.nextExpected <= req.from {
+			r.clearSyncCatchupLocked()
+			r.mu.Unlock()
+			return
+		}
+		next := r.newSyncFetchLocked(r.nextExpected, c.target)
+		r.mu.Unlock()
+		r.enqueueSyncFetch(next)
+		return
+	}
+
+	prepare = c.prepare
+	hash, known = r.prefixHashAtLocked(prepare.SlotToSync)
+	stable, haveStable = r.stableSlot, r.haveStable
+	r.clearSyncCatchupLocked()
+	r.mu.Unlock()
+
+	r.answerSyncPrepare(prepare, hash, known, stable, haveStable)
 }
 
 func (r *Replica) fetchActive(req fetchReq) bool {
@@ -1840,6 +1993,12 @@ func (r *Replica) fetchActive(req fetchReq) bool {
 	}
 	if r.view() != req.view {
 		return false
+	}
+	if req.syncGen != 0 {
+		r.mu.Lock()
+		active := r.syncCatchupActiveLocked(req)
+		r.mu.Unlock()
+		return active
 	}
 	if req.vc != nil {
 		r.mu.Lock()
@@ -1986,6 +2145,9 @@ func (r *Replica) fetchActiveLocked(req fetchReq) bool {
 	if r.view() != req.view {
 		return false
 	}
+	if req.syncGen != 0 {
+		return r.syncCatchupActiveLocked(req)
+	}
 	if req.vc != nil {
 		select {
 		case <-req.vc.abort:
@@ -2001,6 +2163,21 @@ func (r *Replica) fetchActiveLocked(req fetchReq) bool {
 	return r.recovery != nil && r.recovery.generation == req.installGen &&
 		r.recovery.view == req.view && r.recovery.leader == req.peer &&
 		r.status == statusViewChange
+}
+
+// syncCatchupMatchesLocked checks only the generation identity, which is what
+// queue failure needs before invalidating state. Guarded by r.mu.
+func (r *Replica) syncCatchupMatchesLocked(req fetchReq) bool {
+	c := &r.syncCatchup
+	return req.syncGen != 0 && c.active && c.generation == req.syncGen &&
+		c.view == req.view && c.leader == req.peer
+}
+
+// syncCatchupActiveLocked additionally fences transfer work on the current
+// normal view and its designated leader. Guarded by r.mu.
+func (r *Replica) syncCatchupActiveLocked(req fetchReq) bool {
+	return r.syncCatchupMatchesLocked(req) && r.status == statusNormal &&
+		r.view() == req.view && r.config.LeaderIndex(req.view) == req.peer
 }
 
 func (r *Replica) handleGetState(msg *BusGetState) {

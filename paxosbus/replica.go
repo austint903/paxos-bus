@@ -241,6 +241,18 @@ func (s replicaStatus) String() string {
 	}
 }
 
+// syncCatchup is the one coalesced sync-driven state transfer on a follower.
+// generation fences completions from an older transfer after the view, leader,
+// or replica status has changed. Guarded by r.mu.
+type syncCatchup struct {
+	generation uint64
+	view       uint64
+	leader     int
+	target     uint64
+	prepare    BusSyncPrepare
+	active     bool
+}
+
 type Replica struct {
 	config *Config
 	idx    int
@@ -321,6 +333,7 @@ type Replica struct {
 	gapRetryTimeout           time.Duration
 	lastHeartbeatNs           int64
 	sync                      *syncRound
+	syncCatchup               syncCatchup
 	vc                        *vcState
 	viewChangeWatchdog        *viewChangeWatchdog
 	viewChangeWatchdogGen     uint64
