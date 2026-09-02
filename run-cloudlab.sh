@@ -55,7 +55,7 @@ set -euo pipefail
 #   CLIENT_REPLICA              [small] which replica's cluster runs the clients;
 #                               must be a non-leader (1 or 2, default 1)
 #   RESEND_MS                   per-request no-quorum re-board timeout, ms
-#                               (default 2000; 0 uses the client default)
+#                               (default 5000; 0 uses the client default)
 #   START_DELAY_MS              client sync->data-phase delay (default 5000 small /
 #                               10000 large). EVERY client must sync inside this
 #                               window at ALL replicas or the slot mapping diverges,
@@ -76,7 +76,7 @@ GEN_INTERVAL_US="${GEN_INTERVAL_US:-500}"
 GAP_RETRY_TIMEOUT_MS="${GAP_RETRY_TIMEOUT_MS:-1500}"
 NUM_CLIENTS="${NUM_CLIENTS:-1}"
 CLIENTS_PER_HOST="${CLIENTS_PER_HOST:-3}"
-RESEND_MS="${RESEND_MS:-2000}"
+RESEND_MS="${RESEND_MS:-5000}"
 SCALE="${SCALE:-small}"
 TRANSPORT="${TRANSPORT:-direct}"
 # Failure-recovery experiment: SIGKILL the leader replica this many seconds into

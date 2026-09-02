@@ -8,7 +8,7 @@ set -euo pipefail
 MSG_INTERVAL_MS=1      # change this: 1000=1s  100=100ms  10=10ms  2=2ms  1=1ms (bus interval)
 NUM_REPLICAS=3
 NUM_CLIENTS=2
-RESEND_MS=2000         # client resend-on-no-quorum timeout (ms; 0 uses the client default)
+RESEND_MS=5000         # client resend-on-no-quorum timeout (ms; 0 uses the client default)
 DURATION_S="${DURATION_S:-60}"  # seconds of data phase, then auto-stop; 0 = run until Ctrl+C
 SYNC_WARMUP_S=5        # client sync wait before data starts (matches syncStartDelayMs=5000)
 DROP_MODE=none         # artificial drop scenario: none|leader|followers|all

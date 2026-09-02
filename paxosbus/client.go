@@ -13,7 +13,7 @@ import (
 
 const (
 	defaultStartDelayMs     = 5000
-	defaultRequestTimeoutMs = 2000
+	defaultRequestTimeoutMs = 5000
 )
 
 // requestOp is the per-request payload: "hello" plus 12 random pad bytes so

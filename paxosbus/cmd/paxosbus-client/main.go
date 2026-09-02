@@ -12,7 +12,7 @@ func main() {
 	configPath := flag.String("c", "", "path to replica config file")
 	clientId := flag.Uint64("I", 0, "client ID (unique per client; 0-indexed)")
 	intervalMs := flag.Uint64("p", 1, "bus interval in milliseconds")
-	resendMs := flag.Uint64("t", 2000, "per-request no-quorum re-board timeout in ms (0 uses the 2000 ms default)")
+	resendMs := flag.Uint64("t", 5000, "per-request no-quorum re-board timeout in ms (0 uses the 5000 ms default)")
 	label := flag.String("l", "", "location label shown in every log line, e.g. asia-east1")
 	genIntervalUs := flag.Uint64("g", 500, "request generation interval in microseconds")
 	verbose := flag.Bool("v", false, "log every per-replica REPLY line (3 log writes per request at high rates; COMMITTED lines are always logged)")
