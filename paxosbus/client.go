@@ -48,6 +48,15 @@ type reqInflight struct {
 	committed   bool
 }
 
+// boardLog carries the fields for one BOARDED line out of sendBus's locked
+// section, so the stderr write happens without holding c.mu. reboard marks a
+// request departing again after a resend versus its first bus.
+type boardLog struct {
+	rid            uint64
+	genNs, boardNs int64
+	reboard        bool
+}
+
 const gcCommittedNs = 2 * int64(time.Second)
 
 type lockedWriter struct {
@@ -330,14 +339,16 @@ func (c *Client) genLoop() {
 		now := nowNs()
 		for now >= next {
 			rid++
+			genNs := now // generation time; per-request latency clock starts here
 			c.pendingMu.Lock()
 			c.pending = append(c.pending, RequestMessage{
 				ClientId:   c.clientId,
 				RequestId:  rid,
-				SendTimeNs: uint64(now), // generation time; per-request latency clock starts here
+				SendTimeNs: uint64(genNs),
 				Op:         requestOp,
 			})
 			c.pendingMu.Unlock()
+			Notice("[%s] GENERATED req=%d gen_ns=%d", c.self, rid, genNs)
 			next += intervalNs
 			now = nowNs()
 		}
@@ -407,9 +418,11 @@ func (c *Client) sendBus() {
 	c.mu.Lock()
 	c.busSeqNum++
 	seq := c.busSeqNum
+	boarded := make([]boardLog, 0, len(reqs))
 	for i := range reqs {
 		rid := reqs[i].RequestId
 		e := c.rInflight[rid]
+		reboard := true
 		if e == nil {
 			// firstSendNs is the generation time
 			genNs := int64(reqs[i].SendTimeNs)
@@ -418,12 +431,28 @@ func (c *Client) sendBus() {
 			}
 			e = &reqInflight{firstSendNs: genNs, op: reqs[i].Op, votes: make(map[voteKey]uint32)}
 			c.rInflight[rid] = e
+			reboard = false
 		}
 		e.sendTimeNs = now
 		reqs[i].SendTimeNs = uint64(now)
+		boarded = append(boarded, boardLog{rid: rid, genNs: e.firstSendNs, boardNs: now, reboard: reboard})
 	}
 	c.winSent += uint64(len(reqs))
 	c.mu.Unlock()
+
+	// BOARDED lines are emitted outside c.mu so the stderr writes never
+	// serialize with reply handling. Every request that departs on a bus is
+	// logged; a reboard (resend after a missed quorum) is marked so it is not
+	// mistaken for the request's first departure.
+	for _, t := range boarded {
+		if t.reboard {
+			Notice("[%s] BOARDED req=%d bus_seq=%d board_ns=%d reboard=true",
+				c.self, t.rid, seq, t.boardNs)
+		} else {
+			Notice("[%s] BOARDED req=%d bus_seq=%d board_ns=%d gen_ns=%d wait_us=%d",
+				c.self, t.rid, seq, t.boardNs, t.genNs, (t.boardNs-t.genNs)/1000)
+		}
+	}
 
 	msg := BusMessage{
 		ClientId:   c.clientId,
@@ -538,11 +567,13 @@ func (c *Client) handleRequestReply(msg *RequestReplyMessage) {
 	replyRttUs := (now - e.sendTimeNs) / 1000
 
 	justCommitted := !e.committed && c.quorumReached(mask, msg.ViewId)
-	var rttUs, totalUs int64
+	var rttUs, totalUs, genNs, boardNs int64
 	if justCommitted {
 		e.committed = true
 		rttUs = (now - e.sendTimeNs) / 1000
 		totalUs = (now - e.firstSendNs) / 1000 // generation -> commit
+		genNs = e.firstSendNs
+		boardNs = e.sendTimeNs
 		c.recordCommitLocked(totalUs)
 	}
 	c.mu.Unlock()
@@ -552,8 +583,12 @@ func (c *Client) handleRequestReply(msg *RequestReplyMessage) {
 			c.self, msg.ReplicaIdx, replyRttUs, msg.RequestId, msg.BusSlotNum, msg.LogIndex)
 	}
 	if justCommitted {
-		Notice("[%s] COMMITTED req=%d log_index=%d rtt=%dus total=%dus",
-			c.self, msg.RequestId, msg.LogIndex, rttUs, totalUs)
+		// The leading fields (req/log_index/rtt/total, in that order) are what
+		// the tally/aggregate parsers read positionally; the absolute
+		// gen/board/commit timestamps that join the three lifecycle lines
+		// (GENERATED -> BOARDED -> COMMITTED) for one request are appended after.
+		Notice("[%s] COMMITTED req=%d log_index=%d rtt=%dus total=%dus gen_ns=%d board_ns=%d commit_ns=%d",
+			c.self, msg.RequestId, msg.LogIndex, rttUs, totalUs, genNs, boardNs, now)
 	}
 }
 

@@ -15,7 +15,7 @@ func main() {
 	resendMs := flag.Uint64("t", 5000, "per-request no-quorum re-board timeout in ms (0 uses the 5000 ms default)")
 	label := flag.String("l", "", "location label shown in every log line, e.g. asia-east1")
 	genIntervalUs := flag.Uint64("g", 500, "request generation interval in microseconds")
-	verbose := flag.Bool("v", false, "log every per-replica REPLY line (3 log writes per request at high rates; COMMITTED lines are always logged)")
+	verbose := flag.Bool("v", false, "log every per-replica REPLY line (extra log write per reply at high rates; the GENERATED/BOARDED/COMMITTED lifecycle lines are always logged)")
 	startDelayMs := flag.Uint64("w", 5000, "delay in ms between sync and the data phase; every client must sync within this window")
 	maxOwdMs := flag.Float64("owd", 0, "max one-way delay to any replica in ms; buses depart this early so they arrive on the announced schedule (0 = auto-measure as max TCP dial RTT / 2)")
 	flag.Parse()
