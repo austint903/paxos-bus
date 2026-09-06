@@ -1542,6 +1542,11 @@ func (r *Replica) statsLoop() {
 		status, stable, haveStable := r.status, r.stableSlot, r.haveStable
 		executed, resident, dedupSize := r.nextExpected, len(r.globalLog), len(r.dedup)
 		residentMB := r.residentBytes >> 20
+		entryLogLen, prunedBelow := r.nextLogIndex, r.prunedBelow
+		busLogHigh := uint64(0)
+		if r.haveMax {
+			busLogHigh = r.maxSlotSeen + 1
+		}
 		r.mu.Unlock()
 		// durable logs carry their own mutex, so sample their backlog off r.mu.
 		durMax := 0
@@ -1555,6 +1560,21 @@ func (r *Replica) statsLoop() {
 				durMax = m
 			}
 		}
+		// The two log lengths are what a client's own commit count is checked
+		// against, so they are emitted every tick rather than only on the busy
+		// ticks below: the interesting comparison is the final one, taken after
+		// the clients have stopped generating and this replica has drained.
+		//
+		//   bus_log_len    executed prefix of the BusMessage log -- bus slots
+		//                  0..nextExpected-1 have been executed by this replica.
+		//   bus_log_high   highest slot seen + 1, so bus_log_high - bus_log_len
+		//                  is the un-executed suffix still waiting on a gap.
+		//   entry_log_len  length of the Request Log List: one index per
+		//                  deduped request executed. This is the number that
+		//                  should equal the sum of the clients' cumulative
+		//                  committed counts.
+		Notice("[%s] 1s: bus_log_len=%d bus_log_high=%d entry_log_len=%d pruned_below=%d",
+			r.self, executed, busLogHigh, entryLogLen, prunedBelow)
 		if recv == 0 && gaps == 0 && recovered == 0 && noops == 0 && dropped == 0 {
 			continue
 		}
