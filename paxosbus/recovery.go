@@ -1751,11 +1751,13 @@ func (r *Replica) rewindToLocked(target uint64) bool {
 	if !ok {
 		return false
 	}
-	for s := target; s < r.nextExpected; s++ {
-		e := r.globalLog[s]
+	// Undo newer writes first: several slots may overwrite the same key.
+	for s := r.nextExpected; s > target; s-- {
+		e := r.globalLog[s-1]
 		if e == nil {
 			continue
 		}
+		r.undoWritesLocked(e)
 		for i := range e.requests {
 			req := &e.requests[i]
 			key := reqKey{req.ClientId, req.RequestId}

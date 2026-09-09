@@ -9,6 +9,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/imdea-software/swiftpaxos/state"
 )
 
 var startTime = time.Now()
@@ -56,7 +58,17 @@ type globalEntry struct {
 	logIdxLo uint64
 	logIdxHi uint64
 
+	// One pre-bus value per written key lets recovery undo this slot without
+	// retaining a separate history entry for every passenger.
+	undo []writeUndo
+
 	sizeBytes uint64 // this slot's share of residentBytes
+}
+
+type writeUndo struct {
+	key     state.Key
+	value   state.Value
+	present bool
 }
 
 // requestOverheadBytes is the fixed heap cost of one retained RequestMessage,
@@ -307,6 +319,7 @@ type Replica struct {
 	// request rates for nothing.
 	nextLogIndex uint64
 	dedup        map[reqKey]uint64
+	State        *state.State
 
 	pendingBuses []*BusMessage
 
@@ -458,6 +471,7 @@ func NewReplica(config *Config, idx int, label, logDir string, mode dropMode, ev
 		clients:                   make(map[uint64]*clientLine),
 		globalLog:                 make(map[uint64]*globalEntry),
 		dedup:                     make(map[reqKey]uint64),
+		State:                     state.InitState(),
 		replySenders:              make(map[uint64]*replySender),
 		replyWake:                 make(chan struct{}, 1),
 		cursorNextN:               make(map[uint64]uint64),
@@ -1307,14 +1321,47 @@ func (r *Replica) durableRecordCursorLocked(slot uint64, e *globalEntry, logIdxs
 	r.durable.recordBus(slot, clientId, reqId, logIdxs, e.state == slotNoOp)
 }
 
-// executeLocked is a deliberate no-op standing in for the state-machine apply
-// step a real SMR replica performs. It runs under r.mu at the moment the cursor
-// commits the slot and the request first takes a spot in the request log list,
-// immediately before the client ack is enqueued, so the commit path here has
-// the same shape it would with a real state machine behind it. A real
-// implementation would apply req.Op at logIndex and return a result, which
-// would ride back to the client in RequestReplyMessage.Result (nil today).
+// executeLocked applies a PUT through the same mutex-protected tree map used
+// by the baseline protocols. The workload is write-only: Op is the value and
+// ClientId selects a stable per-client key, so repeated writes update the map
+// instead of growing it by one key per request. PUT returns an empty result.
+// The caller holds r.mu and deduplicates requests before executing them.
 func (r *Replica) executeLocked(req *RequestMessage, logIndex uint64) {
+	cmd := state.Command{Op: state.PUT, K: state.Key(req.ClientId), V: state.Value(req.Op)}
+	cmd.Execute(r.State)
+}
+
+// All application state access is serialized by r.mu, including these recovery
+// snapshots. Values are immutable, just as they are in state.Command.Execute.
+func (r *Replica) rememberWriteLocked(e *globalEntry, key state.Key) {
+	for _, u := range e.undo {
+		if u.key == key {
+			return
+		}
+	}
+	value, present := r.State.Store.Get(key)
+	u := writeUndo{key: key, present: present}
+	if present {
+		u.value = value.(state.Value)
+	}
+	e.undo = append(e.undo, u)
+	size := uint64(40 + len(u.value))
+	e.sizeBytes += size
+	r.residentBytes += size
+}
+
+func (r *Replica) undoWritesLocked(e *globalEntry) {
+	for _, u := range e.undo {
+		if u.present {
+			r.State.Store.Put(u.key, u.value)
+		} else {
+			r.State.Store.Remove(u.key)
+		}
+		size := uint64(40 + len(u.value))
+		e.sizeBytes -= size
+		r.residentBytes -= size
+	}
+	e.undo = nil
 }
 
 // appendBusToLogListLocked appends the slot's bus passengers to the request log
@@ -1355,6 +1402,7 @@ func (r *Replica) appendBusToLogListLocked(slot uint64) []uint64 {
 			// one every later re-board of it is acked against.
 			r.dedup[key] = li
 			execIdx = li
+			r.rememberWriteLocked(e, state.Key(req.ClientId))
 			r.executeLocked(req, li)
 		}
 		logIdxs = append(logIdxs, li)

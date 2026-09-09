@@ -14,18 +14,9 @@ import (
 const (
 	defaultStartDelayMs     = 5000
 	defaultRequestTimeoutMs = 5000
+	// DefaultCommandSize is the value size in bytes, matching the GCP baselines.
+	DefaultCommandSize = 16
 )
-
-// requestOp is the per-request payload: "hello" plus 12 random pad bytes so
-// each request carried by a bus (28-byte header + 17-byte op = 45 bytes)
-// matches the 45-byte swiftpaxos Propose that the paxos/epaxos baselines send
-// (commandsize 16). Shared across requests; never mutated after init.
-var requestOp = func() []byte {
-	op := make([]byte, 17)
-	copy(op, "hello")
-	crand.Read(op[5:])
-	return op
-}()
 
 // Votes are counted per view, never across them. A view change can hand a
 // replica an entry it had logged but never acknowledged, so it replies again in
@@ -142,6 +133,7 @@ type Client struct {
 	self       string
 
 	genIntervalUs uint64
+	requestOp     []byte // immutable write value, shared by this client's requests
 	reqTimeoutNs  int64
 	verbose       bool
 	startDelayMs  uint64
@@ -184,7 +176,7 @@ type Client struct {
 
 func NewClient(config *Config, clientId, intervalMs, resendMs uint64, label string,
 	genIntervalUs uint64, verbose bool, startDelayMs uint64,
-	maxOwdMs float64) *Client {
+	maxOwdMs float64, commandSize int) *Client {
 	self := "Client " + strconv.FormatUint(clientId, 10)
 	if label != "" {
 		self += " " + label
@@ -195,6 +187,10 @@ func NewClient(config *Config, clientId, intervalMs, resendMs uint64, label stri
 	if resendMs == 0 {
 		resendMs = defaultRequestTimeoutMs
 	}
+	requestOp := make([]byte, commandSize)
+	if _, err := crand.Read(requestOp); err != nil {
+		panic("cannot generate write payload: " + err.Error())
+	}
 	c := &Client{
 		config:        config,
 		clientId:      clientId,
@@ -202,6 +198,7 @@ func NewClient(config *Config, clientId, intervalMs, resendMs uint64, label stri
 		resendMs:      resendMs,
 		self:          self,
 		genIntervalUs: genIntervalUs,
+		requestOp:     requestOp,
 		reqTimeoutNs:  int64(resendMs) * 1e6,
 		verbose:       verbose,
 		startDelayMs:  startDelayMs,
@@ -219,6 +216,7 @@ func NewClient(config *Config, clientId, intervalMs, resendMs uint64, label stri
 	}
 	Notice("[%s] started  request-gen  gen=%dus  bus=%dms  replicas=%d  f=%d  quorum=%d (f+1, must include leader)%s",
 		c.self, genIntervalUs, intervalMs, config.N, config.F, config.QuorumSize(), resend)
+	Notice("[%s] workload writes=100 command-size=%d key=%d", c.self, commandSize, clientId)
 	if resendMs > 0 {
 		Notice("[%s] req-timeout=%dms", c.self, resendMs)
 	}
@@ -335,7 +333,7 @@ func (c *Client) genLoop() {
 				ClientId:   c.clientId,
 				RequestId:  rid,
 				SendTimeNs: uint64(now), // generation time; per-request latency clock starts here
-				Op:         requestOp,
+				Op:         c.requestOp,
 			})
 			c.pendingMu.Unlock()
 			next += intervalNs
