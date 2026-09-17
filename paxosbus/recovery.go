@@ -1049,7 +1049,7 @@ func (r *Replica) fetchMergedState(vc *vcState, watchdog *viewChangeWatchdog,
 		if !r.mergeActive(vc, watchdog) {
 			return false
 		}
-		byDonor := make(map[uint32][2]uint64) // donor -> [lo, hi] of what it still owes
+		byDonor := make(map[uint32][]uint64)
 		r.mu.Lock()
 		for slot, donor := range plan.donors {
 			if e := r.globalLog[slot]; e != nil && e.state != slotEmpty {
@@ -1058,33 +1058,32 @@ func (r *Replica) fetchMergedState(vc *vcState, watchdog *viewChangeWatchdog,
 			if slot < r.nextExpected {
 				continue
 			}
-			rng, seen := byDonor[donor]
-			if !seen {
-				byDonor[donor] = [2]uint64{slot, slot}
-				continue
-			}
-			if slot < rng[0] {
-				rng[0] = slot
-			}
-			if slot > rng[1] {
-				rng[1] = slot
-			}
-			byDonor[donor] = rng
+			byDonor[donor] = append(byDonor[donor], slot)
 		}
 		r.mu.Unlock()
 		if len(byDonor) == 0 {
 			return r.mergeActive(vc, watchdog)
 		}
-		for donor, rng := range byDonor {
-			if !r.mergeActive(vc, watchdog) {
-				return false
-			}
+		for donor, slots := range byDonor {
 			if int(donor) == r.idx {
 				continue
 			}
-			r.fetchRangeBlocking(vc, int(donor), rng[0], rng[1])
-			if !r.mergeActive(vc, watchdog) {
-				return false
+			sort.Slice(slots, func(i, j int) bool { return slots[i] < slots[j] })
+			// Keep each request within a contiguous run assigned to this donor.
+			for i := 0; i < len(slots); {
+				from, to := slots[i], slots[i]
+				i++
+				for i < len(slots) && slots[i] == to+1 {
+					to = slots[i]
+					i++
+				}
+				if !r.mergeActive(vc, watchdog) {
+					return false
+				}
+				r.fetchRangeBlocking(vc, int(donor), from, to)
+				if !r.mergeActive(vc, watchdog) {
+					return false
+				}
 			}
 		}
 	}
@@ -2068,7 +2067,9 @@ func (r *Replica) runFetch(req fetchReq) bool {
 			return false
 		}
 		to := req.to
-		if req.syncGen != 0 {
+		// Recheck each chunk: buses may arrive while the fetch is queued or
+		// waiting for a response. Explicit divergence repair still refetches.
+		if req.syncGen != 0 || req.vc != nil || req.installGen != 0 {
 			r.mu.Lock()
 			next, to = r.missingRangeLocked(next, req.to)
 			r.mu.Unlock()
