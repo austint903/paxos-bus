@@ -275,15 +275,16 @@ type Replica struct {
 	viewId atomic.Uint64
 	self   string
 
-	mu             sync.Mutex
-	clients        map[uint64]*clientLine
-	status         replicaStatus
-	lastNormalView uint64
-	recovery       *viewRecovery
-	recoveryGen    uint64
-	startViewSeen  uint64
-	startViewView  uint64
-	startViewUsed  []uint32
+	mu              sync.Mutex
+	clients         map[uint64]*clientLine
+	status          replicaStatus
+	lastNormalView  uint64
+	recovery        *viewRecovery
+	recoveryGen     uint64
+	startViewSeen   uint64
+	startViewView   uint64
+	startViewSource uint64
+	startViewUsed   []uint32
 
 	globalLog    map[uint64]*globalEntry
 	nextExpected uint64
