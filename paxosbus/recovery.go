@@ -5,10 +5,7 @@ package paxosbus
 // of them lean on.
 //
 // The shape of it: a bus's slot is a local computation from its client's arrival
-// line, so replicas keep recording traffic with no leader at all. What a leader
-// is actually needed for is deciding — agreeing a commit point, agreeing a no-op
-// for a slot nobody received. So a view change never has to re-establish an
-// order, only to reconcile which slots hold what, and it can do that from
+// line. A view change reconciles which slots hold what from
 // metadata: which slots each replica holds (a bitmap), which of them are agreed
 // no-ops, and a hash of the committed prefix. Entries themselves move only over
 // BusGetState. A follower remains in ViewChange until it has installed the
@@ -895,14 +892,12 @@ func (r *Replica) driveViewChange(vc *vcState) {
 	r.mu.Unlock()
 
 	// Multicast the immutable decision while the ViewChange fence is still
-	// published. A later bus can arrive while a peer send blocks, but it cannot
-	// enter this message or advance the cursor. The heartbeat timer is gated by
-	// the same status and therefore remains silent too.
+	// published. In-flight buses cannot advance the cursor, and heartbeats stay
+	// silent.
 	r.broadcastStartView(msg)
 
 	// A newer view may have started while the network sends above ran off-lock.
-	// Only the exact view-change instance that produced this decision may expose
-	// it as Normal and release the post-merge buses.
+	// Only the view change that produced this decision may publish Normal.
 	r.mu.Lock()
 	if !r.mergeActiveLocked(vc, watchdog) ||
 		!r.committedPrefixCompleteLocked(plan.stableSlot, plan.hasStable) {
@@ -1120,9 +1115,8 @@ func (r *Replica) broadcastStartView(msg *BusStartView) {
 }
 
 // initialStartViewMsgLocked snapshots exactly the merge that was decided. It is
-// deliberately independent of nextExpected: real buses outside the merge stay
-// resident while the initial multicast runs, and later StartView responses may
-// legitimately include them only after Normal publishes and sweeps them.
+// deliberately independent of nextExpected: speculative buses outside the
+// merge stay resident until Normal publishes and sweeps them.
 func (r *Replica) initialStartViewMsgLocked(view uint64, plan *mergePlan,
 	maxSlot uint64, hasMax bool) *BusStartView {
 	msg := &BusStartView{
@@ -1366,10 +1360,8 @@ func (r *Replica) installStartView(msg *BusStartView) {
 	}
 }
 
-// prepareRecoveryLocked establishes the immutable reconciliation boundary
-// before releasing r.mu. Entries already present outside the merged log are
-// removed here, so buses arriving after recovery begins are never swept away by
-// a later cleanup pass.
+// prepareRecoveryLocked establishes the reconciliation boundary and removes
+// entries outside the merged log before releasing r.mu.
 func (r *Replica) prepareRecoveryLocked(rec *viewRecovery, msg *BusStartView,
 	selected bool) (rewound uint64, didRewind, ok bool) {
 
@@ -1457,9 +1449,7 @@ func (r *Replica) prepareRecoveryLocked(rec *viewRecovery, msg *BusStartView,
 	return rewound, didRewind, true
 }
 
-// clearSlotRangeLocked removes the entries that existed when recovery began.
-// The caller holds r.mu, so a live bus cannot appear in the range until after
-// this one-time cleanup has finished.
+// clearSlotRangeLocked removes entries from the recovery range.
 func (r *Replica) clearSlotRangeLocked(from, to uint64, bounded bool) {
 	for slot, entry := range r.globalLog {
 		if slot < from || (bounded && slot > to) {
@@ -1542,11 +1532,10 @@ func (r *Replica) finishRecoveryIfComplete(rec *viewRecovery) bool {
 		r.setStableLocked(rec.stable)
 	}
 
-	// Publish Normal only after every canonical reply is queued. The mutex keeps
-	// replyLoop and ordinary bus handling out until publication; the unbounded
-	// sweep then appends replies for buses recorded beyond the merge boundary.
+	// Publish Normal only after every canonical reply is queued.
 	r.lastNormalView = rec.view
 	r.cancelViewChangeWatchdogLocked()
+	r.installPendingSyncsLocked()
 	r.status = statusNormal
 	r.lastHeartbeatNs = nowNs()
 	r.leaderLost = false
@@ -1680,6 +1669,7 @@ func (r *Replica) installCanonicalViewLocked(view, stable uint64, hasStable bool
 func (r *Replica) publishNormalViewLocked(view uint64) {
 	r.lastNormalView = view
 	r.cancelViewChangeWatchdogLocked()
+	r.installPendingSyncsLocked()
 	r.status = statusNormal
 	r.lastHeartbeatNs = nowNs()
 	r.leaderLost = false

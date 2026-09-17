@@ -3,6 +3,7 @@ package paxosbus
 import (
 	"bufio"
 	"fmt"
+	"math"
 	"net"
 	"os"
 	"strconv"
@@ -233,10 +234,7 @@ func (m dropMode) String() string {
 	}
 }
 
-// replicaStatus gates the cursor. In ViewChange the replica still records
-// arriving buses into their slots — a bus's position comes from its client's
-// line, not from any leader — but nothing is decomposed into the request log
-// list and no client hears back until the new view is installed.
+// replicaStatus gates the cursor.
 type replicaStatus uint8
 
 const (
@@ -275,6 +273,9 @@ type Replica struct {
 
 	mu             sync.Mutex
 	clients        map[uint64]*clientLine
+	pendingSyncs   map[uint64]BusSyncMessage
+	pauseNotified  map[uint64]uint64
+	syncBarrierNs  int64
 	status         replicaStatus
 	lastNormalView uint64
 	recovery       *viewRecovery
@@ -469,6 +470,8 @@ func NewReplica(config *Config, idx int, label, logDir string, mode dropMode, ev
 		self:                      self,
 		gapDeltaNs:                int64(gapDeltaMs) * 1e6,
 		clients:                   make(map[uint64]*clientLine),
+		pendingSyncs:              make(map[uint64]BusSyncMessage),
+		pauseNotified:             make(map[uint64]uint64),
 		globalLog:                 make(map[uint64]*globalEntry),
 		dedup:                     make(map[reqKey]uint64),
 		State:                     state.InitState(),
@@ -726,6 +729,14 @@ func (r *Replica) clientListener(conn net.Conn) {
 			}
 			r.handleBus(&busMsg, lw)
 
+		case MsgClientStatusQuery:
+			var m ClientStatusQuery
+			if err := m.Unmarshal(reader); err != nil {
+				Warning("[%s] bad client status query: %v", r.self, err)
+				return
+			}
+			r.handleClientStatusQuery(&m, lw)
+
 		case MsgBusGapRequest:
 			var m BusGapRequest
 			if err := m.Unmarshal(reader); err != nil {
@@ -850,18 +861,64 @@ func (r *Replica) clientListener(conn net.Conn) {
 	}
 }
 
-// handleSync installs a client's arrival line — the only coordination the
-// common path needs, since every replica derives the same order from it.
+// handleSync installs a client's arrival line. During view change it is held
+// until the replica publishes Normal, keeping recovery on the old schedule.
 func (r *Replica) handleSync(msg *BusSyncMessage) {
 	r.mu.Lock()
+	baseNs, ok := clientLineBase(msg)
+	if !ok {
+		r.mu.Unlock()
+		Warning("[%s] invalid sync from client %d", r.self, msg.ClientId)
+		return
+	}
+	if r.status != statusNormal {
+		r.pendingSyncs[msg.ClientId] = *msg
+		r.mu.Unlock()
+		Notice("[%s] queued sync from client %d during view change", r.self, msg.ClientId)
+		return
+	}
+	r.installClientSyncLocked(msg, baseNs)
+	r.mu.Unlock()
+	Notice("[%s] sync from client %d: bus %d expected at %dns (in %dms), interval=%dms",
+		r.self, msg.ClientId, msg.NextBusSeq, msg.FirstMsgNs,
+		(int64(msg.FirstMsgNs)-wallNs())/1e6, msg.IntervalMs)
+}
+
+func clientLineBase(msg *BusSyncMessage) (int64, bool) {
+	if msg.NextBusSeq == 0 || msg.IntervalMs == 0 || msg.FirstMsgNs > math.MaxInt64 ||
+		msg.IntervalMs > uint64(math.MaxInt64/1_000_000) {
+		return 0, false
+	}
+	intervalNs := int64(msg.IntervalMs) * 1e6
+	if msg.NextBusSeq-1 > uint64(math.MaxInt64/intervalNs) {
+		return 0, false
+	}
+	return int64(msg.FirstMsgNs) - int64(msg.NextBusSeq-1)*intervalNs, true
+}
+
+func (r *Replica) installClientSyncLocked(msg *BusSyncMessage, baseNs int64) {
+	maxSeqSeen := uint64(0)
+	if old := r.clients[msg.ClientId]; old != nil {
+		maxSeqSeen = old.maxSeqSeen
+	}
 	r.clients[msg.ClientId] = &clientLine{
-		baseNs:     int64(msg.FirstMsgNs),
-		intervalNs: int64(msg.IntervalMs) * 1e6,
+		baseNs: baseNs, intervalNs: int64(msg.IntervalMs) * 1e6,
+		maxSeqSeen: maxSeqSeen,
+	}
+	if first := int64(msg.FirstMsgNs); first > r.syncBarrierNs {
+		r.syncBarrierNs = first
 	}
 	r.resetCursorLocked()
-	r.mu.Unlock()
-	Notice("[%s] sync from client %d: first msg expected at %dns (in %dms), interval=%dms",
-		r.self, msg.ClientId, msg.FirstMsgNs, (int64(msg.FirstMsgNs)-wallNs())/1e6, msg.IntervalMs)
+}
+
+func (r *Replica) installPendingSyncsLocked() {
+	for clientId, msg := range r.pendingSyncs {
+		baseNs, ok := clientLineBase(&msg)
+		if ok {
+			r.installClientSyncLocked(&msg, baseNs)
+		}
+		delete(r.pendingSyncs, clientId)
+	}
 }
 
 // resetCursorLocked discards the memoized slot-to-owner inverse: a new line
@@ -925,13 +982,29 @@ func (r *Replica) handleBus(msg *BusMessage, lw *lockedWriter) {
 	r.bindReplySender(msg.ClientId, lw)
 
 	r.mu.Lock()
+	var pause *ClientPauseMessage
+	if r.status != statusNormal {
+		view := r.view()
+		notifiedView, notified := r.pauseNotified[msg.ClientId]
+		if !notified || notifiedView != view {
+			r.pauseNotified[msg.ClientId] = view
+			pause = &ClientPauseMessage{ViewId: view, ReplicaIdx: uint32(r.idx)}
+		}
+		if _, resynced := r.pendingSyncs[msg.ClientId]; resynced {
+			r.mu.Unlock()
+			r.sendClientPause(msg.ClientId, pause, lw)
+			return
+		}
+	}
 	switch r.admitLocked(msg.ClientId, msg.BusSeqNum, actualNs) {
 	case admitUnsynced:
 		r.mu.Unlock()
+		r.sendClientPause(msg.ClientId, pause, lw)
 		Warning("[%s] bus from unsynced client %d, ignoring", r.self, msg.ClientId)
 		return
 	case admitDropped:
 		r.mu.Unlock()
+		r.sendClientPause(msg.ClientId, pause, lw)
 		return
 	}
 	if len(r.gaps) > 0 {
@@ -942,6 +1015,28 @@ func (r *Replica) handleBus(msg *BusMessage, lw *lockedWriter) {
 		r.advanceNextExpectedLocked()
 	}
 	r.mu.Unlock()
+	r.sendClientPause(msg.ClientId, pause, lw)
+}
+
+func (r *Replica) sendClientPause(clientId uint64, msg *ClientPauseMessage, lw *lockedWriter) {
+	if msg == nil {
+		return
+	}
+	if err := lw.sendMsg(MsgClientPause, msg); err != nil {
+		Warning("[%s] failed to pause client %d: %v", r.self, clientId, err)
+	}
+}
+
+func (r *Replica) handleClientStatusQuery(msg *ClientStatusQuery, lw *lockedWriter) {
+	r.mu.Lock()
+	reply := ClientStatusReply{
+		QueryId: msg.QueryId, ViewId: r.view(), ReplicaIdx: uint32(r.idx),
+		Normal: r.status == statusNormal,
+	}
+	r.mu.Unlock()
+	if err := lw.sendMsg(MsgClientStatusReply, &reply); err != nil {
+		Warning("[%s] failed to send client status: %v", r.self, err)
+	}
 }
 
 // bindReplySender points this client's reply sender at the connection its bus
@@ -1189,10 +1284,7 @@ func (r *Replica) slotOpLocked(slot uint64) []byte {
 // advanceNextExpectedLocked walks the contiguous filled prefix forward. Slots
 // fill out of order, so this is where a run of them commits at once.
 //
-// Outside statusNormal the cursor is frozen: buses arriving during a view change
-// are still recorded into their slots (their position comes from the client's
-// line, not from any leader), they are just not decomposed into the request log
-// list and no reply is sent, since nothing may be committed without a leader.
+// Outside statusNormal the cursor is frozen while in-flight buses are retained.
 func (r *Replica) advanceNextExpectedLocked() {
 	if r.status != statusNormal {
 		r.pruneCommittedLocked()
@@ -1767,7 +1859,8 @@ func (r *Replica) gapDetectLoop() {
 		r.mu.Lock()
 		// With the cursor frozen every slot above nextExpected looks like a gap,
 		// and there is no leader to agree a no-op with anyway.
-		if r.status == statusNormal && r.haveMax && len(r.clients) > 0 {
+		if r.status == statusNormal && wallNow >= r.syncBarrierNs &&
+			r.haveMax && len(r.clients) > 0 {
 			view := r.view()
 			r.genCursorUpToLocked(r.maxSlotSeen)
 			for slot := r.nextExpected; slot <= r.maxSlotSeen; slot++ {

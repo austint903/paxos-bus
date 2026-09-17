@@ -13,7 +13,9 @@ import (
 
 const (
 	defaultStartDelayMs     = 5000
+	defaultRecoveryWaitMs   = 1500
 	defaultRequestTimeoutMs = 5000
+	statusPollInterval      = 250 * time.Millisecond
 	// DefaultCommandSize is the value size in bytes, matching the GCP baselines.
 	DefaultCommandSize = 16
 )
@@ -44,6 +46,15 @@ const gcCommittedNs = 2 * int64(time.Second)
 type lockedWriter struct {
 	mu sync.Mutex
 	w  *bufio.Writer
+}
+
+func stopTimer(t *time.Timer) {
+	if !t.Stop() {
+		select {
+		case <-t.C:
+		default:
+		}
+	}
 }
 
 func (lw *lockedWriter) sendMsg(code uint8, msg wireMsg) error {
@@ -132,12 +143,13 @@ type Client struct {
 	resendMs   uint64
 	self       string
 
-	genIntervalUs uint64
-	requestOp     []byte // immutable write value, shared by this client's requests
-	reqTimeoutNs  int64
-	verbose       bool
-	startDelayMs  uint64
-	syncWallNs    int64
+	genIntervalUs  uint64
+	requestOp      []byte // immutable write value, shared by this client's requests
+	reqTimeoutNs   int64
+	verbose        bool
+	startDelayMs   uint64
+	recoveryWaitMs uint64
+	syncWallNs     int64
 
 	// maxOwdNs is the worst one-way delay from this client to any replica.
 	// The sync message announces an ARRIVAL schedule, so every bus departs
@@ -164,6 +176,17 @@ type Client struct {
 	busSeqNum uint64
 	rInflight map[uint64]*reqInflight
 
+	pauseMu       sync.Mutex
+	paused        bool
+	activeView    uint64
+	pauseView     uint64
+	pauseEpoch    uint64
+	pauseCh       chan struct{}
+	resumeCh      chan struct{}
+	resumeSendNs  int64
+	statusReplies chan ClientStatusReply
+	statusQueryId uint64
+
 	committedCount uint64
 	totalRttUs     uint64
 	resendCount    uint64
@@ -176,7 +199,7 @@ type Client struct {
 
 func NewClient(config *Config, clientId, intervalMs, resendMs uint64, label string,
 	genIntervalUs uint64, verbose bool, startDelayMs uint64,
-	maxOwdMs float64, commandSize int) *Client {
+	recoveryWaitMs uint64, maxOwdMs float64, commandSize int) *Client {
 	self := "Client " + strconv.FormatUint(clientId, 10)
 	if label != "" {
 		self += " " + label
@@ -187,28 +210,34 @@ func NewClient(config *Config, clientId, intervalMs, resendMs uint64, label stri
 	if resendMs == 0 {
 		resendMs = defaultRequestTimeoutMs
 	}
+	if recoveryWaitMs == 0 {
+		recoveryWaitMs = defaultRecoveryWaitMs
+	}
 	requestOp := make([]byte, commandSize)
 	if _, err := crand.Read(requestOp); err != nil {
 		panic("cannot generate write payload: " + err.Error())
 	}
 	c := &Client{
-		config:        config,
-		clientId:      clientId,
-		intervalMs:    intervalMs,
-		resendMs:      resendMs,
-		self:          self,
-		genIntervalUs: genIntervalUs,
-		requestOp:     requestOp,
-		reqTimeoutNs:  int64(resendMs) * 1e6,
-		verbose:       verbose,
-		startDelayMs:  startDelayMs,
-		maxOwdNs:      int64(maxOwdMs * 1e6),
-		owdAuto:       maxOwdMs == 0,
-		conns:         make([]net.Conn, config.N),
-		readers:       make([]*bufio.Reader, config.N),
-		writers:       make([]*lockedWriter, config.N),
-		busSenders:    make([]*connSender, config.N),
-		rInflight:     make(map[uint64]*reqInflight),
+		config:         config,
+		clientId:       clientId,
+		intervalMs:     intervalMs,
+		resendMs:       resendMs,
+		self:           self,
+		genIntervalUs:  genIntervalUs,
+		requestOp:      requestOp,
+		reqTimeoutNs:   int64(resendMs) * 1e6,
+		verbose:        verbose,
+		startDelayMs:   startDelayMs,
+		recoveryWaitMs: recoveryWaitMs,
+		maxOwdNs:       int64(maxOwdMs * 1e6),
+		owdAuto:        maxOwdMs == 0,
+		conns:          make([]net.Conn, config.N),
+		readers:        make([]*bufio.Reader, config.N),
+		writers:        make([]*lockedWriter, config.N),
+		busSenders:     make([]*connSender, config.N),
+		rInflight:      make(map[uint64]*reqInflight),
+		pauseCh:        make(chan struct{}),
+		statusReplies:  make(chan ClientStatusReply, config.N*2),
 	}
 	resend := ""
 	if resendMs > 0 {
@@ -266,10 +295,9 @@ func (c *Client) Connect() error {
 }
 
 func (c *Client) Run() {
-	// The sync message announces the arrival-prediction line the replicas order
-	// by: expect this client's msg n at FirstMsgNs + (n-1)*interval. FirstMsgNs
-	// is a true ARRIVAL instant: msg n departs maxOwdNs earlier (see
-	// firstSendWallNs), so it reaches the farthest replica right on its line
+	// The sync message anchors the arrival-prediction line at NextBusSeq.
+	// FirstMsgNs is a true ARRIVAL instant: the bus departs maxOwdNs earlier, so
+	// it reaches the farthest replica right on its line
 	// and nearer replicas early. Ordering by send instants instead made every
 	// in-order append (and thus every reply) wait out the slowest inbound
 	// region's one-way delay past the line — the straggler penalty; now the
@@ -279,16 +307,10 @@ func (c *Client) Run() {
 		ClientId:   c.clientId,
 		FirstMsgNs: uint64(c.dataPhaseStartWallNs()),
 		IntervalMs: c.intervalMs,
+		NextBusSeq: 1,
 	}
-	for i, lw := range c.writers {
-		lw.mu.Lock()
-		lw.w.WriteByte(MsgBusSync)
-		syncMsg.Marshal(lw.w)
-		err := lw.w.Flush()
-		lw.mu.Unlock()
-		if err != nil {
-			Panic("[%s] failed to send sync to replica %d: %v", c.self, i, err)
-		}
+	if !c.broadcastSync(&syncMsg) {
+		Panic("[%s] failed to send initial sync", c.self)
 	}
 	Notice("[%s] sync sent, waiting %dms before data phase", c.self, c.startDelayMs)
 
@@ -315,6 +337,17 @@ func (c *Client) Run() {
 	c.busLoop()
 }
 
+func (c *Client) broadcastSync(msg *BusSyncMessage) bool {
+	ok := true
+	for i, lw := range c.writers {
+		if err := lw.sendMsg(MsgBusSync, msg); err != nil {
+			Warning("[%s] failed to send sync to replica %d: %v", c.self, i, err)
+			ok = false
+		}
+	}
+	return ok
+}
+
 // genLoop produces requests at a fixed rate into c.pending, stamping SendTimeNs
 // so that latency counts each request's wait for a bus
 func (c *Client) genLoop() {
@@ -325,8 +358,17 @@ func (c *Client) genLoop() {
 	next := nowNs()
 	var rid uint64
 	for {
+		paused, changed, _ := c.pauseState()
+		if paused {
+			<-changed
+			next = nowNs()
+			continue
+		}
 		now := nowNs()
 		for now >= next {
+			if c.isPaused() {
+				break
+			}
 			rid++
 			c.pendingMu.Lock()
 			c.pending = append(c.pending, RequestMessage{
@@ -340,7 +382,13 @@ func (c *Client) genLoop() {
 			now = nowNs()
 		}
 		if sleep := next - nowNs(); sleep > 0 {
-			time.Sleep(time.Duration(sleep))
+			timer := time.NewTimer(time.Duration(sleep))
+			select {
+			case <-changed:
+				stopTimer(timer)
+				next = nowNs()
+			case <-timer.C:
+			}
 		}
 	}
 }
@@ -358,35 +406,51 @@ func (c *Client) firstSendWallNs() int64 {
 	return c.dataPhaseStartWallNs() - c.maxOwdNs
 }
 
-// runOnSchedule fires tick at base, base+interval, base+2*interval, and so on
-func (c *Client) runOnSchedule(base, intervalNs int64, tick func()) {
-	next := base
-	curEpoch := int64(0)
-	for {
-		now := wallNs()
-		for now >= next {
-			tick()
-			next += intervalNs
-			if epoch := (next - base) / int64(time.Second); epoch != curEpoch {
-				c.emitStats()
-				curEpoch = epoch
-			}
-			now = wallNs()
-		}
-		if sleep := next - wallNs(); sleep > 0 {
-			time.Sleep(time.Duration(sleep))
-		}
-	}
-}
-
 // busLoop departs one bus per interval on the announced schedule
 func (c *Client) busLoop() {
-	c.runOnSchedule(c.firstSendWallNs(), int64(c.intervalMs)*1e6, c.sendBus)
+	intervalNs := int64(c.intervalMs) * 1e6
+	next := c.firstSendWallNs()
+	lastStats := wallNs()
+	resetSchedule := false
+	for {
+		paused, changed, resumeAt := c.pauseState()
+		if paused {
+			resetSchedule = true
+			<-changed
+			continue
+		}
+		if resetSchedule {
+			next = resumeAt
+			resetSchedule = false
+		}
+		now := wallNs()
+		if now < next {
+			timer := time.NewTimer(time.Duration(next - now))
+			select {
+			case <-changed:
+				stopTimer(timer)
+				resetSchedule = true
+				continue
+			case <-timer.C:
+			}
+		}
+		if !c.isPaused() {
+			c.sendBus()
+		}
+		next += intervalNs
+		if now := wallNs(); now-lastStats >= int64(time.Second) {
+			c.emitStats()
+			lastStats = now
+		}
+	}
 }
 
 // sendBus drains the pending and retry buffers into one bus, marshals it once,
 // and hands the same bytes to every replica's sender
 func (c *Client) sendBus() {
+	if c.isPaused() {
+		return
+	}
 	c.pendingMu.Lock()
 	batch := c.pending
 	c.pending = nil
@@ -448,6 +512,9 @@ func (c *Client) reqTimeoutLoop() {
 	}
 	ticker := time.NewTicker(tick)
 	for range ticker.C {
+		if c.isPaused() {
+			continue
+		}
 		now := nowNs()
 		var reboard []RequestMessage
 		c.mu.Lock()
@@ -476,6 +543,8 @@ func (c *Client) reqTimeoutLoop() {
 func (c *Client) receiveLoop(rid int) {
 	reader := c.readers[rid]
 	var reqReply RequestReplyMessage
+	var pause ClientPauseMessage
+	var status ClientStatusReply
 	for {
 		msgType, err := reader.ReadByte()
 		if err != nil {
@@ -489,11 +558,174 @@ func (c *Client) receiveLoop(rid int) {
 				return
 			}
 			c.handleRequestReply(&reqReply)
+		case MsgClientPause:
+			if err := pause.Unmarshal(reader); err != nil {
+				Warning("[%s] bad pause message from replica %d: %v", c.self, rid, err)
+				return
+			}
+			c.handlePause(&pause)
+		case MsgClientStatusReply:
+			if err := status.Unmarshal(reader); err != nil {
+				Warning("[%s] bad status reply from replica %d: %v", c.self, rid, err)
+				return
+			}
+			select {
+			case c.statusReplies <- status:
+			default:
+			}
 		default:
 			Warning("[%s] unknown message type %d from replica %d",
 				c.self, msgType, rid)
 			return
 		}
+	}
+}
+
+func (c *Client) pauseState() (bool, <-chan struct{}, int64) {
+	c.pauseMu.Lock()
+	defer c.pauseMu.Unlock()
+	if c.paused {
+		return true, c.resumeCh, c.resumeSendNs
+	}
+	return false, c.pauseCh, c.resumeSendNs
+}
+
+func (c *Client) isPaused() bool {
+	c.pauseMu.Lock()
+	paused := c.paused
+	c.pauseMu.Unlock()
+	return paused
+}
+
+func (c *Client) handlePause(msg *ClientPauseMessage) {
+	c.pauseMu.Lock()
+	if msg.ViewId <= c.activeView {
+		c.pauseMu.Unlock()
+		return
+	}
+	started := false
+	if !c.paused {
+		c.paused = true
+		c.pauseView = msg.ViewId
+		c.pauseEpoch++
+		close(c.pauseCh)
+		c.resumeCh = make(chan struct{})
+		started = true
+	} else if msg.ViewId > c.pauseView {
+		c.pauseView = msg.ViewId
+		c.pauseEpoch++
+	}
+	c.pauseMu.Unlock()
+	if !started {
+		return
+	}
+	Notice("[%s] pausing for view change at replica %d view=%d",
+		c.self, msg.ReplicaIdx, msg.ViewId)
+	go c.recoveryLoop()
+}
+
+func (c *Client) recoveryLoop() {
+	for {
+		c.pauseMu.Lock()
+		if !c.paused {
+			c.pauseMu.Unlock()
+			return
+		}
+		minView, epoch := c.pauseView, c.pauseEpoch
+		c.pauseMu.Unlock()
+
+		view := c.waitForNormalQuorum(minView)
+		c.pauseMu.Lock()
+		stale := !c.paused || c.pauseEpoch != epoch || view < c.pauseView
+		c.pauseMu.Unlock()
+		if stale {
+			continue
+		}
+
+		c.mu.Lock()
+		nextSeq := c.busSeqNum + 1
+		c.mu.Unlock()
+		arrivalNs := wallNs() + int64(c.recoveryWaitMs)*1e6
+		msg := BusSyncMessage{
+			ClientId: c.clientId, FirstMsgNs: uint64(arrivalNs),
+			IntervalMs: c.intervalMs, NextBusSeq: nextSeq,
+		}
+		c.broadcastSync(&msg)
+		Notice("[%s] normal quorum in view=%d; sync sent, waiting %dms before resuming",
+			c.self, view, c.recoveryWaitMs)
+
+		resumeSendNs := arrivalNs - c.maxOwdNs
+		if sleep := resumeSendNs - wallNs(); sleep > 0 {
+			time.Sleep(time.Duration(sleep))
+		}
+
+		c.pauseMu.Lock()
+		if !c.paused || c.pauseEpoch != epoch || view < c.pauseView {
+			c.pauseMu.Unlock()
+			continue
+		}
+		c.mu.Lock()
+		now := nowNs()
+		for _, req := range c.rInflight {
+			if !req.committed {
+				req.sendTimeNs = now
+			}
+		}
+		c.mu.Unlock()
+		c.activeView = view
+		c.resumeSendNs = resumeSendNs
+		c.paused = false
+		c.pauseCh = make(chan struct{})
+		close(c.resumeCh)
+		c.pauseMu.Unlock()
+		Notice("[%s] resumed in view=%d at bus=%d", c.self, view, nextSeq)
+		return
+	}
+}
+
+func (c *Client) waitForNormalQuorum(minView uint64) uint64 {
+	for {
+		for {
+			select {
+			case <-c.statusReplies:
+			default:
+				goto drained
+			}
+		}
+	drained:
+		c.statusQueryId++
+		queryId := c.statusQueryId
+		query := ClientStatusQuery{QueryId: queryId}
+		for i, lw := range c.writers {
+			if err := lw.sendMsg(MsgClientStatusQuery, &query); err != nil {
+				Warning("[%s] status query to replica %d failed: %v", c.self, i, err)
+			}
+		}
+
+		votes := make(map[uint64]map[uint32]struct{})
+		timer := time.NewTimer(statusPollInterval)
+		for {
+			select {
+			case reply := <-c.statusReplies:
+				if reply.QueryId != queryId || !reply.Normal || reply.ViewId < minView ||
+					int(reply.ReplicaIdx) >= c.config.N {
+					continue
+				}
+				set := votes[reply.ViewId]
+				if set == nil {
+					set = make(map[uint32]struct{})
+					votes[reply.ViewId] = set
+				}
+				set[reply.ReplicaIdx] = struct{}{}
+				if len(set) >= c.config.QuorumSize() {
+					stopTimer(timer)
+					return reply.ViewId
+				}
+			case <-timer.C:
+				goto retry
+			}
+		}
+	retry:
 	}
 }
 

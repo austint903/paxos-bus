@@ -59,6 +59,11 @@ const (
 	MsgBusStateQuery
 	MsgBusGetState
 	MsgBusNewState
+
+	// Client backpressure during view change.
+	MsgClientPause
+	MsgClientStatusQuery
+	MsgClientStatusReply
 )
 
 // Sanity caps on the variable-length parts of the recovery messages. A view
@@ -76,8 +81,9 @@ type wireMsg interface {
 
 type BusSyncMessage struct {
 	ClientId   uint64
-	FirstMsgNs uint64 // wall-clock ns when this client's first bus ARRIVES (it departs maxOWD earlier)
-	IntervalMs uint64 // bus interval; expect msg n at FirstMsgNs + (n-1)*IntervalMs
+	FirstMsgNs uint64 // wall-clock ns when NextBusSeq ARRIVES
+	IntervalMs uint64
+	NextBusSeq uint64
 }
 
 func (m *BusSyncMessage) New() fastrpc.Serializable {
@@ -85,21 +91,23 @@ func (m *BusSyncMessage) New() fastrpc.Serializable {
 }
 
 func (m *BusSyncMessage) Marshal(wire io.Writer) {
-	var b [24]byte
+	var b [32]byte
 	binary.LittleEndian.PutUint64(b[0:8], m.ClientId)
 	binary.LittleEndian.PutUint64(b[8:16], m.FirstMsgNs)
 	binary.LittleEndian.PutUint64(b[16:24], m.IntervalMs)
+	binary.LittleEndian.PutUint64(b[24:32], m.NextBusSeq)
 	wire.Write(b[:])
 }
 
 func (m *BusSyncMessage) Unmarshal(wire io.Reader) error {
-	var b [24]byte
+	var b [32]byte
 	if _, err := io.ReadFull(wire, b[:]); err != nil {
 		return err
 	}
 	m.ClientId = binary.LittleEndian.Uint64(b[0:8])
 	m.FirstMsgNs = binary.LittleEndian.Uint64(b[8:16])
 	m.IntervalMs = binary.LittleEndian.Uint64(b[16:24])
+	m.NextBusSeq = binary.LittleEndian.Uint64(b[24:32])
 	return nil
 }
 
@@ -125,6 +133,22 @@ type RequestReplyMessage struct {
 	ViewId     uint64
 	ReplicaIdx uint32
 	Result     []byte
+}
+
+type ClientPauseMessage struct {
+	ViewId     uint64
+	ReplicaIdx uint32
+}
+
+type ClientStatusQuery struct {
+	QueryId uint64
+}
+
+type ClientStatusReply struct {
+	QueryId    uint64
+	ViewId     uint64
+	ReplicaIdx uint32
+	Normal     bool
 }
 
 func (m *RequestMessage) New() fastrpc.Serializable {
@@ -228,6 +252,65 @@ func (m *RequestReplyMessage) Unmarshal(wire io.Reader) error {
 	if _, err := io.ReadFull(wire, m.Result); err != nil {
 		return err
 	}
+	return nil
+}
+
+func (m *ClientPauseMessage) New() fastrpc.Serializable { return new(ClientPauseMessage) }
+
+func (m *ClientPauseMessage) Marshal(wire io.Writer) {
+	var b [12]byte
+	binary.LittleEndian.PutUint64(b[0:8], m.ViewId)
+	binary.LittleEndian.PutUint32(b[8:12], m.ReplicaIdx)
+	wire.Write(b[:])
+}
+
+func (m *ClientPauseMessage) Unmarshal(wire io.Reader) error {
+	var b [12]byte
+	if _, err := io.ReadFull(wire, b[:]); err != nil {
+		return err
+	}
+	m.ViewId = binary.LittleEndian.Uint64(b[0:8])
+	m.ReplicaIdx = binary.LittleEndian.Uint32(b[8:12])
+	return nil
+}
+
+func (m *ClientStatusQuery) New() fastrpc.Serializable { return new(ClientStatusQuery) }
+
+func (m *ClientStatusQuery) Marshal(wire io.Writer) {
+	var b [8]byte
+	binary.LittleEndian.PutUint64(b[:], m.QueryId)
+	wire.Write(b[:])
+}
+
+func (m *ClientStatusQuery) Unmarshal(wire io.Reader) error {
+	var b [8]byte
+	if _, err := io.ReadFull(wire, b[:]); err != nil {
+		return err
+	}
+	m.QueryId = binary.LittleEndian.Uint64(b[:])
+	return nil
+}
+
+func (m *ClientStatusReply) New() fastrpc.Serializable { return new(ClientStatusReply) }
+
+func (m *ClientStatusReply) Marshal(wire io.Writer) {
+	var b [21]byte
+	binary.LittleEndian.PutUint64(b[0:8], m.QueryId)
+	binary.LittleEndian.PutUint64(b[8:16], m.ViewId)
+	binary.LittleEndian.PutUint32(b[16:20], m.ReplicaIdx)
+	putBool(b[20:21], m.Normal)
+	wire.Write(b[:])
+}
+
+func (m *ClientStatusReply) Unmarshal(wire io.Reader) error {
+	var b [21]byte
+	if _, err := io.ReadFull(wire, b[:]); err != nil {
+		return err
+	}
+	m.QueryId = binary.LittleEndian.Uint64(b[0:8])
+	m.ViewId = binary.LittleEndian.Uint64(b[8:16])
+	m.ReplicaIdx = binary.LittleEndian.Uint32(b[16:20])
+	m.Normal = b[20] != 0
 	return nil
 }
 

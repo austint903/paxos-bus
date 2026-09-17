@@ -18,6 +18,7 @@ func main() {
 	commandSize := flag.Int("command-size", paxosbus.DefaultCommandSize, "write value size in bytes (all requests are PUTs)")
 	verbose := flag.Bool("v", false, "log every per-replica REPLY line (3 log writes per request at high rates; COMMITTED lines are always logged)")
 	startDelayMs := flag.Uint64("w", 5000, "delay in ms between sync and the data phase; every client must sync within this window")
+	recoveryWaitMs := flag.Uint64("recovery-wait-ms", 1500, "delay in ms between a post-view-change sync and resumed traffic")
 	maxOwdMs := flag.Float64("owd", 0, "max one-way delay to any replica in ms; buses depart this early so they arrive on the announced schedule (0 = auto-measure as max TCP dial RTT / 2)")
 	flag.Parse()
 	if *commandSize <= 0 || uint64(*commandSize) > uint64(^uint32(0)) {
@@ -46,7 +47,7 @@ func main() {
 	}
 
 	client := paxosbus.NewClient(config, *clientId, *intervalMs, *resendMs, *label,
-		*genIntervalUs, *verbose, *startDelayMs, *maxOwdMs, *commandSize)
+		*genIntervalUs, *verbose, *startDelayMs, *recoveryWaitMs, *maxOwdMs, *commandSize)
 	if err := client.Connect(); err != nil {
 		fmt.Fprintf(os.Stderr, "cannot connect: %v\n", err)
 		os.Exit(1)
