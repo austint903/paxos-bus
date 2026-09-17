@@ -15,7 +15,7 @@ const (
 	defaultStartDelayMs     = 5000
 	defaultRecoveryWaitMs   = 1500
 	defaultRequestTimeoutMs = 5000
-	statusPollInterval      = 250 * time.Millisecond
+	statusPollInterval      = 350 * time.Millisecond
 	// DefaultCommandSize is the value size in bytes, matching the GCP baselines.
 	DefaultCommandSize = 16
 )
