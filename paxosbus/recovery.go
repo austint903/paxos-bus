@@ -58,16 +58,19 @@ const (
 // outstanding state-transfer response from this installation ineligible to
 // mutate the log.
 type viewRecovery struct {
-	view       uint64
-	generation uint64
-	leader     int
-	abort      chan struct{}
-	stable     uint64
-	hasStable  bool
-	maxSlot    uint64
-	hasMax     bool
-	replayFrom uint64
-	replayTo   uint64
+	view         uint64
+	generation   uint64
+	leader       int
+	abort        chan struct{}
+	stable       uint64
+	hasStable    bool
+	maxSlot      uint64
+	hasMax       bool
+	replayFrom   uint64
+	replayTo     uint64
+	verifyPrefix bool
+	prefixHash   uint64
+	repairFrom   uint64
 }
 
 // ── Commit point ────────────────────────────────────────────────────────────
@@ -1374,8 +1377,9 @@ func (r *Replica) prepareRecoveryLocked(rec *viewRecovery, msg *BusStartView,
 		canonicalEnd = msg.MaxSlot + 1
 	}
 	localStableEnd := suffixBase(r.stableSlot, r.haveStable)
-	// Without a prefix comparison, fetch the newly committed range canonically.
-	repairPrefix := retain && msg.HasStable && r.nextExpected <= msg.StableSlot
+	rec.verifyPrefix = retain && msg.HasStable && r.nextExpected <= msg.StableSlot
+	rec.prefixHash = msg.PrefixHash
+	rec.repairFrom = localStableEnd
 	if r.haveStable && (!msg.HasMax || canonicalEnd < localStableEnd) {
 		Warning("[%s] cannot prepare recovery for view %d: merged end %d is below local stable frontier %d",
 			r.self, rec.view, canonicalEnd, localStableEnd)
@@ -1393,7 +1397,7 @@ func (r *Replica) prepareRecoveryLocked(rec *viewRecovery, msg *BusStartView,
 
 	if !msg.HasMax {
 		target = 0
-	} else if !retain || repairPrefix {
+	} else if !retain {
 		target = localStableEnd
 	} else {
 		if target > canonicalEnd {
@@ -1426,9 +1430,6 @@ func (r *Replica) prepareRecoveryLocked(rec *viewRecovery, msg *BusStartView,
 	if !retain {
 		r.clearSlotRangeLocked(target, 0, false)
 	} else {
-		if repairPrefix {
-			r.clearSlotRangeLocked(target, msg.StableSlot, true)
-		}
 		for slot, entry := range r.globalLog {
 			if slot < localStableEnd || entry == nil || entry.state != slotNoOp {
 				continue
@@ -1490,11 +1491,19 @@ func (r *Replica) recoveryMissingRange(rec *viewRecovery) (uint64, uint64, bool)
 	if !rec.hasMax || r.nextExpected > rec.maxSlot {
 		return 1, 0, true
 	}
-	for slot := r.nextExpected; slot <= rec.maxSlot; slot++ {
+	from, to := r.missingRangeLocked(r.nextExpected, rec.maxSlot)
+	return from, to, true
+}
+
+func (r *Replica) missingRangeLocked(from, end uint64) (uint64, uint64) {
+	if from < r.nextExpected {
+		from = r.nextExpected
+	}
+	for slot := from; slot <= end; slot++ {
 		if entry := r.globalLog[slot]; entry == nil || entry.state == slotEmpty {
 			// Fetch only the missing run, preserving the retained tail.
 			to := slot
-			for to < rec.maxSlot {
+			for to < end {
 				next := to + 1
 				entry := r.globalLog[next]
 				if entry != nil && entry.state != slotEmpty {
@@ -1502,10 +1511,13 @@ func (r *Replica) recoveryMissingRange(rec *viewRecovery) (uint64, uint64, bool)
 				}
 				to = next
 			}
-			return slot, to, true
+			return slot, to
+		}
+		if slot == end {
+			break
 		}
 	}
-	return 1, 0, true
+	return 1, 0
 }
 
 func (r *Replica) finishRecoveryIfComplete(rec *viewRecovery) bool {
@@ -1520,6 +1532,31 @@ func (r *Replica) finishRecoveryIfComplete(rec *viewRecovery) bool {
 				return false
 			}
 		}
+	}
+	if rec.verifyPrefix {
+		// Validate retained data before executing it or releasing replies.
+		hash := r.prefixHash
+		for slot := r.nextExpected; slot <= rec.stable; slot++ {
+			e := r.globalLog[slot]
+			clientId, reqId := e.clientId, e.reqId
+			if !e.ownerSet {
+				owner := r.slotOwnerLocked(slot)
+				clientId, reqId = owner.clientId, owner.reqId
+			}
+			hash = foldSlot(hash, slot, e.state, clientId, reqId)
+		}
+		if hash != rec.prefixHash {
+			if !r.rewindToLocked(rec.repairFrom) {
+				return false
+			}
+			r.clearSlotRangeLocked(rec.repairFrom, rec.stable, true)
+			r.recomputeMaxSlotLocked()
+			rec.replayTo = r.nextExpected
+			Warning("[%s] view %d: retained prefix mismatch, refetching [%d,%d]",
+				r.self, rec.view, rec.repairFrom, rec.stable)
+			return false
+		}
+		rec.verifyPrefix = false
 	}
 
 	// Execute only the canonical range while the ViewChange fence is still up.
@@ -2030,10 +2067,19 @@ func (r *Replica) runFetch(req fetchReq) bool {
 		if !r.fetchActive(req) {
 			return false
 		}
+		to := req.to
+		if req.syncGen != 0 {
+			r.mu.Lock()
+			next, to = r.missingRangeLocked(next, req.to)
+			r.mu.Unlock()
+			if next > to {
+				return true
+			}
+		}
 		r.sendToPeer(req.peer, MsgBusGetState, &BusGetState{
 			ViewId:    req.view,
 			FromSlot:  next,
-			ToSlot:    req.to,
+			ToSlot:    to,
 			FetchId:   req.fetchID,
 			SenderIdx: uint32(r.idx),
 		})
@@ -2043,7 +2089,7 @@ func (r *Replica) runFetch(req fetchReq) bool {
 			case m := <-r.newStateCh:
 				if m.ViewId != req.view || int(m.SenderIdx) != req.peer ||
 					m.FetchId != req.fetchID || m.FromSlot != next ||
-					m.ToSlot < next || m.ToSlot > req.to {
+					m.ToSlot < next || m.ToSlot > to {
 					continue // a reply to an earlier, abandoned request
 				}
 				if !r.applyStateEntries(m, req) {
