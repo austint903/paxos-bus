@@ -13,7 +13,7 @@ import (
 
 const (
 	defaultStartDelayMs     = 5000
-	defaultRecoveryWaitMs   = 1500
+	defaultRecoveryWaitMs   = 2500
 	defaultRequestTimeoutMs = 5000
 	statusPollInterval      = 350 * time.Millisecond
 	// DefaultCommandSize is the value size in bytes, matching the GCP baselines.
