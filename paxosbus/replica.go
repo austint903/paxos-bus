@@ -55,8 +55,10 @@ type globalEntry struct {
 	// slot releases exactly the dedup entries first assigned in that range, and
 	// no others — a re-boarded passenger's entry stays with the slot it first
 	// arrived on, which is the one that executed it.
-	logIdxLo uint64
-	logIdxHi uint64
+	logIdxLo      uint64
+	logIdxHi      uint64
+	prefixHash    uint64
+	logIndexAfter uint64
 
 	// One pre-bus value per written key lets recovery undo this slot without
 	// retaining a separate history entry for every passenger.
@@ -575,6 +577,7 @@ func (r *Replica) foldExecutedLocked(slot uint64, e *globalEntry) {
 		clientId, reqId = m.clientId, m.reqId
 	}
 	r.prefixHash = foldSlot(r.prefixHash, slot, e.state, clientId, reqId)
+	e.prefixHash, e.logIndexAfter = r.prefixHash, r.nextLogIndex
 	i := slot % r.ringSize
 	r.hashRing[i] = r.prefixHash
 	r.logIdxRing[i] = r.nextLogIndex
@@ -593,6 +596,10 @@ func (r *Replica) ringValidLocked(slot uint64) bool {
 // prefixHashAtLocked is the hash of the executed prefix [0, slot].
 func (r *Replica) prefixHashAtLocked(slot uint64) (uint64, bool) {
 	if !r.ringValidLocked(slot) {
+		// The stable checkpoint and speculative suffix can outlive the ring.
+		if e := r.globalLog[slot]; slot >= r.prunedBelow && slot < r.nextExpected && e != nil {
+			return e.prefixHash, true
+		}
 		return 0, false
 	}
 	return r.hashRing[slot%r.ringSize], true
@@ -602,6 +609,9 @@ func (r *Replica) prefixHashAtLocked(slot uint64) (uint64, bool) {
 // the request-log-list length to restore when rewinding to slot+1.
 func (r *Replica) logIndexAfterLocked(slot uint64) (uint64, bool) {
 	if !r.ringValidLocked(slot) {
+		if e := r.globalLog[slot]; slot >= r.prunedBelow && slot < r.nextExpected && e != nil {
+			return e.logIndexAfter, true
+		}
 		return 0, false
 	}
 	return r.logIdxRing[slot%r.ringSize], true
