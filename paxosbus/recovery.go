@@ -746,15 +746,16 @@ func bitSet(bm []byte, i uint64) bool {
 // donor per slot rather than carrying entries, so the leader pulls only what it
 // is actually missing.
 type mergePlan struct {
-	stableSlot uint64
-	hasStable  bool
-	maxSlot    uint64
-	hasMax     bool
-	noops      []uint64          // sorted; slots in (stableSlot, maxSlot] agreed empty
-	donors     map[uint64]uint32 // slot -> a replica known to hold the entry
-	selected   []uint32          // reports retained at the highest LastNormalView
-	catchUp    uint32            // who to pull the committed prefix from
-	hasCatchUp bool
+	sourceNormalView uint64
+	stableSlot       uint64
+	hasStable        bool
+	maxSlot          uint64
+	hasMax           bool
+	noops            []uint64          // sorted; slots in (stableSlot, maxSlot] agreed empty
+	donors           map[uint64]uint32 // slot -> a replica known to hold the entry
+	selected         []uint32          // reports retained at the highest LastNormalView
+	catchUp          uint32            // who to pull the committed prefix from
+	hasCatchUp       bool
 }
 
 // mergeSuffix decides the new view's log from metadata alone.
@@ -780,6 +781,7 @@ func mergeSuffix(reports []*BusViewChange) mergePlan {
 			best = m.LastNormalView
 		}
 	}
+	plan.sourceNormalView = best
 	survivors := make([]*BusViewChange, 0, len(reports))
 	for _, m := range reports {
 		if m.LastNormalView == best {
@@ -888,6 +890,7 @@ func (r *Replica) driveViewChange(vc *vcState) {
 		return
 	}
 	r.startViewView = vc.view
+	r.startViewSource = plan.sourceNormalView
 	r.startViewUsed = append(r.startViewUsed[:0], plan.selected...)
 	r.installCanonicalViewLocked(vc.view, plan.stableSlot, plan.hasStable,
 		canonicalMax, hasCanonical, plan.noops, false)
@@ -1126,12 +1129,13 @@ func (r *Replica) broadcastStartView(msg *BusStartView) {
 func (r *Replica) initialStartViewMsgLocked(view uint64, plan *mergePlan,
 	maxSlot uint64, hasMax bool) *BusStartView {
 	msg := &BusStartView{
-		ViewId:          view,
-		SenderIdx:       uint32(r.idx),
-		MaxSlot:         maxSlot,
-		HasMax:          hasMax,
-		SelectedReports: append([]uint32(nil), plan.selected...),
-		NoOpSlots:       append([]uint64(nil), plan.noops...),
+		ViewId:           view,
+		SourceNormalView: plan.sourceNormalView,
+		SenderIdx:        uint32(r.idx),
+		MaxSlot:          maxSlot,
+		HasMax:           hasMax,
+		SelectedReports:  append([]uint32(nil), plan.selected...),
+		NoOpSlots:        append([]uint64(nil), plan.noops...),
 	}
 	if plan.hasStable {
 		msg.StableSlot, msg.HasStable = plan.stableSlot, true
@@ -1155,12 +1159,14 @@ func (r *Replica) startViewMsg() *BusStartView {
 		return nil
 	}
 	msg := &BusStartView{
-		ViewId:          r.view(),
-		SenderIdx:       uint32(r.idx),
-		SelectedReports: append([]uint32(nil), r.startViewUsed...),
+		ViewId:           r.view(),
+		SourceNormalView: r.startViewSource,
+		SenderIdx:        uint32(r.idx),
+		SelectedReports:  append([]uint32(nil), r.startViewUsed...),
 	}
 	if r.startViewView != msg.ViewId {
 		msg.SelectedReports = nil
+		msg.SourceNormalView = r.lastNormalView
 	}
 	if r.haveStable {
 		msg.StableSlot, msg.HasStable = r.stableSlot, true
@@ -1215,6 +1221,9 @@ func (r *Replica) handleStartView(msg *BusStartView) {
 }
 
 func (r *Replica) validStartView(msg *BusStartView) bool {
+	if msg.SourceNormalView > msg.ViewId {
+		return false
+	}
 	if int(msg.SenderIdx) >= r.config.N ||
 		int(msg.SenderIdx) != r.config.LeaderIndex(msg.ViewId) {
 		Warning("[%s] ignoring start view %d from non-leader replica %d",
@@ -1264,10 +1273,7 @@ func (r *Replica) viewInstallLoop() {
 	}
 }
 
-// installStartView installs a decided view. The replica may be mid-view-change,
-// or simply stale and answering its own catch-up query; the difference is
-// whether it took part in deciding this view, which is also what decides how
-// much of its speculative work it has to give back.
+// installStartView installs a decided view and reconciles the local suffix.
 func (r *Replica) installStartView(msg *BusStartView) {
 	r.mu.Lock()
 	view := r.view()
@@ -1280,25 +1286,12 @@ func (r *Replica) installStartView(msg *BusStartView) {
 		r.mu.Unlock()
 		return
 	}
-	eligible := msg.ViewId == view && r.status == statusViewChange &&
-		r.vc != nil && r.vc.view == msg.ViewId && r.vc.reportSent
-	selected := false
-	if eligible {
-		for _, replica := range msg.SelectedReports {
-			if int(replica) == r.idx {
-				selected = true
-				break
-			}
-		}
-	}
-	// A selected replica can retain its suffix only if its known committed
-	// prefix agrees with the decision. Otherwise it takes the same conservative
-	// path as a replica whose report was not used.
-	if selected && msg.HasStable && r.nextExpected > msg.StableSlot {
-		if h, ok := r.prefixHashAtLocked(msg.StableSlot); ok && h != msg.PrefixHash {
+	retain := r.lastNormalView == msg.SourceNormalView
+	if retain && msg.HasStable && r.nextExpected > msg.StableSlot {
+		if h, ok := r.prefixHashAtLocked(msg.StableSlot); !ok || h != msg.PrefixHash {
 			Warning("[%s] PREFIX MISMATCH installing view %d at slot=%d (ours=%016x leader=%016x)",
 				r.self, msg.ViewId, msg.StableSlot, h, msg.PrefixHash)
-			selected = false
+			retain = false
 		}
 	}
 	if r.vc != nil {
@@ -1329,8 +1322,9 @@ func (r *Replica) installStartView(msg *BusStartView) {
 	}
 	r.recovery = rec
 	r.startViewView = msg.ViewId
+	r.startViewSource = msg.SourceNormalView
 	r.startViewUsed = append(r.startViewUsed[:0], msg.SelectedReports...)
-	rewound, didRewind, prepared := r.prepareRecoveryLocked(rec, msg, selected)
+	rewound, didRewind, prepared := r.prepareRecoveryLocked(rec, msg, retain)
 	r.mu.Unlock()
 
 	if didRewind {
@@ -1366,12 +1360,9 @@ func (r *Replica) installStartView(msg *BusStartView) {
 	}
 }
 
-// prepareRecoveryLocked establishes the immutable reconciliation boundary
-// before releasing r.mu. Entries already present outside the merged log are
-// removed here, so buses arriving after recovery begins are never swept away by
-// a later cleanup pass.
+// prepareRecoveryLocked retains compatible buses while reconciling decisions.
 func (r *Replica) prepareRecoveryLocked(rec *viewRecovery, msg *BusStartView,
-	selected bool) (rewound uint64, didRewind, ok bool) {
+	retain bool) (rewound uint64, didRewind, ok bool) {
 
 	replayFrom := suffixBase(r.stableSlot, r.haveStable)
 	if replayFrom < r.prunedBelow {
@@ -1383,6 +1374,8 @@ func (r *Replica) prepareRecoveryLocked(rec *viewRecovery, msg *BusStartView,
 		canonicalEnd = msg.MaxSlot + 1
 	}
 	localStableEnd := suffixBase(r.stableSlot, r.haveStable)
+	// Without a prefix comparison, fetch the newly committed range canonically.
+	repairPrefix := retain && msg.HasStable && r.nextExpected <= msg.StableSlot
 	if r.haveStable && (!msg.HasMax || canonicalEnd < localStableEnd) {
 		Warning("[%s] cannot prepare recovery for view %d: merged end %d is below local stable frontier %d",
 			r.self, rec.view, canonicalEnd, localStableEnd)
@@ -1400,7 +1393,7 @@ func (r *Replica) prepareRecoveryLocked(rec *viewRecovery, msg *BusStartView,
 
 	if !msg.HasMax {
 		target = 0
-	} else if !selected {
+	} else if !retain || repairPrefix {
 		target = localStableEnd
 	} else {
 		if target > canonicalEnd {
@@ -1411,9 +1404,8 @@ func (r *Replica) prepareRecoveryLocked(rec *viewRecovery, msg *BusStartView,
 				target = slot
 			}
 		}
-		base := suffixBase(msg.StableSlot, msg.HasStable)
 		for slot, entry := range r.globalLog {
-			if slot < base || slot >= canonicalEnd || entry == nil || entry.state != slotNoOp {
+			if slot < localStableEnd || entry == nil || entry.state != slotNoOp {
 				continue
 			}
 			if _, canonical := noop[slot]; !canonical && slot < target {
@@ -1431,13 +1423,14 @@ func (r *Replica) prepareRecoveryLocked(rec *viewRecovery, msg *BusStartView,
 		rewound, didRewind = target, true
 	}
 
-	if !selected {
+	if !retain {
 		r.clearSlotRangeLocked(target, 0, false)
 	} else {
-		r.clearSlotRangeLocked(canonicalEnd, 0, false)
-		base := suffixBase(msg.StableSlot, msg.HasStable)
+		if repairPrefix {
+			r.clearSlotRangeLocked(target, msg.StableSlot, true)
+		}
 		for slot, entry := range r.globalLog {
-			if slot < base || slot >= canonicalEnd || entry == nil || entry.state != slotNoOp {
+			if slot < localStableEnd || entry == nil || entry.state != slotNoOp {
 				continue
 			}
 			if _, canonical := noop[slot]; !canonical {
@@ -1499,9 +1492,7 @@ func (r *Replica) recoveryMissingRange(rec *viewRecovery) (uint64, uint64, bool)
 	}
 	for slot := r.nextExpected; slot <= rec.maxSlot; slot++ {
 		if entry := r.globalLog[slot]; entry == nil || entry.state == slotEmpty {
-			// Pull only this contiguous missing run. Selected followers retain
-			// entries already represented in the merge, so re-downloading the
-			// filled tail would defeat that optimization.
+			// Fetch only the missing run, preserving the retained tail.
 			to := slot
 			for to < rec.maxSlot {
 				next := to + 1

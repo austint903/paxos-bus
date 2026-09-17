@@ -559,15 +559,16 @@ type BusViewChange struct {
 // runs (MaxSlot), which reports selected it, and which slots became no-ops.
 // They remain in recovery while fetching every missing entry.
 type BusStartView struct {
-	ViewId          uint64
-	StableSlot      uint64
-	HasStable       bool
-	MaxSlot         uint64
-	HasMax          bool
-	PrefixHash      uint64 // at StableSlot
-	SenderIdx       uint32
-	NoOpSlots       []uint64
-	SelectedReports []uint32 // reports retained after filtering to the highest LastNormalView
+	ViewId           uint64
+	SourceNormalView uint64
+	StableSlot       uint64
+	HasStable        bool
+	MaxSlot          uint64
+	HasMax           bool
+	PrefixHash       uint64 // at StableSlot
+	SenderIdx        uint32
+	NoOpSlots        []uint64
+	SelectedReports  []uint32 // reports retained after filtering to the highest LastNormalView
 }
 
 // BusStateQuery is how a replica that finds itself in a stale view asks to be
@@ -678,7 +679,7 @@ func (m *BusViewChange) Unmarshal(wire io.Reader) error {
 func (m *BusStartView) New() fastrpc.Serializable { return new(BusStartView) }
 
 func (m *BusStartView) Marshal(wire io.Writer) {
-	var b [38]byte
+	var b [46]byte
 	binary.LittleEndian.PutUint64(b[0:8], m.ViewId)
 	binary.LittleEndian.PutUint64(b[8:16], m.StableSlot)
 	putBool(b[16:17], m.HasStable)
@@ -686,13 +687,14 @@ func (m *BusStartView) Marshal(wire io.Writer) {
 	putBool(b[25:26], m.HasMax)
 	binary.LittleEndian.PutUint64(b[26:34], m.PrefixHash)
 	binary.LittleEndian.PutUint32(b[34:38], m.SenderIdx)
+	binary.LittleEndian.PutUint64(b[38:46], m.SourceNormalView)
 	wire.Write(b[:])
 	putSlotList(wire, m.NoOpSlots)
 	putReplicaList(wire, m.SelectedReports)
 }
 
 func (m *BusStartView) Unmarshal(wire io.Reader) error {
-	var b [38]byte
+	var b [46]byte
 	if _, err := io.ReadFull(wire, b[:]); err != nil {
 		return err
 	}
@@ -703,6 +705,7 @@ func (m *BusStartView) Unmarshal(wire io.Reader) error {
 	m.HasMax = b[25] != 0
 	m.PrefixHash = binary.LittleEndian.Uint64(b[26:34])
 	m.SenderIdx = binary.LittleEndian.Uint32(b[34:38])
+	m.SourceNormalView = binary.LittleEndian.Uint64(b[38:46])
 	slots, err := readSlotList(wire)
 	if err != nil {
 		return err
