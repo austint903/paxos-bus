@@ -734,6 +734,7 @@ type BusGetState struct {
 	ToSlot    uint64
 	FetchId   uint64
 	SenderIdx uint32
+	Slots     []uint64 // Empty requests the full range.
 }
 
 // StateEntry is one slot's content. Payload is the marshaled request list for a
@@ -770,6 +771,7 @@ func (m *BusGetState) Marshal(wire io.Writer) {
 	binary.LittleEndian.PutUint64(b[24:32], m.FetchId)
 	binary.LittleEndian.PutUint32(b[32:36], m.SenderIdx)
 	wire.Write(b[:])
+	putSlotList(wire, m.Slots)
 }
 
 func (m *BusGetState) Unmarshal(wire io.Reader) error {
@@ -782,7 +784,9 @@ func (m *BusGetState) Unmarshal(wire io.Reader) error {
 	m.ToSlot = binary.LittleEndian.Uint64(b[16:24])
 	m.FetchId = binary.LittleEndian.Uint64(b[24:32])
 	m.SenderIdx = binary.LittleEndian.Uint32(b[32:36])
-	return nil
+	var err error
+	m.Slots, err = readSlotList(wire)
+	return err
 }
 
 func (e *StateEntry) Marshal(wire io.Writer) {

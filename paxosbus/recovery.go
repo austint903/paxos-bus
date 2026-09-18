@@ -36,6 +36,7 @@ const (
 	// between a few hundred bytes and tens of megabytes.
 	stateChunkBytes    = 1 << 20
 	stateEntryOverhead = 32
+	stateFetchSlots    = 1024
 
 	stateFetchTimeout = 5 * time.Second
 	// stateFetchProbe is how often a blocked fetch rechecks that its peer is
@@ -1024,7 +1025,7 @@ func (r *Replica) fetchMergedState(vc *vcState, watchdog *viewChangeWatchdog,
 			if plan.hasCatchUp && int(plan.catchUp) != r.idx {
 				Notice("[%s] view %d: catching up committed prefix [%d,%d] from replica %d",
 					r.self, vc.view, from, plan.stableSlot, plan.catchUp)
-				r.fetchRangeBlocking(vc, int(plan.catchUp), from, plan.stableSlot)
+				r.fetchRangeBlocking(vc, int(plan.catchUp), from, plan.stableSlot, nil)
 			} else {
 				Warning("[%s] view %d: committed prefix [%d,%d] is missing with no remote donor",
 					r.self, vc.view, from, plan.stableSlot)
@@ -1070,21 +1071,9 @@ func (r *Replica) fetchMergedState(vc *vcState, watchdog *viewChangeWatchdog,
 				continue
 			}
 			sort.Slice(slots, func(i, j int) bool { return slots[i] < slots[j] })
-			// Keep each request within a contiguous run assigned to this donor.
-			for i := 0; i < len(slots); {
-				from, to := slots[i], slots[i]
-				i++
-				for i < len(slots) && slots[i] == to+1 {
-					to = slots[i]
-					i++
-				}
-				if !r.mergeActive(vc, watchdog) {
-					return false
-				}
-				r.fetchRangeBlocking(vc, int(donor), from, to)
-				if !r.mergeActive(vc, watchdog) {
-					return false
-				}
+			r.fetchRangeBlocking(vc, int(donor), slots[0], slots[len(slots)-1], slots)
+			if !r.mergeActive(vc, watchdog) {
+				return false
 			}
 		}
 	}
@@ -1346,7 +1335,7 @@ func (r *Replica) installStartView(msg *BusStartView) {
 			return
 		}
 		if from <= to {
-			r.fetchRecoveryRange(rec, from, to)
+			r.fetchRecoveryRange(rec, from, rec.maxSlot)
 		}
 		if r.finishRecoveryIfComplete(rec) {
 			return
@@ -1836,6 +1825,7 @@ type fetchReq struct {
 	vc         *vcState
 	cancel     <-chan struct{}
 	done       chan bool
+	slots      []uint64
 }
 
 // newSyncFetchLocked snapshots the current catch-up identity into one fetch.
@@ -1895,7 +1885,7 @@ func (r *Replica) enqueueFetch(peer int, from, to uint64, done chan bool) {
 	}
 }
 
-func (r *Replica) fetchRangeBlocking(vc *vcState, peer int, from, to uint64) bool {
+func (r *Replica) fetchRangeBlocking(vc *vcState, peer int, from, to uint64, slots []uint64) bool {
 	if peer < 0 || peer >= r.config.N || peer == r.idx || from > to {
 		return peer == r.idx || from > to
 	}
@@ -1907,6 +1897,7 @@ func (r *Replica) fetchRangeBlocking(vc *vcState, peer int, from, to uint64) boo
 		view:    vc.view,
 		fetchID: r.fetchSeq.Add(1),
 		vc:      vc,
+		slots:   slots,
 		cancel:  vc.abort,
 		done:    done,
 	}
@@ -2055,15 +2046,27 @@ func (r *Replica) fetchActive(req fetchReq) bool {
 	return active
 }
 
-// runFetch pulls one slot range, a chunk at a time.
-//
-// It gives up the moment the peer's connection breaks rather than waiting out
-// stateFetchTimeout. A dead peer's reply is never coming, and every fetch shares
-// this one goroutine — so a range left blocking on a corpse also blocks whatever
-// is queued behind it. That is not hypothetical: a replica that has fallen
-// behind is mid-catch-up *from the leader*, so when the leader dies its own
-// view change queues behind a five-second wait for the replica it has just
-// declared dead. Measured at 5.12s of a 6.9s view change.
+func (r *Replica) missingFetchSlotsLocked(req fetchReq, from uint64) []uint64 {
+	var slots []uint64
+	i := sort.Search(len(req.slots), func(i int) bool { return req.slots[i] >= from })
+	for slot := from; slot <= req.to && len(slots) < stateFetchSlots; slot++ {
+		if req.slots != nil {
+			if i == len(req.slots) {
+				break
+			}
+			slot = req.slots[i]
+			i++
+		}
+		if slot >= r.nextExpected && r.slotStateLocked(slot) == slotEmpty {
+			slots = append(slots, slot)
+		}
+		if slot == req.to {
+			break
+		}
+	}
+	return slots
+}
+
 func (r *Replica) runFetch(req fetchReq) bool {
 	if req.peer < 0 || req.peer >= r.config.N || req.peer == r.idx || req.from > req.to {
 		return req.peer == r.idx || req.from > req.to
@@ -2076,15 +2079,17 @@ func (r *Replica) runFetch(req fetchReq) bool {
 			return false
 		}
 		to := req.to
+		var slots []uint64
 		// Recheck each chunk: buses may arrive while the fetch is queued or
 		// waiting for a response. Explicit divergence repair still refetches.
 		if req.syncGen != 0 || req.vc != nil || req.installGen != 0 {
 			r.mu.Lock()
-			next, to = r.missingRangeLocked(next, req.to)
+			slots = r.missingFetchSlotsLocked(req, next)
 			r.mu.Unlock()
-			if next > to {
+			if len(slots) == 0 {
 				return true
 			}
+			next, to = slots[0], slots[len(slots)-1]
 		}
 		r.sendToPeer(req.peer, MsgBusGetState, &BusGetState{
 			ViewId:    req.view,
@@ -2092,6 +2097,7 @@ func (r *Replica) runFetch(req fetchReq) bool {
 			ToSlot:    to,
 			FetchId:   req.fetchID,
 			SenderIdx: uint32(r.idx),
+			Slots:     slots,
 		})
 		deadline := time.NewTimer(stateFetchTimeout)
 		for advanced := false; !advanced; {
@@ -2102,7 +2108,14 @@ func (r *Replica) runFetch(req fetchReq) bool {
 					m.ToSlot < next || m.ToSlot > to {
 					continue // a reply to an earlier, abandoned request
 				}
-				if !r.applyStateEntries(m, req) {
+				valid := true
+				for _, entry := range m.Entries {
+					if len(slots) > 0 {
+						i := sort.Search(len(slots), func(i int) bool { return slots[i] >= entry.Slot })
+						valid = valid && i < len(slots) && slots[i] == entry.Slot
+					}
+				}
+				if !valid || !r.applyStateEntries(m, req) {
 					if !deadline.Stop() {
 						<-deadline.C
 					}
@@ -2239,6 +2252,14 @@ func (r *Replica) handleGetState(msg *BusGetState) {
 	if int(msg.SenderIdx) >= r.config.N || msg.FromSlot > msg.ToSlot || msg.ViewId != r.view() {
 		return
 	}
+	if len(msg.Slots) > stateFetchSlots {
+		return
+	}
+	for i, slot := range msg.Slots {
+		if slot < msg.FromSlot || slot > msg.ToSlot || (i > 0 && slot <= msg.Slots[i-1]) {
+			return
+		}
+	}
 	cp := *msg
 	select {
 	case r.serveQ <- &cp:
@@ -2269,13 +2290,20 @@ func (r *Replica) serveState(req *BusGetState) {
 	}
 	last := req.FromSlot
 	size := 0
-	for slot := req.FromSlot; slot <= req.ToSlot; slot++ {
+	for slot, i := req.FromSlot, 0; slot <= req.ToSlot; slot++ {
+		if len(req.Slots) > 0 {
+			if i == len(req.Slots) {
+				break
+			}
+			slot = req.Slots[i]
+			i++
+		}
 		if ent, ok := r.readSlot(slot); ok {
 			reply.Entries = append(reply.Entries, ent)
 			size += len(ent.Payload) + stateEntryOverhead
 		}
 		last = slot
-		if size >= stateChunkBytes || len(reply.Entries) >= maxStateEntries {
+		if size >= stateChunkBytes || len(reply.Entries) >= maxStateEntries || slot == req.ToSlot {
 			break
 		}
 	}
