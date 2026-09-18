@@ -4,6 +4,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"time"
 
 	"github.com/imdea-software/swiftpaxos/paxosbus"
 )
@@ -19,6 +20,8 @@ func main() {
 	verbose := flag.Bool("v", false, "log every per-replica REPLY line (3 log writes per request at high rates; COMMITTED lines are always logged)")
 	startDelayMs := flag.Uint64("w", 5000, "delay in ms between sync and the data phase; every client must sync within this window")
 	maxOwdMs := flag.Float64("owd", 0, "max one-way delay to any replica in ms; buses depart this early so they arrive on the announced schedule (0 = auto-measure as max TCP dial RTT / 2)")
+	pause := flag.Bool("pause-on-view-change", true, "pause generation and buses until a leader-containing quorum acknowledges resume")
+	resumeWait := flag.Uint64("recovery-wait-ms", 1000, "minimum resume scheduling lead in ms; an acknowledged handshake is also required")
 	flag.Parse()
 	if *commandSize <= 0 || uint64(*commandSize) > uint64(^uint32(0)) {
 		fmt.Fprintln(os.Stderr, "command-size must be between 1 and 4294967295 bytes")
@@ -47,6 +50,7 @@ func main() {
 
 	client := paxosbus.NewClient(config, *clientId, *intervalMs, *resendMs, *label,
 		*genIntervalUs, *verbose, *startDelayMs, *maxOwdMs, *commandSize)
+	client.ConfigureClientPause(*pause, time.Duration(*resumeWait)*time.Millisecond)
 	if err := client.Connect(); err != nil {
 		fmt.Fprintf(os.Stderr, "cannot connect: %v\n", err)
 		os.Exit(1)

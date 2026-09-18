@@ -42,13 +42,18 @@ type reqInflight struct {
 const gcCommittedNs = 2 * int64(time.Second)
 
 type lockedWriter struct {
-	mu sync.Mutex
-	w  *bufio.Writer
+	mu   sync.Mutex
+	w    *bufio.Writer
+	conn net.Conn // control and peer writes use a bounded write deadline
 }
 
 func (lw *lockedWriter) sendMsg(code uint8, msg wireMsg) error {
 	lw.mu.Lock()
 	defer lw.mu.Unlock()
+	if lw.conn != nil {
+		lw.conn.SetWriteDeadline(time.Now().Add(clientControlWriteTimeout))
+		defer lw.conn.SetWriteDeadline(time.Time{})
+	}
 	lw.w.WriteByte(code)
 	msg.Marshal(lw.w)
 	return lw.w.Flush()
@@ -172,6 +177,19 @@ type Client struct {
 	winCommitted uint64
 	winResends   uint64
 	winRttSumUs  uint64
+
+	// pauseMu also fences sendBus against a pause notification.
+	pauseMu        sync.Mutex
+	pauseEnabled   bool
+	paused         bool
+	activeView     uint64
+	pauseView      uint64
+	pauseChanged   chan struct{}
+	resumeSendNs   int64
+	resumeWait     time.Duration
+	controlPeers   []*clientControlPeer
+	controlReplies chan clientControlReply
+	controlSeq     uint64 // owned by the recovery loop
 }
 
 func NewClient(config *Config, clientId, intervalMs, resendMs uint64, label string,
@@ -192,23 +210,27 @@ func NewClient(config *Config, clientId, intervalMs, resendMs uint64, label stri
 		panic("cannot generate write payload: " + err.Error())
 	}
 	c := &Client{
-		config:        config,
-		clientId:      clientId,
-		intervalMs:    intervalMs,
-		resendMs:      resendMs,
-		self:          self,
-		genIntervalUs: genIntervalUs,
-		requestOp:     requestOp,
-		reqTimeoutNs:  int64(resendMs) * 1e6,
-		verbose:       verbose,
-		startDelayMs:  startDelayMs,
-		maxOwdNs:      int64(maxOwdMs * 1e6),
-		owdAuto:       maxOwdMs == 0,
-		conns:         make([]net.Conn, config.N),
-		readers:       make([]*bufio.Reader, config.N),
-		writers:       make([]*lockedWriter, config.N),
-		busSenders:    make([]*connSender, config.N),
-		rInflight:     make(map[uint64]*reqInflight),
+		config:         config,
+		clientId:       clientId,
+		intervalMs:     intervalMs,
+		resendMs:       resendMs,
+		self:           self,
+		genIntervalUs:  genIntervalUs,
+		requestOp:      requestOp,
+		reqTimeoutNs:   int64(resendMs) * 1e6,
+		verbose:        verbose,
+		startDelayMs:   startDelayMs,
+		maxOwdNs:       int64(maxOwdMs * 1e6),
+		owdAuto:        maxOwdMs == 0,
+		conns:          make([]net.Conn, config.N),
+		readers:        make([]*bufio.Reader, config.N),
+		writers:        make([]*lockedWriter, config.N),
+		busSenders:     make([]*connSender, config.N),
+		rInflight:      make(map[uint64]*reqInflight),
+		pauseEnabled:   true,
+		pauseChanged:   make(chan struct{}),
+		resumeWait:     time.Second,
+		controlReplies: make(chan clientControlReply, config.N*8),
 	}
 	resend := ""
 	if resendMs > 0 {
@@ -295,6 +317,9 @@ func (c *Client) Run() {
 	for i := range c.readers {
 		go c.receiveLoop(i)
 	}
+	if c.pauseEnabled {
+		c.startClientControl()
+	}
 
 	// Sleep until maxOwdNs BEFORE the FirstMsgNs instant announced in the sync
 	// message, on the same wall clock the replicas use for expected arrival
@@ -324,9 +349,21 @@ func (c *Client) genLoop() {
 	}
 	next := nowNs()
 	var rid uint64
+	var lastResume int64
 	for {
+		waited := c.waitWhilePaused()
+		c.pauseMu.Lock()
+		resume := c.resumeSendNs
+		c.pauseMu.Unlock()
+		if waited || resume != lastResume {
+			next = nowNs() // do not generate the work skipped during the pause
+			lastResume = resume
+		}
 		now := nowNs()
 		for now >= next {
+			if c.isPaused() {
+				break
+			}
 			rid++
 			c.pendingMu.Lock()
 			c.pending = append(c.pending, RequestMessage{
@@ -381,12 +418,40 @@ func (c *Client) runOnSchedule(base, intervalNs int64, tick func()) {
 
 // busLoop departs one bus per interval on the announced schedule
 func (c *Client) busLoop() {
-	c.runOnSchedule(c.firstSendWallNs(), int64(c.intervalMs)*1e6, c.sendBus)
+	next := c.firstSendWallNs()
+	lastStats := wallNs()
+	var lastResume int64
+	for {
+		c.waitWhilePaused()
+		c.pauseMu.Lock()
+		resume := c.resumeSendNs
+		c.pauseMu.Unlock()
+		if resume != lastResume {
+			next, lastResume = resume, resume
+		}
+		if delay := next - wallNs(); delay > 0 {
+			c.waitUnlessPause(time.Duration(delay))
+		}
+		if c.isPaused() {
+			continue
+		}
+		c.sendBus()
+		next += int64(c.intervalMs) * 1e6
+		if now := wallNs(); now-lastStats >= int64(time.Second) {
+			c.emitStats()
+			lastStats = now
+		}
+	}
 }
 
 // sendBus drains the pending and retry buffers into one bus, marshals it once,
 // and hands the same bytes to every replica's sender
 func (c *Client) sendBus() {
+	c.pauseMu.Lock()
+	defer c.pauseMu.Unlock()
+	if c.paused {
+		return
+	}
 	c.pendingMu.Lock()
 	batch := c.pending
 	c.pending = nil
@@ -448,6 +513,9 @@ func (c *Client) reqTimeoutLoop() {
 	}
 	ticker := time.NewTicker(tick)
 	for range ticker.C {
+		if c.isPaused() {
+			continue
+		}
 		now := nowNs()
 		var reboard []RequestMessage
 		c.mu.Lock()
