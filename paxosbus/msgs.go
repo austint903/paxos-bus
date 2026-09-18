@@ -59,6 +59,12 @@ const (
 	MsgBusStateQuery
 	MsgBusGetState
 	MsgBusNewState
+
+	MsgClientPause
+	MsgClientStatusQuery
+	MsgClientStatusReply
+	MsgClientResume
+	MsgClientResumeAck
 )
 
 // Sanity caps on the variable-length parts of the recovery messages. A view

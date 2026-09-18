@@ -508,6 +508,7 @@ func (r *Replica) beginViewChangeLocked(newView uint64) *viewChangeStart {
 func (r *Replica) publishViewChange(start *viewChangeStart) {
 	Notice("[%s] VIEW-CHANGE start view=%d new_leader=%d stable=%d executed=%d max_filled=%d",
 		r.self, start.view, start.leader, start.stable, start.executed, start.maxFilled)
+	r.pauseClients(start.view)
 
 	// Everyone who hears this joins the same view immediately instead of waiting
 	// out their own timer, so a quorum of requests forms in about half a round
@@ -1350,6 +1351,14 @@ func (r *Replica) installStartView(msg *BusStartView) {
 		if r.finishRecoveryIfComplete(rec) {
 			return
 		}
+		// A sparse fetch that filled its first hole made progress. Move to the
+		// next hole immediately; only empty/failed responses need backoff.
+		r.mu.Lock()
+		progressed := from <= to && r.slotStateLocked(from) != slotEmpty
+		r.mu.Unlock()
+		if progressed {
+			continue
+		}
 		timer := time.NewTimer(recoveryRetryDelay)
 		select {
 		case <-rec.abort:
@@ -2107,6 +2116,12 @@ func (r *Replica) runFetch(req fetchReq) bool {
 				}
 				return false
 			case <-probe.C:
+				// Sync/divergence fetches need not have a cancel channel. Their
+				// view/generation can expire while the socket remains connected.
+				if !r.fetchActive(req) {
+					deadline.Stop()
+					return false
+				}
 				if !r.peerConnected(req.peer) {
 					Warning("[%s] state fetch [%d,%d] from replica %d abandoned at slot %d: "+
 						"peer connection lost", r.self, req.from, req.to, req.peer, next)

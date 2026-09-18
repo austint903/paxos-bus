@@ -35,10 +35,22 @@ type clientLine struct {
 	baseNs     int64
 	intervalNs int64
 	maxSeqSeen uint64
+	// Ordering always uses baseNs. Resume only shifts the arrival prediction
+	// for future buses; changing baseNs would remap already assigned slots.
+	resumeSeq       uint64
+	arrivalOffsetNs int64
 }
 
 func (cl *clientLine) expectedNs(n uint64) int64 {
 	return cl.baseNs + int64(n-1)*cl.intervalNs
+}
+
+func (cl *clientLine) arrivalNs(n uint64) int64 {
+	t := cl.expectedNs(n)
+	if cl.resumeSeq != 0 && n >= cl.resumeSeq {
+		t += cl.arrivalOffsetNs
+	}
+	return t
 }
 
 type globalEntry struct {
@@ -277,6 +289,7 @@ type Replica struct {
 
 	mu              sync.Mutex
 	clients         map[uint64]*clientLine
+	clientControls  map[uint64]*clientControlState // guarded by r.mu
 	status          replicaStatus
 	lastNormalView  uint64
 	recovery        *viewRecovery
@@ -697,7 +710,7 @@ func (r *Replica) Run() error {
 func (r *Replica) clientListener(conn net.Conn) {
 	defer conn.Close()
 	reader := bufio.NewReader(conn)
-	lw := &lockedWriter{w: bufio.NewWriter(conn)}
+	lw := &lockedWriter{w: bufio.NewWriter(conn), conn: conn}
 
 	// Peer messages name their sender, so this connection identifies itself the
 	// first time one arrives. When it then closes we know exactly which replica
@@ -723,6 +736,13 @@ func (r *Replica) clientListener(conn net.Conn) {
 			return
 		}
 		switch msgType {
+		case MsgClientStatusQuery, MsgClientResume:
+			var m clientControlMessage
+			if err := m.Unmarshal(reader); err != nil {
+				return
+			}
+			r.handleClientControl(msgType, &m, lw)
+
 		case MsgBusSync:
 			if err := syncMsg.Unmarshal(reader); err != nil {
 				Warning("[%s] bad sync message: %v", r.self, err)
@@ -900,12 +920,14 @@ func (r *Replica) admitLocked(clientId, seq uint64, actualNs int64) admission {
 	if !ok {
 		return admitUnsynced
 	}
+	// Track consumption of the TCP stream even when the fault injector drops
+	// the received bus, so pausing at that sequence cannot strand resume.
+	if seq > line.maxSeqSeen {
+		line.maxSeqSeen = seq
+	}
 	if r.shouldDropLocked(seq) {
 		r.winDropped++
 		return admitDropped
-	}
-	if seq > line.maxSeqSeen {
-		line.maxSeqSeen = seq
 	}
 	r.observeArrivalLocked(line, seq, actualNs)
 	return admitted
@@ -914,7 +936,7 @@ func (r *Replica) admitLocked(clientId, seq uint64, actualNs int64) admission {
 // observeArrivalLocked accumulates how far this arrival fell from where the
 // client's line said it would land.
 func (r *Replica) observeArrivalLocked(line *clientLine, seq uint64, actualNs int64) {
-	deltaUs := (actualNs - line.expectedNs(seq)) / 1000
+	deltaUs := (actualNs - line.arrivalNs(seq)) / 1000
 	if r.winRecv == 0 {
 		r.winDeltaMinUs, r.winDeltaMaxUs = deltaUs, deltaUs
 	} else {
@@ -1678,7 +1700,7 @@ func (r *Replica) dialPeer(j int) {
 		if tc, ok := conn.(*net.TCPConn); ok {
 			tc.SetNoDelay(true)
 		}
-		lw := &lockedWriter{w: bufio.NewWriter(conn)}
+		lw := &lockedWriter{w: bufio.NewWriter(conn), conn: conn}
 		r.mu.Lock()
 		r.peerWriters[j] = lw
 		r.mu.Unlock()
@@ -1789,7 +1811,7 @@ func (r *Replica) gapDetectLoop() {
 				if !ok {
 					continue
 				}
-				if wallNow <= meta.expectedNs+r.gapDeltaNs {
+				if !r.clientGapDueLocked(meta, wallNow) {
 					continue
 				}
 				key := gapKey{view: view, slot: slot}
