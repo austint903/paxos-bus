@@ -1,63 +1,24 @@
 package paxosbus
 
-// Failure recovery: the leader heartbeat that doubles as the commit point, the
-// view change that runs when that heartbeat stops, and the state transfer both
-// of them lean on.
-//
-// The shape of it: a bus's slot is a local computation from its client's arrival
-// line, so replicas keep recording traffic with no leader at all. What a leader
-// is actually needed for is deciding — agreeing a commit point, agreeing a no-op
-// for a slot nobody received. So a view change never has to re-establish an
-// order, only to reconcile which slots hold what, and it can do that from
-// metadata: which slots each replica holds (a bitmap), which of them are agreed
-// no-ops, and a hash of the committed prefix. Entries themselves move only over
-// BusGetState. A follower remains in ViewChange until it has installed the
-// complete merged range.
-
 import (
 	"sort"
 	"time"
 )
 
 const (
-	// suspicionTick is how often a follower checks the heartbeat clock and the
-	// lost-connection flag. The flag is set the instant the leader's socket
-	// breaks, so this interval is pure added latency on the fast path, and it
-	// has to stay well under the spread in when replicas notice a failure
-	// (the difference in their one-way delay from the leader, ~10ms on our
-	// testbed). Otherwise replicas suspect at times set by their own tick
-	// phases rather than by the network, one wakes the others with its request
-	// instead of everyone multicasting together, and collecting a quorum of
-	// requests costs a full round trip instead of half.
 	suspicionTick = 5 * time.Millisecond
 
-	// stateChunkBytes caps a BusNewState by payload size rather than slot count:
-	// one bus can carry a thousand requests, so a fixed slot count would swing
-	// between a few hundred bytes and tens of megabytes.
 	stateChunkBytes    = 1 << 20
 	stateEntryOverhead = 32
 	stateFetchSlots    = 1024
 
-	stateFetchTimeout = 5 * time.Second
-	// stateFetchProbe is how often a blocked fetch rechecks that its peer is
-	// still connected. It bounds how long a dead peer can hold the fetch
-	// goroutine, so it wants to be well under the round trip a live peer takes
-	// to answer — not so fine that an idle fetch spins.
-	stateFetchProbe = 50 * time.Millisecond
-	// mergeFetchAttempts bounds how many times the new leader re-asks for merged
-	// entries a donor failed to produce before declaring those slots no-ops.
+	stateFetchTimeout  = 5 * time.Second
+	stateFetchProbe    = 50 * time.Millisecond
 	mergeFetchAttempts = 3
 
-	// A replica that cannot complete a state-transfer fetch stays fenced in
-	// ViewChange and retries. This delay keeps a disconnected donor from turning
-	// either the leader's merge or a follower's recovery into a tight send loop.
 	recoveryRetryDelay = 100 * time.Millisecond
 )
 
-// viewRecovery is one follower-side StartView installation. generation is a
-// local fence: a newer StartView or view change cancels abort and makes every
-// outstanding state-transfer response from this installation ineligible to
-// mutate the log.
 type viewRecovery struct {
 	view         uint64
 	generation   uint64
@@ -74,18 +35,12 @@ type viewRecovery struct {
 	repairFrom   uint64
 }
 
-// ── Commit point ────────────────────────────────────────────────────────────
-
-// syncRound is one outstanding BusSyncPrepare. Guarded by r.mu.
 type syncRound struct {
 	prepare BusSyncPrepare
 	acks    map[uint32]struct{}
 	done    bool
 }
 
-// syncLoop is the leader's heartbeat and the first phase of the commit point.
-// Followers read liveness from its arrival and agreement from its prefix hash,
-// so one message carries both and a silent leader is a dead leader.
 func (r *Replica) syncLoop() {
 	ticker := time.NewTicker(r.syncInterval)
 	defer ticker.Stop()
@@ -94,9 +49,6 @@ func (r *Replica) syncLoop() {
 	}
 }
 
-// syncOnce is one independent heartbeat-timer tick. Keeping the status gate in
-// a single helper makes the view-change publication boundary directly testable
-// without relying on ticker timing; peer writes remain off r.mu as before.
 func (r *Replica) syncOnce() {
 	var (
 		prep   BusSyncPrepare
@@ -128,8 +80,6 @@ func (r *Replica) syncOnce() {
 			}
 		}
 		if !prep.HasSlot {
-			// Nothing executed yet: still beat, so followers know we are alive
-			// before any client traffic starts.
 			r.sync = nil
 		}
 	}
@@ -141,8 +91,6 @@ func (r *Replica) syncOnce() {
 	}
 }
 
-// maybeCommitSyncLocked promotes the outstanding round once f+1 replicas
-// including this one have agreed, and returns the commit to broadcast off-lock.
 func (r *Replica) maybeCommitSyncLocked() *BusSyncCommit {
 	s := r.sync
 	if s == nil || s.done || len(s.acks) < r.config.QuorumSize() {
@@ -157,10 +105,6 @@ func (r *Replica) maybeCommitSyncLocked() *BusSyncCommit {
 	}
 }
 
-// setStableLocked advances the commit point, never past what this replica has
-// actually executed: everything that reads stableSlot — the prune floor, the
-// rewind target, the prefix hash a view change is checked against — assumes the
-// local log really does run that far.
 func (r *Replica) setStableLocked(slot uint64) {
 	if r.nextExpected == 0 {
 		return
@@ -198,8 +142,6 @@ func (r *Replica) handleSyncPrepare(msg *BusSyncPrepare) {
 		return
 	}
 	if r.nextExpected == 0 || r.nextExpected-1 < msg.SlotToSync {
-		// Behind. Coalesce retries and newer targets into one sync-driven state
-		// transfer instead of filling fetchQ with the same work.
 		leader := int(msg.SenderIdx)
 		c := &r.syncCatchup
 		var req *fetchReq
@@ -230,10 +172,6 @@ func (r *Replica) handleSyncPrepare(msg *BusSyncPrepare) {
 	r.answerSyncPrepare(*msg, h, known, stable, haveStable)
 }
 
-// answerSyncPrepare performs the common prefix decision after the caller has
-// established that the requested slot is executed. It deliberately does not
-// refresh the heartbeat clock, so completing a slow fetch is not mistaken for
-// a newly received heartbeat.
 func (r *Replica) answerSyncPrepare(msg BusSyncPrepare, h uint64, known bool,
 	stable uint64, haveStable bool) {
 	r.mu.Lock()
@@ -246,9 +184,6 @@ func (r *Replica) answerSyncPrepare(msg BusSyncPrepare, h uint64, known bool,
 
 	switch {
 	case !known:
-		// The slot has aged out of the rings, meaning we are more than a full
-		// window ahead of the leader. We executed it long ago, so agreeing is
-		// trivially true; refusing would only stall the commit point.
 		Notice("[%s] sync prepare slot=%d below hash window, agreeing unverified",
 			r.self, msg.SlotToSync)
 	case h != msg.PrefixHash:
@@ -279,8 +214,6 @@ func (r *Replica) handleSyncReply(msg *BusSyncReply) {
 	}
 }
 
-// clearSyncCatchupLocked invalidates any queued or running sync fetch without
-// reusing its generation. Guarded by r.mu.
 func (r *Replica) clearSyncCatchupLocked() {
 	generation := r.syncCatchup.generation + 1
 	r.syncCatchup = syncCatchup{generation: generation}
@@ -300,22 +233,7 @@ func (r *Replica) handleSyncCommit(msg *BusSyncCommit) {
 	r.mu.Unlock()
 }
 
-// rewindToStableAndRefetch drops everything above the commit point and pulls it
-// again.
-//
-// This is the repair for the one divergence a view change cannot detect on its
-// own. leaderResolve applies a no-op and advances its own cursor before it has
-// f+1 acks (replica.go), so a leader can execute a no-op at a slot no follower
-// ever hears about. If that leader is then merely suspected rather than dead, it
-// rejoins as a follower still holding the no-op while the merge — seeing the
-// real bus at some replica that received it late — kept the entry. It took part
-// in the view change, so the no-op list gives it nothing to rewind to.
-//
-// The next heartbeat catches it: the hashes disagree, and the divergent slot is
-// necessarily above this replica's own commit point (a slot below it had f+1
-// agreement, so no follower could disagree). Rewinding there and refetching is
-// enough. Loud, because the principled fix is for leaderResolve to wait for its
-// quorum before executing.
+// Rewind to the local commit point before refetching divergent state.
 func (r *Replica) rewindToStableAndRefetch(peer int, view, stable uint64, haveStable bool) {
 	if !haveStable {
 		return
@@ -339,8 +257,6 @@ func (r *Replica) rewindToStableAndRefetch(peer int, view, stable uint64, haveSt
 	}
 }
 
-// ── Failure detection ───────────────────────────────────────────────────────
-
 func (r *Replica) suspicionLoop() {
 	ticker := time.NewTicker(suspicionTick)
 	defer ticker.Stop()
@@ -349,26 +265,15 @@ func (r *Replica) suspicionLoop() {
 	}
 }
 
-// suspectLeaderIfTimedOut performs one atomic failure-detector check. Keeping
-// the status check and transition under r.mu prevents an old Normal-state tick
-// from advancing a StartView installation that began concurrently.
 func (r *Replica) suspectLeaderIfTimedOut() bool {
 	r.mu.Lock()
 	view := r.view()
-	// ViewChange liveness, including an active StartView installation, belongs
-	// to the longer per-view fallback. Heartbeat suspicion is only a Normal
-	// state failure detector.
 	if r.status != statusNormal || r.config.LeaderIndex(view) == r.idx {
 		r.mu.Unlock()
 		return false
 	}
 
-	// Missing heartbeats are the only trigger. A closed socket is tempting to
-	// act on — it arrives one one-way delay after a kill instead of a whole
-	// timeout — but it answers the wrong question: it says this replica's link
-	// to the leader broke, which a partition produces just as readily as a crash,
-	// and a crash that takes the machine or its power down produces no close at
-	// all. The socket state is therefore context for the log, never a trigger.
+	// Only missed heartbeats trigger suspicion; a closed socket may reconnect.
 	silentFor := time.Duration(nowNs() - r.lastHeartbeatNs)
 	if silentFor < r.suspectTimeout {
 		r.mu.Unlock()
@@ -390,36 +295,21 @@ func (r *Replica) suspectLeaderIfTimedOut() bool {
 	return true
 }
 
-// ── View change ─────────────────────────────────────────────────────────────
-
-// vcState is one view change in progress. Every replica keeps one, because
-// every replica has to count BusViewChangeRequests before it may report; only
-// the new leader drains reports.
 type vcState struct {
 	view    uint64
 	reports chan *BusViewChange
 	abort   chan struct{}
 
-	// requests are the replicas that have asked for this view, including us.
-	// A replica sends its own BusViewChange only once a quorum of them has
-	// arrived, so no replica ships its suffix on one machine's suspicion alone.
 	requests   map[uint32]struct{}
 	reportSent bool
 }
 
-// viewChangeWatchdog is the replica-wide liveness fallback for one exact view
-// change. Each arm gets a new identity and generation; an expired callback must
-// still match both under r.mu before it may advance the view. time.AfterFunc is
-// used once per arm so cancellation never relies on Timer.Reset or channel
-// draining, and Stop retires a replaced timer without leaving a waiter behind.
 type viewChangeWatchdog struct {
 	view       uint64
 	generation uint64
 	timer      *time.Timer
 }
 
-// viewChangeStart carries the state needed to announce a transition after the
-// state itself has been published atomically under r.mu.
 type viewChangeStart struct {
 	view      uint64
 	leader    int
@@ -468,9 +358,6 @@ func (r *Replica) armViewChangeWatchdogLocked(view uint64) {
 	})
 }
 
-// beginViewChangeLocked cancels all work belonging to the old view, installs
-// the new ViewChange state, and arms that view's fallback atomically. The
-// caller publishes the request after dropping r.mu.
 func (r *Replica) beginViewChangeLocked(newView uint64) *viewChangeStart {
 	if newView <= r.view() {
 		return nil
@@ -487,9 +374,6 @@ func (r *Replica) beginViewChangeLocked(newView uint64) *viewChangeStart {
 	r.clearSyncCatchupLocked()
 	r.lastHeartbeatNs = nowNs()
 	r.armViewChangeWatchdogLocked(newView)
-	// Retire in-flight gap agreement immediately. Messages already in flight
-	// carry the old view and are ignored; the view-change merge decides their
-	// slots rather than allowing an old retry goroutine to keep working.
 	r.cancelGapsLocked()
 	r.drainPendingBusesLocked()
 	leader := r.config.LeaderIndex(newView)
@@ -511,9 +395,6 @@ func (r *Replica) publishViewChange(start *viewChangeStart) {
 		r.self, start.view, start.leader, start.stable, start.executed, start.maxFilled)
 	r.pauseClients(start.view)
 
-	// Everyone who hears this joins the same view immediately instead of waiting
-	// out their own timer, so a quorum of requests forms in about half a round
-	// trip when replicas notice together (the VR-revisited optimisation).
 	r.broadcastToPeers(MsgBusViewChangeRequest,
 		&BusViewChangeRequest{ViewId: start.view, SenderIdx: uint32(r.idx)})
 
@@ -549,13 +430,6 @@ func (r *Replica) expireViewChangeWatchdog(watchdog *viewChangeWatchdog) {
 	r.publishViewChange(start)
 }
 
-// handleViewChangeRequest counts requests for this view and, on the f+1st,
-// sends our suffix report to the new leader. Anyone not already in the view
-// change joins it here, which is what makes the quorum form in half a round
-// trip: a replica that noticed on its own has already multicast its request, so
-// everyone holds the quorum one one-way delay after the earliest detection. It
-// costs a full round trip only when a single replica notices alone and the
-// others have to be woken by its request.
 func (r *Replica) handleViewChangeRequest(msg *BusViewChangeRequest) {
 	if msg.ViewId > r.view() {
 		r.startViewChange(msg.ViewId) // sets ViewChange status, multicasts our own
@@ -571,9 +445,6 @@ func (r *Replica) handleViewChangeRequest(msg *BusViewChangeRequest) {
 		return
 	}
 	vc.requests[msg.SenderIdx] = struct{}{}
-	// Our own suspicion is already in the set, so this is f+1 counting ourselves.
-	// Any configuration that can survive a failure has f >= 1, so the quorum is
-	// never reached before some peer's request arrives here.
 	if len(vc.requests) < r.config.QuorumSize() {
 		r.mu.Unlock()
 		return
@@ -601,7 +472,6 @@ func (r *Replica) handleViewChange(msg *BusViewChange) {
 		return
 	}
 	if msg.ViewId > r.view() {
-		// We are the leader of a view we have not joined yet.
 		r.startViewChange(msg.ViewId)
 	}
 	r.mu.Lock()
@@ -610,8 +480,6 @@ func (r *Replica) handleViewChange(msg *BusViewChange) {
 	r.mu.Unlock()
 
 	if st == statusNormal && r.AmLeader() && installed == msg.ViewId {
-		// A straggler joined this view after we had already installed it. It does
-		// not need another round, just the result.
 		r.sendStartView(int(msg.SenderIdx))
 		return
 	}
@@ -633,9 +501,6 @@ func (r *Replica) deliverViewChange(msg *BusViewChange) {
 	}
 }
 
-// handleStateQuery answers a replica that has noticed it is in a stale view.
-// It gets the current view's StartView rather than triggering another view
-// change: there is a healthy leader, the querier just has not heard from it.
 func (r *Replica) handleStateQuery(msg *BusStateQuery) {
 	r.mu.Lock()
 	ok := r.status == statusNormal && r.lastNormalView == r.view()
@@ -648,12 +513,6 @@ func (r *Replica) handleStateQuery(msg *BusStateQuery) {
 	r.sendStartView(int(msg.SenderIdx))
 }
 
-// requestCatchUp asks the cluster for the current view's StartView. Multicast
-// because we do not know who leads the view we just heard about.
-//
-// Hearing a higher view is proof the cluster is alive, so it also counts as a
-// heartbeat: suspecting a leader we have simply not met yet, and starting a view
-// change from our own stale number, would only disrupt a healthy cluster.
 func (r *Replica) requestCatchUp(higherView uint64) {
 	r.mu.Lock()
 	r.lastHeartbeatNs = nowNs()
@@ -665,9 +524,6 @@ func (r *Replica) requestCatchUp(higherView uint64) {
 		&BusStateQuery{ViewId: r.view(), SenderIdx: uint32(r.idx)})
 }
 
-// buildViewChangeLocked describes this replica's log to the new leader without
-// sending any of it: a bitmap of which suffix slots are filled, the agreed
-// no-ops among them, and a hash of the committed prefix.
 func (r *Replica) buildViewChangeLocked(newView uint64) *BusViewChange {
 	m := &BusViewChange{
 		SenderIdx:      uint32(r.idx),
@@ -697,8 +553,6 @@ func (r *Replica) buildViewChangeLocked(newView uint64) *BusViewChange {
 		m.BitmapBase = base
 		return m
 	}
-	// Keep the newest end if the span is somehow enormous; the merge only cares
-	// about slots above the highest reported commit point anyway.
 	if span := top - base + 1; span > maxBitmapBytes*8 {
 		base = top - (maxBitmapBytes*8 - 1)
 	}
@@ -725,8 +579,6 @@ func (r *Replica) buildViewChangeLocked(newView uint64) *BusViewChange {
 	return m
 }
 
-// suffixBase is the first slot a view change reasons about: everything on and
-// below the commit point is settled and never revisited.
 func suffixBase(stable uint64, hasStable bool) uint64 {
 	if !hasStable {
 		return 0
@@ -745,11 +597,6 @@ func bitSet(bm []byte, i uint64) bool {
 	return idx < uint64(len(bm)) && bm[idx]&(1<<(i%8)) != 0
 }
 
-// ── The merge ───────────────────────────────────────────────────────────────
-
-// mergePlan is what the new leader decides the suffix must contain. It names a
-// donor per slot rather than carrying entries, so the leader pulls only what it
-// is actually missing.
 type mergePlan struct {
 	sourceNormalView uint64
 	stableSlot       uint64
@@ -763,17 +610,7 @@ type mergePlan struct {
 	hasCatchUp       bool
 }
 
-// mergeSuffix decides the new view's log from metadata alone.
-//
-// Only reports from the highest LastNormalView count: an entry recorded in an
-// older view can contradict a decision made in the newest one, so a stale report
-// is discarded outright rather than merged. Among the survivors the committed
-// prefix is the highest commit point anyone reports, and above it a slot holds
-// an entry if anyone has one — unless anyone reports it as an agreed no-op, in
-// which case the no-op wins. That asymmetry matches setNoOpLocked: in this
-// protocol an agreed no-op already overwrites a received entry, because a no-op
-// slot has produced no client replies and so loses nothing visible, whereas
-// resurrecting a slot other replicas have skipped past would.
+// Merge only reports from the highest LastNormalView; agreed no-ops win.
 func mergeSuffix(reports []*BusViewChange) mergePlan {
 	var plan mergePlan
 	if len(reports) == 0 {
@@ -836,8 +673,6 @@ func mergeSuffix(reports []*BusViewChange) mergePlan {
 			}
 		}
 		if !found {
-			// Nobody in the quorum holds it, so nobody can have committed it.
-			// The new leader is free to close the hole.
 			noop[s] = struct{}{}
 		}
 	}
@@ -849,8 +684,6 @@ func mergeSuffix(reports []*BusViewChange) mergePlan {
 	return plan
 }
 
-// driveViewChange runs on the new leader: collect a quorum of reports, decide
-// the merge, make the local log match it, and only then announce the view.
 func (r *Replica) driveViewChange(vc *vcState) {
 	deadline := time.After(r.viewChangeTimeout)
 	reports := make(map[uint32]*BusViewChange)
@@ -902,15 +735,9 @@ func (r *Replica) driveViewChange(vc *vcState) {
 	msg := r.initialStartViewMsgLocked(vc.view, &plan, canonicalMax, hasCanonical)
 	r.mu.Unlock()
 
-	// Multicast the immutable decision while the ViewChange fence is still
-	// published. A later bus can arrive while a peer send blocks, but it cannot
-	// enter this message or advance the cursor. The heartbeat timer is gated by
-	// the same status and therefore remains silent too.
+	// Keep the ViewChange fence while multicasting the selected merge.
 	r.broadcastStartView(msg)
 
-	// A newer view may have started while the network sends above ran off-lock.
-	// Only the exact view-change instance that produced this decision may expose
-	// it as Normal and release the post-merge buses.
 	r.mu.Lock()
 	if !r.mergeActiveLocked(vc, watchdog) ||
 		!r.committedPrefixCompleteLocked(plan.stableSlot, plan.hasStable) {
@@ -925,10 +752,6 @@ func (r *Replica) driveViewChange(vc *vcState) {
 	Notice("[%s] VIEW-CHANGE done view=%d leader=self executed=%d", r.self, vc.view, executed)
 }
 
-// mergeCanonicalBoundary turns the two-part merge frontier into the inclusive
-// end followers install. A stable-only merge still contains its committed
-// prefix, so StartView must carry HasMax through StableSlot even when there is
-// no suffix above it.
 func mergeCanonicalBoundary(plan *mergePlan) (uint64, bool) {
 	var maxSlot uint64
 	hasMax := false
@@ -941,9 +764,6 @@ func mergeCanonicalBoundary(plan *mergePlan) (uint64, bool) {
 	return maxSlot, hasMax
 }
 
-// mergeActiveLocked reports whether reconciliation still belongs to the exact
-// view change and fallback interval that selected the merge. In particular, a
-// replacement watchdog for the same numeric view does not extend this work.
 func (r *Replica) mergeActiveLocked(vc *vcState, watchdog *viewChangeWatchdog) bool {
 	if vc == nil || watchdog == nil {
 		return false
@@ -964,9 +784,6 @@ func (r *Replica) mergeActive(vc *vcState, watchdog *viewChangeWatchdog) bool {
 	return r.mergeActiveLocked(vc, watchdog)
 }
 
-// committedPrefixMissingLocked returns the first locally absent committed slot.
-// Slots below nextExpected have already executed and may have been reclaimed;
-// every slot at or above the frozen cursor must still have a concrete entry.
 func (r *Replica) committedPrefixMissingLocked(stable uint64, hasStable bool) (uint64, bool) {
 	if !hasStable || r.nextExpected > stable {
 		return 0, false
@@ -1000,12 +817,6 @@ func (r *Replica) waitMergeRetry(vc *vcState, watchdog *viewChangeWatchdog) bool
 	}
 }
 
-// fetchMergedState brings the new leader's own log up to the merge before it
-// announces anything: the committed prefix first, then every suffix entry it is
-// missing. A committed-prefix miss is retried for exactly as long as the
-// existing per-view fallback remains active; it can never be converted to a
-// no-op. Slots above the commit point retain the bounded/no-op behavior because
-// nobody in the selected quorum can have committed them.
 func (r *Replica) fetchMergedState(vc *vcState, watchdog *viewChangeWatchdog,
 	plan *mergePlan) bool {
 
@@ -1078,7 +889,6 @@ func (r *Replica) fetchMergedState(vc *vcState, watchdog *viewChangeWatchdog,
 		}
 	}
 
-	// Whatever is still missing gets closed as a no-op.
 	r.mu.Lock()
 	var stuck []uint64
 	for slot := range plan.donors {
@@ -1098,10 +908,6 @@ func (r *Replica) fetchMergedState(vc *vcState, watchdog *viewChangeWatchdog,
 	return r.mergeActive(vc, watchdog)
 }
 
-// broadcastStartView announces the installed view. It carries no entries: the
-// committed prefix and its hash, how far the merged suffix runs, which reports
-// selected that result, and which slots are no-ops. A follower pulls everything
-// it lacks before exposing the view as normal.
 func (r *Replica) broadcastStartView(msg *BusStartView) {
 	if msg == nil {
 		return
@@ -1114,10 +920,6 @@ func (r *Replica) broadcastStartView(msg *BusStartView) {
 	}
 }
 
-// initialStartViewMsgLocked snapshots exactly the merge that was decided. It is
-// deliberately independent of nextExpected: real buses outside the merge stay
-// resident while the initial multicast runs, and later StartView responses may
-// legitimately include them only after Normal publishes and sweeps them.
 func (r *Replica) initialStartViewMsgLocked(view uint64, plan *mergePlan,
 	maxSlot uint64, hasMax bool) *BusStartView {
 	msg := &BusStartView{
@@ -1178,9 +980,7 @@ func (r *Replica) startViewMsg() *BusStartView {
 	return msg
 }
 
-// handleStartView queues the install. It must not run inline: installing waits
-// on a state transfer from the leader, and the reply to that transfer arrives on
-// this very connection — blocking the reader here would deadlock against it.
+// Install off the reader goroutine; state transfer replies arrive on that connection.
 func (r *Replica) handleStartView(msg *BusStartView) {
 	cp := *msg
 	cp.NoOpSlots = append([]uint64(nil), msg.NoOpSlots...)
@@ -1257,15 +1057,12 @@ func (r *Replica) validStartView(msg *BusStartView) bool {
 	return true
 }
 
-// viewInstallLoop serialises view installs so two StartViews cannot rewind the
-// log underneath each other.
 func (r *Replica) viewInstallLoop() {
 	for msg := range r.startViewQ {
 		r.installStartView(msg)
 	}
 }
 
-// installStartView installs a decided view and reconciles the local suffix.
 func (r *Replica) installStartView(msg *BusStartView) {
 	r.mu.Lock()
 	view := r.view()
@@ -1296,8 +1093,6 @@ func (r *Replica) installStartView(msg *BusStartView) {
 	r.drainPendingBusesLocked()
 	r.viewId.Store(msg.ViewId)
 	r.status = statusViewChange
-	// Acceptance starts a fresh full fallback interval for the reconciliation.
-	// Invalid, stale, and duplicate StartViews return above without touching it.
 	r.armViewChangeWatchdogLocked(msg.ViewId)
 	r.lastHeartbeatNs = nowNs()
 	r.leaderLost = false
@@ -1340,8 +1135,6 @@ func (r *Replica) installStartView(msg *BusStartView) {
 		if r.finishRecoveryIfComplete(rec) {
 			return
 		}
-		// A sparse fetch that filled its first hole made progress. Move to the
-		// next hole immediately; only empty/failed responses need backoff.
 		r.mu.Lock()
 		progressed := from <= to && r.slotStateLocked(from) != slotEmpty
 		r.mu.Unlock()
@@ -1360,7 +1153,6 @@ func (r *Replica) installStartView(msg *BusStartView) {
 	}
 }
 
-// prepareRecoveryLocked retains compatible buses while reconciling decisions.
 func (r *Replica) prepareRecoveryLocked(rec *viewRecovery, msg *BusStartView,
 	retain bool) (rewound uint64, didRewind, ok bool) {
 
@@ -1448,9 +1240,6 @@ func (r *Replica) prepareRecoveryLocked(rec *viewRecovery, msg *BusStartView,
 	return rewound, didRewind, true
 }
 
-// clearSlotRangeLocked removes the entries that existed when recovery began.
-// The caller holds r.mu, so a live bus cannot appear in the range until after
-// this one-time cleanup has finished.
 func (r *Replica) clearSlotRangeLocked(from, to uint64, bounded bool) {
 	for slot, entry := range r.globalLog {
 		if slot < from || (bounded && slot > to) {
@@ -1498,7 +1287,6 @@ func (r *Replica) missingRangeLocked(from, end uint64) (uint64, uint64) {
 	}
 	for slot := from; slot <= end; slot++ {
 		if entry := r.globalLog[slot]; entry == nil || entry.state == slotEmpty {
-			// Fetch only the missing run, preserving the retained tail.
 			to := slot
 			for to < end {
 				next := to + 1
@@ -1531,7 +1319,6 @@ func (r *Replica) finishRecoveryIfComplete(rec *viewRecovery) bool {
 		}
 	}
 	if rec.verifyPrefix {
-		// Validate retained data before executing it or releasing replies.
 		hash := r.prefixHash
 		for slot := r.nextExpected; slot <= rec.stable; slot++ {
 			e := r.globalLog[slot]
@@ -1556,9 +1343,6 @@ func (r *Replica) finishRecoveryIfComplete(rec *viewRecovery) bool {
 		rec.verifyPrefix = false
 	}
 
-	// Execute only the canonical range while the ViewChange fence is still up.
-	// Replayed replies for speculative execution join that same canonical batch;
-	// both paths stamp replies with the new view already stored by StartView.
 	if rec.hasMax {
 		r.advanceNextExpectedThroughLocked(rec.maxSlot)
 	}
@@ -1567,9 +1351,6 @@ func (r *Replica) finishRecoveryIfComplete(rec *viewRecovery) bool {
 		r.setStableLocked(rec.stable)
 	}
 
-	// Publish Normal only after every canonical reply is queued. The mutex keeps
-	// replyLoop and ordinary bus handling out until publication; the unbounded
-	// sweep then appends replies for buses recorded beyond the merge boundary.
 	r.lastNormalView = rec.view
 	r.cancelViewChangeWatchdogLocked()
 	r.status = statusNormal
@@ -1582,16 +1363,6 @@ func (r *Replica) finishRecoveryIfComplete(rec *viewRecovery) bool {
 	return true
 }
 
-// installViewLocked makes the local log agree with a decided view and returns
-// the replica to normal operation. The new-leader path uses the two phases
-// separately so it can multicast StartView between them.
-//
-// conservative is for a replica that did not take part in deciding this view:
-// it cannot tell which of its speculative slots the merge contradicts, so it
-// gives back everything above its own commit point and refetches. A participant
-// only has to undo slots the merge turned into no-ops, which is almost always
-// none of them — entries are content-determined by (clientId, busSeq) at a slot,
-// so two replicas holding the same slot hold the same bus.
 func (r *Replica) installViewLocked(view, stable uint64, hasStable bool,
 	maxSlot uint64, hasMax bool, noops []uint64,
 	conservative bool) (rewound uint64, didRewind bool) {
@@ -1604,10 +1375,6 @@ func (r *Replica) installViewLocked(view, stable uint64, hasStable bool,
 	return rewound, didRewind
 }
 
-// installCanonicalViewLocked installs and executes exactly the decided range,
-// queues its new-view replies, and deliberately leaves statusViewChange
-// published. Real buses beyond maxSlot remain in the log for the post-Normal
-// sweep; stale no-ops outside the decision do not.
 func (r *Replica) installCanonicalViewLocked(view, stable uint64, hasStable bool,
 	maxSlot uint64, hasMax bool, noops []uint64,
 	conservative bool) (rewound uint64, didRewind bool) {
@@ -1617,21 +1384,11 @@ func (r *Replica) installCanonicalViewLocked(view, stable uint64, hasStable bool
 	if hasMax && maxSlot != ^uint64(0) {
 		canonicalNext = maxSlot + 1
 	}
-	// Work executed before the ViewChange fence may extend beyond the reports
-	// selected by this merge. Give it back before replaying replies so the
-	// initial StartView and its canonical reply batch stop at the same boundary.
-	// rewindToLocked leaves the real entries resident; publication sweeps them
-	// again under the new view.
 	if (!hasMax || maxSlot != ^uint64(0)) && target > canonicalNext {
 		target = canonicalNext
 	}
 	if conservative {
-		// Back to *our* commit point, not the leader's. Ours is the last slot we
-		// know a quorum agreed with us on; between it and the leader's, higher,
-		// commit point our content was never checked against anyone — and on
-		// this path there is no no-op list to tell us where it diverges. Stable
-		// slots only ever move forward, so the leader's log agrees with ours
-		// through our commit point and everything above it can be refetched.
+		// Rewind to the local commit point; higher slots may differ from the leader.
 		if base := suffixBase(r.stableSlot, r.haveStable); r.haveStable && base < target {
 			target = base
 		} else if !r.haveStable {
@@ -1680,11 +1437,6 @@ func (r *Replica) installCanonicalViewLocked(view, stable uint64, hasStable bool
 	}
 
 	r.viewId.Store(view)
-	// A new view owes the client a reply for every slot above the commit point,
-	// in two ranges. What we had already executed was replied to under the old
-	// leader and has to be said again; what the merge added is executed now and
-	// replied to for the first time. Both are stamped with the new view, since
-	// viewId is already stored, but the ViewChange fence remains published.
 	replayFrom, replayTo := suffixBase(r.stableSlot, r.haveStable), r.nextExpected
 	if replayFrom < r.prunedBelow {
 		replayFrom = r.prunedBelow
@@ -1699,9 +1451,6 @@ func (r *Replica) installCanonicalViewLocked(view, stable uint64, hasStable bool
 	return rewound, didRewind
 }
 
-// publishNormalViewLocked is the leader's publication point after StartView has
-// been multicast. The mutex makes status publication and the post-merge sweep
-// atomic with respect to heartbeat ticks and ordinary bus intake.
 func (r *Replica) publishNormalViewLocked(view uint64) {
 	r.lastNormalView = view
 	r.cancelViewChangeWatchdogLocked()
@@ -1711,26 +1460,7 @@ func (r *Replica) publishNormalViewLocked(view uint64) {
 	r.advanceNextExpectedLocked()
 }
 
-// replayRepliesLocked re-sends the replies for slots this replica had already
-// executed above the commit point, now stamped with the new view.
-//
-// A client counts a request committed on f+1 replies that agree, and requires
-// one of them to come from the leader of the view they were stamped with. A
-// replica goes on executing for as long as it takes to notice the leader is gone
-// — one one-way delay plus a suspicion tick, ~40ms on our testbed — and every
-// reply it sends in that window names a leader that is already dead, so those
-// replies can never add up. Without this the requests in them are stranded until
-// the client's own request timeout re-boards them seconds later, and that does
-// not show up in the recovery gap at all: the client is open-loop, so it goes on
-// committing newer requests while they wait.
-//
-// The commit point is the exact floor. A slot at or below it was acked by f+1
-// replicas, so the old leader had executed it, and a reply it enqueued before
-// dying is still delivered — the kernel flushes what was written before the FIN.
-// Above the commit point there is no such guarantee.
-//
-// Repeats are harmless: the client counts replies in a per-replica bitmask keyed
-// by log index and view, so a request that did commit just sees a duplicate.
+// Replay replies above the commit point with the new view ID.
 func (r *Replica) replayRepliesLocked(from, to uint64) {
 	if from >= to {
 		return
@@ -1745,8 +1475,6 @@ func (r *Replica) replayRepliesLocked(from, to uint64) {
 			req := &e.requests[i]
 			li, ok := r.dedup[reqKey{req.ClientId, req.RequestId}]
 			if !ok {
-				// First assigned below the prune floor, which never rises past the
-				// commit point: the request committed long ago.
 				continue
 			}
 			r.enqueueReply(req.ClientId, req.RequestId, s, li)
@@ -1759,15 +1487,6 @@ func (r *Replica) replayRepliesLocked(from, to uint64) {
 	}
 }
 
-// rewindToLocked moves the cursor back to target, undoing speculative execution
-// above it. The request log list shrinks to the length it had, and every dedup
-// entry first assigned up there is released, so re-execution hands out exactly
-// the same log indexes again — which is what lets a client's votes for a request
-// still add up after a view change. A request first assigned an index below
-// target keeps it, which is exactly what re-boarding needs.
-//
-// The slots being walked are all above the commit point, and the prune floor
-// never rises past that, so their request lists are still resident.
 func (r *Replica) rewindToLocked(target uint64) bool {
 	if target >= r.nextExpected {
 		return true
@@ -1776,7 +1495,6 @@ func (r *Replica) rewindToLocked(target uint64) bool {
 	if !ok {
 		return false
 	}
-	// Undo newer writes first: several slots may overwrite the same key.
 	for s := r.nextExpected; s > target; s-- {
 		e := r.globalLog[s-1]
 		if e == nil {
@@ -1797,9 +1515,6 @@ func (r *Replica) rewindToLocked(target uint64) bool {
 	return true
 }
 
-// clearSlotsAboveLocked discards everything from slot upward so it can be
-// refetched from the leader. Only used on the conservative path, where this
-// replica cannot tell which of its own entries the new view contradicts.
 func (r *Replica) clearSlotsAboveLocked(from uint64) {
 	if !r.haveMax {
 		return
@@ -1811,8 +1526,6 @@ func (r *Replica) clearSlotsAboveLocked(from uint64) {
 		delete(r.globalLog, s)
 	}
 }
-
-// ── State transfer ──────────────────────────────────────────────────────────
 
 type fetchReq struct {
 	peer       int
@@ -1828,8 +1541,6 @@ type fetchReq struct {
 	slots      []uint64
 }
 
-// newSyncFetchLocked snapshots the current catch-up identity into one fetch.
-// Guarded by r.mu.
 func (r *Replica) newSyncFetchLocked(from, to uint64) fetchReq {
 	c := &r.syncCatchup
 	return fetchReq{
@@ -1842,8 +1553,6 @@ func (r *Replica) newSyncFetchLocked(from, to uint64) fetchReq {
 	}
 }
 
-// enqueueSyncFetch keeps queue failure from stranding an active catch-up with
-// no request that could ever complete it.
 func (r *Replica) enqueueSyncFetch(req fetchReq) {
 	select {
 	case r.fetchQ <- req:
@@ -1950,10 +1659,6 @@ func (r *Replica) fetchRecoveryRange(rec *viewRecovery, from, to uint64) bool {
 	}
 }
 
-// stateFetchLoop owns every inbound state transfer. Keeping it on one goroutine
-// off r.mu means a multi-megabyte catch-up cannot stall the ordering lock, and
-// the sync path, the view-change path and the lazy suffix catch-up all queue
-// through the same place.
 func (r *Replica) stateFetchLoop() {
 	for req := range r.fetchQ {
 		ok := r.runFetch(req)
@@ -1966,9 +1671,6 @@ func (r *Replica) stateFetchLoop() {
 	}
 }
 
-// finishSyncFetch reconciles one completed range with the follower's latest
-// coalesced target. A newer target produces one continuation; reaching it
-// validates the latest retained prepare and replies to the leader.
 func (r *Replica) finishSyncFetch(req fetchReq, ok bool) {
 	var (
 		prepare    BusSyncPrepare
@@ -1991,9 +1693,6 @@ func (r *Replica) finishSyncFetch(req fetchReq, ok bool) {
 
 	c := &r.syncCatchup
 	if r.nextExpected == 0 || r.nextExpected-1 < c.target {
-		// A successful sparse response is allowed to contain no entry for a
-		// slot. Do not turn that case into an immediate retry loop when the
-		// executed frontier made no progress.
 		if r.nextExpected <= req.from {
 			r.clearSyncCatchupLocked()
 			r.mu.Unlock()
@@ -2080,8 +1779,6 @@ func (r *Replica) runFetch(req fetchReq) bool {
 		}
 		to := req.to
 		var slots []uint64
-		// Recheck each chunk: buses may arrive while the fetch is queued or
-		// waiting for a response. Explicit divergence repair still refetches.
 		if req.syncGen != 0 || req.vc != nil || req.installGen != 0 {
 			r.mu.Lock()
 			slots = r.missingFetchSlotsLocked(req, next)
@@ -2129,8 +1826,6 @@ func (r *Replica) runFetch(req fetchReq) bool {
 				}
 				return false
 			case <-probe.C:
-				// Sync/divergence fetches need not have a cancel channel. Their
-				// view/generation can expire while the socket remains connected.
 				if !r.fetchActive(req) {
 					deadline.Stop()
 					return false
@@ -2233,16 +1928,12 @@ func (r *Replica) fetchActiveLocked(req fetchReq) bool {
 		r.status == statusViewChange
 }
 
-// syncCatchupMatchesLocked checks only the generation identity, which is what
-// queue failure needs before invalidating state. Guarded by r.mu.
 func (r *Replica) syncCatchupMatchesLocked(req fetchReq) bool {
 	c := &r.syncCatchup
 	return req.syncGen != 0 && c.active && c.generation == req.syncGen &&
 		c.view == req.view && c.leader == req.peer
 }
 
-// syncCatchupActiveLocked additionally fences transfer work on the current
-// normal view and its designated leader. Guarded by r.mu.
 func (r *Replica) syncCatchupActiveLocked(req fetchReq) bool {
 	return r.syncCatchupMatchesLocked(req) && r.status == statusNormal &&
 		r.view() == req.view && r.config.LeaderIndex(req.view) == req.peer
@@ -2269,9 +1960,6 @@ func (r *Replica) handleGetState(msg *BusGetState) {
 	}
 }
 
-// stateServeLoop answers BusGetState off the connection goroutines: a reply can
-// mean reading the durable log and marshalling a megabyte, neither of which
-// belongs on a reader or under r.mu.
 func (r *Replica) stateServeLoop() {
 	for req := range r.serveQ {
 		r.serveState(req)
@@ -2314,12 +2002,7 @@ func (r *Replica) serveState(req *BusGetState) {
 	r.sendToPeer(int(req.SenderIdx), MsgBusNewState, reply)
 }
 
-// readSlot returns one slot's content for a peer, from memory when it is still
-// resident and from the durable log when it has been reclaimed.
-//
-// Only slots at or below the commit point are ever read from disk. Above it a
-// slot can still be rewound, and a rewind does not rewrite history on disk — so
-// the durable log is authoritative exactly where it can no longer change.
+// Disk is authoritative only at or below the commit point.
 func (r *Replica) readSlot(slot uint64) (StateEntry, bool) {
 	r.mu.Lock()
 	if e := r.globalLog[slot]; e != nil && e.state != slotEmpty {

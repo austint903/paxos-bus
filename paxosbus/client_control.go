@@ -1,8 +1,6 @@
 package paxosbus
 
-// Client flow control travels on separate TCP connections: data/reply queues
-// must not delay the message that asks the producer to stop growing them.
-// Resume changes arrival predictions, never the immutable ordering lines.
+// Control messages use separate connections so data backpressure cannot delay a pause.
 
 import (
 	"bufio"
@@ -89,8 +87,6 @@ func (r *Replica) pauseClients(view uint64) {
 	}
 }
 
-// A silent/failed client cannot suppress gap detection indefinitely. Before
-// its resume fence arrives, allow one recovery interval for the handshake.
 func (r *Replica) clientGapDueLocked(meta slotMetaEntry, now int64) bool {
 	if s := r.clientControls[meta.clientId]; s != nil &&
 		s.resume.ViewId < r.view() && now < s.holdUntil {
@@ -132,8 +128,7 @@ func (r *Replica) clientControlReplyLocked(code uint8, m *clientControlMessage, 
 		m.NextSeq-1 > uint64((math.MaxInt64-line.baseNs)/line.intervalNs) {
 		return reply
 	}
-	// An ACK also fences the old data stream: every bus already issued by this
-	// client must have reached this replica before that client starts a new one.
+	// A resume ACK fences all buses this client sent before the pause.
 	if m.NextSeq-1 > line.maxSeqSeen {
 		return reply
 	}
@@ -170,8 +165,6 @@ type clientControlReply struct {
 
 type clientControlPeer struct{ out chan clientControlReply }
 
-// ConfigureClientPause is called before Connect/Run. Pause is enabled by
-// default; the switch permits paired benchmark runs with identical binaries.
 func (c *Client) ConfigureClientPause(enabled bool, resumeLead time.Duration) {
 	c.pauseEnabled = enabled
 	if resumeLead > 0 {
@@ -245,7 +238,6 @@ func (c *Client) controlPeerLoop(idx int) {
 }
 
 func (c *Client) handleControlReply(code uint8, m clientControlMessage) {
-	// Polls also deliver a missed pause (including after control reconnection).
 	if code == MsgClientPause || code == MsgClientStatusReply {
 		c.pauseForView(m.ViewId)
 	}
@@ -308,8 +300,6 @@ func (c *Client) waitUnlessPause(delay time.Duration) {
 
 func (c *Client) broadcastControl(code uint8, m clientControlMessage) {
 	for _, p := range c.controlPeers {
-		// At most one unsent control request per peer. Retries supersede older
-		// tokens, so a dead replica cannot build a queue or hold up the quorum.
 		select {
 		case <-p.out:
 		default:

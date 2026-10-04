@@ -47,9 +47,6 @@ const (
 	MsgBus
 	MsgRequestReply
 
-	// Failure recovery. The first three are the periodic leader heartbeat that
-	// doubles as the commit-point protocol; the rest drive view change and the
-	// state transfer that replaces shipping the log in a message.
 	MsgBusSyncPrepare
 	MsgBusSyncReply
 	MsgBusSyncCommit
@@ -67,9 +64,6 @@ const (
 	MsgClientResumeAck
 )
 
-// Sanity caps on the variable-length parts of the recovery messages. A view
-// change carries only metadata, so anything beyond these is a corrupt or
-// hostile frame rather than a big log.
 const (
 	maxBitmapBytes  = 1 << 20
 	maxSlotListLen  = 1 << 20
@@ -237,9 +231,7 @@ func (m *RequestReplyMessage) Unmarshal(wire io.Reader) error {
 	return nil
 }
 
-// Gap messages use (ViewId, Slot) as the identity of one logical agreement.
-// Retransmissions keep both fields unchanged, and a view change invalidates all
-// messages from the previous identity.
+// (ViewId, Slot) identifies one gap agreement.
 type BusGapRequest struct {
 	Slot      uint64
 	SenderIdx uint32
@@ -368,8 +360,6 @@ func (m *BusGapCommitReply) Unmarshal(wire io.Reader) error {
 	return nil
 }
 
-// ── Failure recovery ────────────────────────────────────────────────────────
-
 func putSlotList(wire io.Writer, slots []uint64) {
 	var b [8]byte
 	binary.LittleEndian.PutUint32(b[0:4], uint32(len(slots)))
@@ -439,10 +429,6 @@ func putBool(b []byte, v bool) {
 	}
 }
 
-// BusSyncPrepare is the leader's periodic heartbeat and the first phase of the
-// commit point: it names the slot the leader wants made stable and the prefix
-// hash a follower must match to agree. HasSlot is false before any client
-// traffic, when the message is a bare liveness beat.
 type BusSyncPrepare struct {
 	ViewId     uint64
 	SlotToSync uint64
@@ -451,15 +437,12 @@ type BusSyncPrepare struct {
 	SenderIdx  uint32
 }
 
-// BusSyncReply agrees that this replica's log matches the leader's through Slot.
 type BusSyncReply struct {
 	ViewId    uint64
 	Slot      uint64
 	SenderIdx uint32
 }
 
-// BusSyncCommit advances the stable slot once the leader has f+1 agreements
-// including its own. On and below StableSlot the log is durable at a quorum.
 type BusSyncCommit struct {
 	ViewId     uint64
 	StableSlot uint64
@@ -533,18 +516,12 @@ func (m *BusSyncCommit) Unmarshal(wire io.Reader) error {
 	return nil
 }
 
-// BusViewChangeRequest announces that this replica suspects the leader and has
-// moved to ViewId. Every replica that hears it joins immediately rather than
-// waiting for its own timer, so the new leader collects its quorum in ~0.5 RTT.
 type BusViewChangeRequest struct {
 	ViewId    uint64
 	SenderIdx uint32
 }
 
-// BusViewChange reports one replica's state to the new leader. It carries no
-// log entries: FilledBitmap says which suffix slots this replica holds and
-// NoOpSlots which of them are agreed no-ops, so the leader can merge from
-// metadata alone and pull only the entries it actually lacks over BusGetState.
+// BusViewChange carries suffix metadata, not log entries.
 type BusViewChange struct {
 	SenderIdx      uint32
 	ViewId         uint64
@@ -560,10 +537,7 @@ type BusViewChange struct {
 	NoOpSlots      []uint64
 }
 
-// BusStartView installs the new view. Like BusViewChange it is metadata only:
-// followers learn the committed prefix (StableSlot), how far the merged suffix
-// runs (MaxSlot), which reports selected it, and which slots became no-ops.
-// They remain in recovery while fetching every missing entry.
+// BusStartView carries the selected merge metadata, not log entries.
 type BusStartView struct {
 	ViewId           uint64
 	SourceNormalView uint64
@@ -577,9 +551,6 @@ type BusStartView struct {
 	SelectedReports  []uint32 // reports retained after filtering to the highest LastNormalView
 }
 
-// BusStateQuery is how a replica that finds itself in a stale view asks to be
-// caught up. It does not start a view change — the current leader answers with
-// its BusStartView and the querier installs it like any other.
 type BusStateQuery struct {
 	ViewId    uint64
 	SenderIdx uint32
@@ -725,9 +696,6 @@ func (m *BusStartView) Unmarshal(wire io.Reader) error {
 	return nil
 }
 
-// BusGetState asks a peer for the log content of [FromSlot, ToSlot]. This is
-// the only message that ever carries entries, and the responder is free to
-// answer a shorter range than asked (see BusNewState.ToSlot).
 type BusGetState struct {
 	ViewId    uint64
 	FromSlot  uint64
@@ -737,8 +705,6 @@ type BusGetState struct {
 	Slots     []uint64 // Empty requests the full range.
 }
 
-// StateEntry is one slot's content. Payload is the marshaled request list for a
-// bus (see marshalRequests); a no-op carries none.
 type StateEntry struct {
 	Slot     uint64
 	ClientId uint64
@@ -748,10 +714,6 @@ type StateEntry struct {
 	Payload  []byte
 }
 
-// BusNewState answers a BusGetState. ToSlot is how far the responder actually
-// got: replies are capped by bytes, not slot count, because one bus can carry a
-// thousand requests. The requester loops from ToSlot+1 until it is caught up.
-// Slots the responder does not have are simply absent from Entries.
 type BusNewState struct {
 	ViewId    uint64
 	FromSlot  uint64

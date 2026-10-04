@@ -16,17 +16,9 @@ type durableLog struct {
 	f *os.File
 	w *bufio.Writer
 
-	// flushReq lets a reader ask writeLoop to push the buffer to the file
-	// before it looks at it. Reads are rare and never on the hot path, so this
-	// costs the writer nothing in the normal case.
 	flushReq chan chan struct{}
 
-	// Read side. rf is a second, read-only descriptor so a state transfer never
-	// disturbs the writer's position. offIdx is a sparse key -> offset table
-	// built as records are written (every offStride-th key), which is what makes
-	// a lookup a short forward scan instead of a walk from the start of the file.
-	// r* is a cursor: consecutive lookups walk forward in key order, so a range
-	// read of a thousand slots is one linear pass.
+	// Readers use a separate descriptor so state transfer cannot disturb the writer.
 	idxMu     sync.Mutex
 	offIdx    []int64
 	firstKey  uint64
@@ -39,11 +31,7 @@ type durableLog struct {
 	rOff   int64
 	rValid bool
 
-	// pending is an unbounded in-memory hand-off to writeLoop. The hot path
-	// (record*) only appends under mu and never blocks on the disk goroutine, so
-	// a disk latency spike can't stall the caller's r.mu — it just grows this
-	// buffer transiently and drains once the disk catches up. maxDepth is the
-	// high-water mark since the last backlogMax() read, exposed in the stats line.
+	// pending lets the hot path enqueue records without waiting for disk.
 	mu       sync.Mutex
 	pending  []logRecord
 	maxDepth int
@@ -69,9 +57,7 @@ const durableSyncInterval = time.Second
 
 const holeRecordWidth = 256
 
-// offStride is how many records separate two entries of the sparse offset
-// index: one int64 per 1024 records is negligible memory, and it bounds a
-// lookup's forward scan to at most that many lines.
+// offStride controls the sparse disk index spacing.
 const offStride = 1024
 
 func openDurableLog(dir, name string) (*durableLog, error) {
@@ -111,12 +97,6 @@ func recordBody(slot, clientId, reqId uint64, op []byte, noop bool) string {
 		slot, clientId, reqId, len(op), hex.EncodeToString(op), noop)
 }
 
-// busRecordBody is one line of the BusMessage Log: which bus occupies this
-// global slot and which request-log-list indexes its passengers map to. The
-// request payloads themselves live in the separate request log list (see
-// reqListRecordBody); the bus log only references them by index. A request
-// carried by several buses (re-boarded after missing quorum) is appended once
-// per bus, so the same request appears at several indexes, one per arrival.
 func busRecordBody(slot, clientId, busSeq uint64, logIdxs []uint64, noop bool) string {
 	var sb strings.Builder
 	fmt.Fprintf(&sb, "{\"slot\":%d,\"client\":%d,\"bus\":%d,\"log_indexes\":[", slot, clientId, busSeq)
@@ -130,11 +110,6 @@ func busRecordBody(slot, clientId, busSeq uint64, logIdxs []uint64, noop bool) s
 	return sb.String()
 }
 
-// reqListRecordBody is one line of the Request Log List: the request stored at
-// log_index. Appended in strict log-index order, so the file is contiguous (no
-// holes) unlike the slot-indexed bus/global logs. One line per arrival, not per
-// distinct request — a re-boarded request is recorded again at its new index,
-// and only its execution is deduplicated (see appendBusToLogListLocked).
 func reqListRecordBody(logIndex, clientId, reqId uint64, op []byte) string {
 	return fmt.Sprintf(
 		"{\"log_index\":%d,\"client\":%d,\"req_id\":%d,\"len\":%d,\"op\":\"%s\"}",
@@ -169,9 +144,6 @@ func (cl *durableLog) recordReq(logIndex, clientId, reqId uint64, op []byte) {
 	cl.push(logRecord{logIndex, reqListRecordBody(logIndex, clientId, reqId, op)})
 }
 
-// push is the hot-path enqueue. It only appends under mu and wakes writeLoop —
-// it never waits on disk — so callers holding r.mu are never blocked by an fsync
-// stall. The disk write itself happens off-lock in writeLoop.
 func (cl *durableLog) push(rec logRecord) {
 	cl.mu.Lock()
 	cl.pending = append(cl.pending, rec)
@@ -185,8 +157,6 @@ func (cl *durableLog) push(rec logRecord) {
 	}
 }
 
-// backlogMax returns and resets the high-water mark of the pending buffer since
-// the last call — the durable analogue of the reply backlog stat.
 func (cl *durableLog) backlogMax() int {
 	cl.mu.Lock()
 	m := cl.maxDepth
@@ -202,9 +172,6 @@ func (cl *durableLog) writeLoop() {
 		select {
 		case <-cl.wake:
 		case ack := <-cl.flushReq:
-			// Drain before flushing: a reader wants everything recorded so far
-			// to be visible in the file, not just whatever had already been
-			// handed to the buffer.
 			cl.drain()
 			cl.w.Flush()
 			close(ack)
@@ -225,9 +192,6 @@ func (cl *durableLog) writeLoop() {
 	}
 }
 
-// drain writes out the whole pending buffer, swapped out under mu so the hot
-// path keeps appending while disk I/O happens off-lock. It reports whether a
-// close was requested once the buffer had emptied.
 func (cl *durableLog) drain() (closing bool) {
 	for {
 		cl.mu.Lock()
@@ -244,8 +208,6 @@ func (cl *durableLog) drain() (closing bool) {
 	}
 }
 
-// flushForRead makes every record pushed so far visible through the read
-// descriptor.
 func (cl *durableLog) flushForRead() {
 	ack := make(chan struct{})
 	select {
@@ -281,9 +243,6 @@ func (cl *durableLog) apply(slot uint64, body string) {
 	cl.nextSlot = slot + 1
 }
 
-// noteOffset extends the sparse offset index. Every key from the first one
-// written onwards gets a line (holes are filled with placeholders), so key
-// order and file order agree and a sampled offset is enough to find any key.
 func (cl *durableLog) noteOffset(key uint64) {
 	cl.idxMu.Lock()
 	if !cl.haveFirst {

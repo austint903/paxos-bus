@@ -32,11 +32,9 @@ const (
 )
 
 type clientLine struct {
-	baseNs     int64
-	intervalNs int64
-	maxSeqSeen uint64
-	// Ordering always uses baseNs. Resume only shifts the arrival prediction
-	// for future buses; changing baseNs would remap already assigned slots.
+	baseNs          int64
+	intervalNs      int64
+	maxSeqSeen      uint64
 	resumeSeq       uint64
 	arrivalOffsetNs int64
 }
@@ -62,18 +60,12 @@ type globalEntry struct {
 	isBus    bool
 	ownerSet bool // clientId/reqId hold this slot's real owner (client id 0 is valid)
 
-	// [logIdxLo, logIdxHi) are the request-log-list indexes this slot appended,
-	// one per passenger, filled in when the cursor executes it. Reclaiming the
-	// slot releases exactly the dedup entries first assigned in that range, and
-	// no others — a re-boarded passenger's entry stays with the slot it first
-	// arrived on, which is the one that executed it.
+	// [logIdxLo, logIdxHi) owns the dedup entries first assigned in this slot.
 	logIdxLo      uint64
 	logIdxHi      uint64
 	prefixHash    uint64
 	logIndexAfter uint64
 
-	// One pre-bus value per written key lets recovery undo this slot without
-	// retaining a separate history entry for every passenger.
 	undo []writeUndo
 
 	sizeBytes uint64 // this slot's share of residentBytes
@@ -85,9 +77,6 @@ type writeUndo struct {
 	present bool
 }
 
-// requestOverheadBytes is the fixed heap cost of one retained RequestMessage,
-// on top of its op. Only used to size the retain window, so an estimate is
-// enough — it just has to move with the real footprint.
 const requestOverheadBytes = 48
 
 func busSizeBytes(reqs []RequestMessage) uint64 {
@@ -159,12 +148,10 @@ type gapState struct {
 	start        int64
 	askers       map[uint32]struct{}
 	probeReplies chan *BusGapReply
-	// commitAcks carries the acking replica's index: the commit is rebroadcast
-	// each round, so a replica acks repeatedly and only distinct senders count.
-	commitAcks chan uint32
-	doneCh     chan struct{}
-	abortCh    chan struct{}
-	abortOnce  sync.Once
+	commitAcks   chan uint32
+	doneCh       chan struct{}
+	abortCh      chan struct{}
+	abortOnce    sync.Once
 }
 
 func newGapState(start int64, view uint64) *gapState {
@@ -200,14 +187,8 @@ func (gs *gapState) snapshotAskers() []uint32 {
 	return out
 }
 
-// defaultGapDeltaMs is the default Δ: how far past a slot's expected arrival
-// time a replica waits before treating it as a gap. The line's base is a true
-// arrival instant (the client departs maxOWD early), so Δ only has to absorb
-// jitter around the line — it stays generous anyway, msgs are rarely dropped.
 const defaultGapDeltaMs = 5000
 
-// gapRecoveryTimeout bounds the leader-first lookup/probe phase. Commit
-// retransmission has its own configurable interval on Replica.
 const gapRecoveryTimeout = 3 * time.Second
 
 type dropMode uint8
@@ -247,10 +228,7 @@ func (m dropMode) String() string {
 	}
 }
 
-// replicaStatus gates the cursor. In ViewChange the replica still records
-// arriving buses into their slots — a bus's position comes from its client's
-// line, not from any leader — but nothing is decomposed into the request log
-// list and no client hears back until the new view is installed.
+// ViewChange records buses but fences execution and client replies.
 type replicaStatus uint8
 
 const (
@@ -267,9 +245,7 @@ func (s replicaStatus) String() string {
 	}
 }
 
-// syncCatchup is the one coalesced sync-driven state transfer on a follower.
-// generation fences completions from an older transfer after the view, leader,
-// or replica status has changed. Guarded by r.mu.
+// generation rejects results from an obsolete sync transfer.
 type syncCatchup struct {
 	generation uint64
 	view       uint64
@@ -282,8 +258,6 @@ type syncCatchup struct {
 type Replica struct {
 	config *Config
 	idx    int
-	// viewId is read off r.mu on the reply hot path, so it is atomic; every
-	// write still happens under r.mu alongside the rest of the view state.
 	viewId atomic.Uint64
 	self   string
 
@@ -305,34 +279,20 @@ type Replica struct {
 	maxSlotSeen  uint64
 	haveMax      bool
 
-	// stableSlot is the commit point: on and below it the log is durable at a
-	// quorum, so it is both the floor for memory reclamation and the point a
-	// lagging replica may safely rewind to.
+	// stableSlot is the committed, durable prefix and the rewind floor.
 	stableSlot uint64
 	haveStable bool
 
-	// prefixHash is the rolling hash of the executed prefix [0, nextExpected).
-	// hashRing/logIdxRing remember its value, and the value of nextLogIndex,
-	// after each of the last ringSize executed slots — enough to answer "your
-	// hash at slot S" and to rewind exactly, with no per-request history. The
-	// rings run two slots deeper than the prune window so that the slot being
-	// evicted, and the one below it, can still be looked up as it goes.
+	// The rings retain prefix hashes and log lengths needed for rewind.
 	prefixHash  uint64
 	hashRing    []uint64
 	logIdxRing  []uint64
 	retainSlots uint64
 	ringSize    uint64
 
-	// A slot window alone is a poor memory bound, because a slot is one bus and
-	// a bus can carry one request or a thousand. residentBytes tracks the actual
-	// retained payload so the window can also close on size.
 	residentBytes uint64
 	retainBytes   uint64
 
-	// nextLogIndex is the length of the request log list. The in-memory list
-	// itself was write-only (payloads live in requestlist.log, indexes in
-	// dedup), so only the counter is kept — the slice grew ~50MB/min at high
-	// request rates for nothing.
 	nextLogIndex uint64
 	dedup        map[reqKey]uint64
 	State        *state.State
@@ -354,7 +314,6 @@ type Replica struct {
 
 	gaps map[gapKey]*gapState
 
-	// Failure recovery.
 	syncInterval              time.Duration
 	suspectTimeout            time.Duration
 	viewChangeTimeout         time.Duration
@@ -391,35 +350,6 @@ type Replica struct {
 	winReplyMax   int
 }
 
-// RecoveryOptions tunes failure detection and the memory window.
-//
-// The heartbeat interval is not only liveness: each beat opens the round that
-// advances the commit point, so it also sets how far the commit point trails,
-// and with it the suffix a view change has to reconcile and the floor below
-// which memory may be reclaimed. It must stay comfortably above the round trip
-// to the nearest follower — syncLoop replaces the outstanding round every tick,
-// so a reply that arrives after the next beat is discarded and the commit point
-// stops advancing altogether.
-//
-// The suspect timeout is not a multiple of the heartbeat, because it answers a
-// different question: how long a healthy leader can plausibly go quiet. A crash
-// closes the socket and is noticed in a one-way delay regardless, so this figure
-// only bounds a leader that has gone silent without dying — hung, or partitioned
-// away. It is sized above the things that delay a beat on a working cluster: a
-// lost segment costs a 200ms retransmit floor and twice that if it happens
-// again, and the peer connections are sparse enough to fall back on that timer
-// rather than fast retransmit. Suspecting a leader that is merely slow is not
-// free — the rejoining leader lands on rewindToStableAndRefetch, which repairs a
-// divergence the view change cannot see on its own.
-//
-// The view-change timeout is the designated new leader's report-collection
-// deadline. The longer view-change fallback is replica-wide: every replica in
-// ViewChange advances if that exact view remains stuck, and accepting StartView
-// gives reconciliation a fresh fallback interval.
-//
-// The gap retry timeout is independent of the leader-first recovery probe. It
-// only controls how often an already-installed no-op commit is rebroadcast
-// while the leader waits for f distinct follower acknowledgements.
 type RecoveryOptions struct {
 	SyncIntervalMs              uint64
 	SuspectTimeoutMs            uint64
@@ -555,8 +485,6 @@ func (r *Replica) AmLeader() bool {
 	return r.leaderIdx() == r.idx
 }
 
-// ── Prefix hash ─────────────────────────────────────────────────────────────
-
 const (
 	fnvOffset64 = 14695981039346656037
 	fnvPrime64  = 1099511628211
@@ -571,10 +499,6 @@ func fnvMix(h, v uint64) uint64 {
 	return h
 }
 
-// foldSlot extends the rolling prefix hash with one executed slot. Only the
-// slot's identity is hashed, never its passengers: which requests ride a bus is
-// fully determined by (clientId, busSeq), so an O(1) fold says everything an
-// O(requests) one would while staying off the hot path's budget.
 func foldSlot(h, slot uint64, st slotState, clientId, reqId uint64) uint64 {
 	h = fnvMix(h, slot)
 	h = fnvMix(h, uint64(st))
@@ -582,8 +506,6 @@ func foldSlot(h, slot uint64, st slotState, clientId, reqId uint64) uint64 {
 	return fnvMix(h, reqId)
 }
 
-// foldExecutedLocked records the prefix hash and request-log-list length as of
-// just after slot was executed, so both can be recovered exactly on rewind.
 func (r *Replica) foldExecutedLocked(slot uint64, e *globalEntry) {
 	clientId, reqId := e.clientId, e.reqId
 	if !e.ownerSet {
@@ -597,9 +519,6 @@ func (r *Replica) foldExecutedLocked(slot uint64, e *globalEntry) {
 	r.logIdxRing[i] = r.nextLogIndex
 }
 
-// ringValidLocked reports whether the rings still remember slot. Slots are
-// executed in strictly increasing order, so an entry survives exactly until
-// ringSize later slots have overwritten it.
 func (r *Replica) ringValidLocked(slot uint64) bool {
 	if slot >= r.nextExpected {
 		return false
@@ -607,10 +526,8 @@ func (r *Replica) ringValidLocked(slot uint64) bool {
 	return slot+r.ringSize >= r.nextExpected
 }
 
-// prefixHashAtLocked is the hash of the executed prefix [0, slot].
 func (r *Replica) prefixHashAtLocked(slot uint64) (uint64, bool) {
 	if !r.ringValidLocked(slot) {
-		// The stable checkpoint and speculative suffix can outlive the ring.
 		if e := r.globalLog[slot]; slot >= r.prunedBelow && slot < r.nextExpected && e != nil {
 			return e.prefixHash, true
 		}
@@ -619,8 +536,6 @@ func (r *Replica) prefixHashAtLocked(slot uint64) (uint64, bool) {
 	return r.hashRing[slot%r.ringSize], true
 }
 
-// logIndexAfterLocked is what nextLogIndex was once slot had been executed —
-// the request-log-list length to restore when rewinding to slot+1.
 func (r *Replica) logIndexAfterLocked(slot uint64) (uint64, bool) {
 	if !r.ringValidLocked(slot) {
 		if e := r.globalLog[slot]; slot >= r.prunedBelow && slot < r.nextExpected && e != nil {
@@ -631,8 +546,6 @@ func (r *Replica) logIndexAfterLocked(slot uint64) (uint64, bool) {
 	return r.logIdxRing[slot%r.ringSize], true
 }
 
-// prefixStateAtLocked is the (hash, request-log-list length) pair to restore
-// when rewinding the cursor to slot. Rewinding to 0 needs no history.
 func (r *Replica) prefixStateAtLocked(slot uint64) (hash, logIdx uint64, ok bool) {
 	if slot == 0 {
 		return fnvOffset64, 0, true
@@ -677,8 +590,6 @@ func (r *Replica) Run() error {
 	if err != nil {
 		return err
 	}
-	// Suspicion runs off the clock from here, so a leader that never comes up at
-	// all is noticed the same way one that dies mid-run is.
 	r.mu.Lock()
 	r.lastHeartbeatNs = nowNs()
 	r.mu.Unlock()
@@ -688,9 +599,7 @@ func (r *Replica) Run() error {
 	go r.replyLoop()
 	go r.syncLoop()
 	go r.suspicionLoop()
-	// State transfer gets its own goroutines at both ends: serving reads the
-	// durable log and marshals megabytes, and neither may happen on a connection
-	// reader or under r.mu.
+	// State transfer runs off connection readers and r.mu.
 	go r.stateServeLoop()
 	go r.stateFetchLoop()
 	go r.viewInstallLoop()
@@ -712,10 +621,6 @@ func (r *Replica) clientListener(conn net.Conn) {
 	reader := bufio.NewReader(conn)
 	lw := &lockedWriter{w: bufio.NewWriter(conn), conn: conn}
 
-	// Peer messages name their sender, so this connection identifies itself the
-	// first time one arrives. When it then closes we know exactly which replica
-	// went away — a far stronger and faster signal than the heartbeat timeout,
-	// which is what turns a killed leader into a view change in milliseconds.
 	peerIdx := -1
 	defer func() {
 		if peerIdx >= 0 {
@@ -881,8 +786,6 @@ func (r *Replica) clientListener(conn net.Conn) {
 	}
 }
 
-// handleSync installs a client's arrival line — the only coordination the
-// common path needs, since every replica derives the same order from it.
 func (r *Replica) handleSync(msg *BusSyncMessage) {
 	r.mu.Lock()
 	r.clients[msg.ClientId] = &clientLine{
@@ -895,16 +798,12 @@ func (r *Replica) handleSync(msg *BusSyncMessage) {
 		r.self, msg.ClientId, msg.FirstMsgNs, (int64(msg.FirstMsgNs)-wallNs())/1e6, msg.IntervalMs)
 }
 
-// resetCursorLocked discards the memoized slot-to-owner inverse: a new line
-// changes the merge, so previously generated owners no longer hold.
 func (r *Replica) resetCursorLocked() {
 	r.cursorSlot = 0
 	r.cursorNextN = make(map[uint64]uint64)
 	r.slotMeta = make(map[uint64]slotMetaEntry)
 }
 
-// admission is why an arriving message was or was not accepted. The reason
-// travels back to the caller so the log call happens off r.mu.
 type admission uint8
 
 const (
@@ -913,15 +812,11 @@ const (
 	admitDropped            // swallowed by the fault injector
 )
 
-// admitLocked vets an arriving message and, when it is to be ordered, folds its
-// arrival into this second's schedule-tracking statistics.
 func (r *Replica) admitLocked(clientId, seq uint64, actualNs int64) admission {
 	line, ok := r.clients[clientId]
 	if !ok {
 		return admitUnsynced
 	}
-	// Track consumption of the TCP stream even when the fault injector drops
-	// the received bus, so pausing at that sequence cannot strand resume.
 	if seq > line.maxSeqSeen {
 		line.maxSeqSeen = seq
 	}
@@ -933,8 +828,6 @@ func (r *Replica) admitLocked(clientId, seq uint64, actualNs int64) admission {
 	return admitted
 }
 
-// observeArrivalLocked accumulates how far this arrival fell from where the
-// client's line said it would land.
 func (r *Replica) observeArrivalLocked(line *clientLine, seq uint64, actualNs int64) {
 	deltaUs := (actualNs - line.arrivalNs(seq)) / 1000
 	if r.winRecv == 0 {
@@ -951,8 +844,6 @@ func (r *Replica) observeArrivalLocked(line *clientLine, seq uint64, actualNs in
 	r.winRecv++
 }
 
-// handleBus orders a whole bus of requests. lw is the connection it arrived on,
-// which doubles as the route for replies to that client.
 func (r *Replica) handleBus(msg *BusMessage, lw *lockedWriter) {
 	actualNs := wallNs()
 	r.bindReplySender(msg.ClientId, lw)
@@ -977,8 +868,6 @@ func (r *Replica) handleBus(msg *BusMessage, lw *lockedWriter) {
 	r.mu.Unlock()
 }
 
-// bindReplySender points this client's reply sender at the connection its bus
-// arrived on, creating the sender on first contact.
 func (r *Replica) bindReplySender(clientId uint64, lw *lockedWriter) {
 	r.cwMu.Lock()
 	defer r.cwMu.Unlock()
@@ -989,18 +878,12 @@ func (r *Replica) bindReplySender(clientId uint64, lw *lockedWriter) {
 	r.replySenders[clientId] = newReplySender(r, lw)
 }
 
-// applyDuringRecoveryLocked records every bus in its deterministic slot even
-// while an earlier slot is under gap agreement. advanceNextExpectedLocked
-// already stops at the first empty slot, so later buses can be retained without
-// executing out of order. Once a real bus or no-op fills the hole, the retained
-// suffix is ready to advance immediately.
 func (r *Replica) applyDuringRecoveryLocked(msg *BusMessage) {
 	slot := computeGlobalSlot(r.clients, msg.ClientId, msg.BusSeqNum)
 	stored := r.recordBusReceivedLocked(slot, msg.ClientId, msg.BusSeqNum, msg.Requests)
 	r.advanceNextExpectedLocked()
 	key := gapKey{view: r.view(), slot: slot}
 	if gs := r.gaps[key]; stored && gs != nil {
-		// Non-blocking: the waiter may already have timed out.
 		select {
 		case gs.doneCh <- struct{}{}:
 		default:
@@ -1017,9 +900,7 @@ func (r *Replica) leaderGapActiveLocked(key gapKey, gs *gapState) bool {
 	return r.gapActiveLocked(key, gs) && r.config.LeaderIndex(key.view) == r.idx
 }
 
-// finishGapLocked retires a resolved gap only if the map still points to the
-// exact state being finished. An old goroutine must never remove replacement
-// state installed for the same slot.
+// Only the current gap state may be removed by its waiter.
 func (r *Replica) finishGapLocked(key gapKey, gs *gapState) {
 	if r.gaps[key] != gs {
 		return
@@ -1031,9 +912,6 @@ func (r *Replica) finishGapLocked(key gapKey, gs *gapState) {
 	}
 }
 
-// cancelGapsLocked stops every waiter from the view being retired. The ACK
-// channels stay open so a packet handler that already obtained a pointer cannot
-// panic while delivering a late message.
 func (r *Replica) cancelGapsLocked() {
 	for _, gs := range r.gaps {
 		gs.cancel()
@@ -1041,9 +919,6 @@ func (r *Replica) cancelGapsLocked() {
 	r.gaps = make(map[gapKey]*gapState)
 }
 
-// drainPendingBusesLocked replays the buffered buses. Their slots come from
-// their clients' lines, not arrival order, so replaying them late cannot
-// reorder them.
 func (r *Replica) drainPendingBusesLocked() {
 	if len(r.pendingBuses) == 0 {
 		return
@@ -1076,8 +951,6 @@ func (r *Replica) recordBusReceivedLocked(slot, clientId, busSeq uint64, reqs []
 	return true
 }
 
-// slotGapPayloadLocked returns what to hand a peer missing this slot, and
-// whether that payload is a marshaled bus rather than a bare request op.
 func (r *Replica) slotGapPayloadLocked(slot uint64) (payload []byte, isBus bool) {
 	e := r.globalLog[slot]
 	if e == nil {
@@ -1089,8 +962,6 @@ func (r *Replica) slotGapPayloadLocked(slot uint64) (payload []byte, isBus bool)
 	return e.op, false
 }
 
-// storeRecoveredLocked installs a copy obtained from a peer, through the same
-// first-writer-wins path as a live arrival.
 func (r *Replica) storeRecoveredLocked(slot, clientId, reqId uint64, payload []byte, isBus bool) bool {
 	if !isBus {
 		return r.recordReceivedLocked(slot, clientId, reqId, payload)
@@ -1119,9 +990,6 @@ func (r *Replica) observeSlotLocked(slot uint64) {
 	}
 }
 
-// claimSlotLocked returns the entry for slot if it is still unfilled, nil if
-// some other path got there first — which is how a late or duplicate arrival
-// loses to an already-agreed no-op, identically at every replica.
 func (r *Replica) claimSlotLocked(slot uint64) *globalEntry {
 	r.observeSlotLocked(slot)
 	e := r.slotEntryLocked(slot)
@@ -1149,15 +1017,8 @@ func (r *Replica) recordReceivedLocked(slot, clientId, reqId uint64, op []byte) 
 	return true
 }
 
-// setNoOpLocked deliberately overwrites an existing entry: a no-op is an agreed
-// decision, so a replica that has since received the real message must discard
-// it. The owner comes from the lazy inverse, naming whose message was lost.
+// An agreed no-op may replace a bus only before that slot executes.
 func (r *Replica) setNoOpLocked(slot uint64) bool {
-	// ...but only above the cursor. Below it the slot has already executed and
-	// been replied on, and its entry may have been reclaimed — slotEntryLocked
-	// would resurrect a phantom under the prune floor and the fold would run a
-	// second time. Every caller reaching here with such a slot is acting on
-	// stale information, so refuse rather than corrupt settled history.
 	if r.executedLocked(slot) {
 		Warning("[%s] refusing no-op at slot=%d below executed frontier %d",
 			r.self, slot, r.nextExpected)
@@ -1174,9 +1035,6 @@ func (r *Replica) setNoOpLocked(slot uint64) bool {
 		e.ownerSet = true
 	}
 	e.state = slotNoOp
-	// A no-op slot carries nothing: its passengers are dropped by the agreement
-	// itself and the client re-boards them, so holding the payload would keep
-	// memory for data no one will ever be served.
 	e.op = nil
 	e.requests = nil
 	e.isBus = false
@@ -1200,14 +1058,6 @@ func (r *Replica) slotStateLocked(slot uint64) slotState {
 	return slotEmpty
 }
 
-// executedLocked reports whether the cursor has already run past slot.
-//
-// An absent entry means slotEmpty, which conflates two opposite situations: a
-// slot never received, and one received, executed and since reclaimed. The
-// prune floor never rises above nextExpected (see pruneCommittedLocked), so the
-// cursor separates them — below it, an empty slot was freed, not missed. Gap
-// agreement must not lose that distinction: resolving a reclaimed slot as a
-// no-op overwrites history a quorum already committed and replied on.
 func (r *Replica) executedLocked(slot uint64) bool {
 	return slot < r.nextExpected
 }
@@ -1219,13 +1069,6 @@ func (r *Replica) slotOpLocked(slot uint64) []byte {
 	return nil
 }
 
-// advanceNextExpectedLocked walks the contiguous filled prefix forward. Slots
-// fill out of order, so this is where a run of them commits at once.
-//
-// Outside statusNormal the cursor is frozen: buses arriving during a view change
-// are still recorded into their slots (their position comes from the client's
-// line, not from any leader), they are just not decomposed into the request log
-// list and no reply is sent, since nothing may be committed without a leader.
 func (r *Replica) advanceNextExpectedLocked() {
 	if r.status != statusNormal {
 		r.pruneCommittedLocked()
@@ -1236,10 +1079,7 @@ func (r *Replica) advanceNextExpectedLocked() {
 	r.pruneCommittedLocked()
 }
 
-// advanceNextExpectedThroughLocked is the install-only exception to the
-// ViewChange cursor fence. It executes no further than the decided merged
-// suffix, leaving buses recorded after that boundary frozen until Normal is
-// published.
+// View installation may advance the cursor only through its canonical range.
 func (r *Replica) advanceNextExpectedThroughLocked(maxSlot uint64) {
 	for r.nextExpected <= maxSlot && r.advanceNextExpectedOneLocked() {
 	}
@@ -1261,27 +1101,9 @@ func (r *Replica) advanceNextExpectedOneLocked() bool {
 	return true
 }
 
-// defaultRetainSlots bounds how many already-committed slots the replica keeps
-// in memory (globalLog/slotMeta/dedup) below nextExpected. Without this these
-// maps grow ~one entry per request forever, and the rising GC pressure is the
-// leading suspect for the mid-run stall. The window stays well above the
-// gap-recovery window (gap Δ default 5s + gapRecoveryTimeout 3s ≈ 8s of traffic,
-// ~16k slots at the benchmark's ~2k/s) so a lagging peer's gap request is still
-// answerable from memory; older slots are served from the durable log instead
-// (see logreader.go), so shrinking this trades memory for a disk read on the
-// rare deep catch-up rather than making one impossible.
 const defaultRetainSlots = 1 << 14
 
-// pruneCommittedLocked drops fully-committed slots that sit far enough below
-// nextExpected that no in-flight gap recovery can still need them, bounding the
-// heap. Slots are contiguous and monotonic, so prunedBelow lets each slot be
-// visited exactly once (amortized O(1) per committed slot).
-//
-// The floor never rises above the commit point: rewinding on view change reads
-// globalLog[s].requests for every slot back to stableSlot, so those must stay
-// resident even if the window would otherwise release them.
 func (r *Replica) pruneCommittedLocked() {
-	// Nothing at or above the commit point may go, whatever the pressure.
 	limit := r.nextExpected
 	if r.haveStable && r.stableSlot < limit {
 		limit = r.stableSlot
@@ -1301,10 +1123,6 @@ func (r *Replica) pruneCommittedLocked() {
 		r.prunedBelow = target
 	}
 
-	// A slot is one bus, and a bus carries anywhere from one request to a
-	// thousand — so the slot window alone can mean tens of megabytes or a
-	// gigabyte. Keep reclaiming past it while the retained payload is over
-	// budget, still stopping at the commit point.
 	for r.retainBytes > 0 && r.residentBytes > r.retainBytes && r.prunedBelow < limit {
 		r.pruneSlotLocked(r.prunedBelow)
 		r.prunedBelow++
@@ -1320,17 +1138,7 @@ func (r *Replica) pruneSlotLocked(slot uint64) {
 	delete(r.slotMeta, slot)
 }
 
-// pruneDedupForSlotLocked releases the dedup entries whose log index was first
-// assigned at this slot. Without it dedup is the one map that grows forever —
-// one entry per unique request for the life of the process. Dropping them is
-// safe below the commit point: a request in a stable bus has committed at a
-// quorum, so the client has stopped re-boarding it and will never need its index
-// handed back.
-//
-// The range comes off the entry rather than the log-index ring. The cursor
-// commits a whole run of slots at once whenever a hole fills, so by the time
-// prune sees them most are already further back than the ring reaches — reading
-// it here silently skipped them, and the map kept growing.
+// Release dedup entries only from the slot where each request was first assigned.
 func (r *Replica) pruneDedupForSlotLocked(slot uint64) {
 	e := r.globalLog[slot]
 	if e == nil || len(e.requests) == 0 {
@@ -1354,18 +1162,11 @@ func (r *Replica) durableRecordCursorLocked(slot uint64, e *globalEntry, logIdxs
 	r.durable.recordBus(slot, clientId, reqId, logIdxs, e.state == slotNoOp)
 }
 
-// executeLocked applies a PUT through the same mutex-protected tree map used
-// by the baseline protocols. The workload is write-only: Op is the value and
-// ClientId selects a stable per-client key, so repeated writes update the map
-// instead of growing it by one key per request. PUT returns an empty result.
-// The caller holds r.mu and deduplicates requests before executing them.
 func (r *Replica) executeLocked(req *RequestMessage, logIndex uint64) {
 	cmd := state.Command{Op: state.PUT, K: state.Key(req.ClientId), V: state.Value(req.Op)}
 	cmd.Execute(r.State)
 }
 
-// All application state access is serialized by r.mu, including these recovery
-// snapshots. Values are immutable, just as they are in state.Command.Execute.
 func (r *Replica) rememberWriteLocked(e *globalEntry, key state.Key) {
 	for _, u := range e.undo {
 		if u.key == key {
@@ -1397,23 +1198,6 @@ func (r *Replica) undoWritesLocked(e *globalEntry) {
 	e.undo = nil
 }
 
-// appendBusToLogListLocked appends the slot's bus passengers to the request log
-// list. Every passenger takes its own spot, duplicates included: the list is the
-// record of what arrived and in what order, so a request re-boarded after
-// missing quorum is appended again rather than folded into its first entry. It
-// returns the ordered log index of every passenger so the caller can record
-// which indexes this bus covers, and persists each one to the durable request
-// log list.
-//
-// Deduplication happens at execution instead. dedup remembers the index a
-// request first landed at, so a re-board is appended and acked but not executed
-// a second time — the state machine applies each command once, which is the only
-// place the distinction can be observed.
-//
-// The ack carries the index the request executed at, not the spot just appended.
-// A re-board occupies several spots and only the first one ran, and it is what
-// lets a client's votes add up: it counts replies per log index, so a re-board
-// earns its quorum together with the attempt before it (see voteKey, client.go).
 func (r *Replica) appendBusToLogListLocked(slot uint64) []uint64 {
 	e := r.globalLog[slot]
 	if e == nil || e.state == slotNoOp {
@@ -1431,8 +1215,6 @@ func (r *Replica) appendBusToLogListLocked(slot uint64) []uint64 {
 		}
 		execIdx, seen := r.dedup[key]
 		if !seen {
-			// First arrival: this spot is where the request executes, and the
-			// one every later re-board of it is acked against.
 			r.dedup[key] = li
 			execIdx = li
 			r.rememberWriteLocked(e, state.Key(req.ClientId))
@@ -1445,11 +1227,6 @@ func (r *Replica) appendBusToLogListLocked(slot uint64) []uint64 {
 	return logIdxs
 }
 
-// enqueueReply is called under r.mu. It only appends to an in-memory buffer and
-// wakes replyLoop — it never touches the network — so a slow/backed-up client
-// can no longer stall r.mu (and thus the leader's bus intake). The actual send
-// happens off-lock in replyLoop; the buffer is a growable slice, so a transient
-// reply-drain hiccup is absorbed rather than blocking the hot path.
 func (r *Replica) enqueueReply(clientId, requestId, busSlot, logIndex uint64) {
 	r.pendingReplies = append(r.pendingReplies, pendingReply{
 		clientId:  clientId,
@@ -1467,10 +1244,6 @@ func (r *Replica) enqueueReply(clientId, requestId, busSlot, logIndex uint64) {
 	}
 }
 
-// replyLoop drains pendingReplies off r.mu and dispatches each reply to its
-// client's replySender. It never touches the network itself, so one stalled
-// client connection can only back up that client's own sender buffer — not
-// replies to every other client (cross-client head-of-line blocking).
 func (r *Replica) replyLoop() {
 	for range r.replyWake {
 		for {
@@ -1495,9 +1268,6 @@ func (r *Replica) replyLoop() {
 	}
 }
 
-// replySender owns reply delivery to one client connection. Its goroutine
-// writes each drained batch under a single writer lock with one flush at the
-// end, collapsing a flush syscall per reply into one per batch.
 type replySender struct {
 	r *Replica
 
@@ -1514,7 +1284,6 @@ func newReplySender(r *Replica, lw *lockedWriter) *replySender {
 	return rs
 }
 
-// setWriter swaps in the connection a reconnected client now talks on.
 func (rs *replySender) setWriter(lw *lockedWriter) {
 	rs.mu.Lock()
 	if rs.lw != lw {
@@ -1629,7 +1398,6 @@ func (r *Replica) statsLoop() {
 			busLogHigh = r.maxSlotSeen + 1
 		}
 		r.mu.Unlock()
-		// durable logs carry their own mutex, so sample their backlog off r.mu.
 		durMax := 0
 		if r.durable != nil {
 			if m := r.durable.backlogMax(); m > durMax {
@@ -1641,19 +1409,6 @@ func (r *Replica) statsLoop() {
 				durMax = m
 			}
 		}
-		// The two log lengths are what a client's own commit count is checked
-		// against, so they are emitted every tick rather than only on the busy
-		// ticks below: the interesting comparison is the final one, taken after
-		// the clients have stopped generating and this replica has drained.
-		//
-		//   bus_log_len    executed prefix of the BusMessage log -- bus slots
-		//                  0..nextExpected-1 have been executed by this replica.
-		//   bus_log_high   highest slot seen + 1, so bus_log_high - bus_log_len
-		//                  is the un-executed suffix still waiting on a gap.
-		//   entry_log_len  length of the Request Log List: one index per
-		//                  deduped request executed. This is the number that
-		//                  should equal the sum of the clients' cumulative
-		//                  committed counts.
 		Notice("[%s] 1s: bus_log_len=%d bus_log_high=%d entry_log_len=%d pruned_below=%d",
 			r.self, executed, busLogHigh, entryLogLen, prunedBelow)
 		if recv == 0 && gaps == 0 && recovered == 0 && noops == 0 && dropped == 0 {
@@ -1683,10 +1438,6 @@ func (r *Replica) connectPeers() {
 	}
 }
 
-// dialPeer keeps one outbound connection to peer j alive for the life of the
-// process. It parks after each successful dial and redials when the connection
-// is retired: a replica that never reconnects cannot be led by, or lead, anyone
-// who restarts a socket, which is the whole point of failure recovery.
 func (r *Replica) dialPeer(j int) {
 	addr := r.config.Replicas[j]
 	for {
@@ -1733,18 +1484,12 @@ func (r *Replica) validReplicaIndex(idx uint32) bool {
 	return uint64(idx) < uint64(r.config.N) && int(idx) < len(r.peerWriters)
 }
 
-// peerConnected reports whether a live writer for peer j exists. A retired peer
-// stays nil until dialPeer has waited out its redial pause, so anything waiting
-// on that peer sees the gap.
 func (r *Replica) peerConnected(j int) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return r.peerWriters[j] != nil
 }
 
-// retirePeer drops a broken peer writer and wakes its dialer. Passing lw guards
-// against retiring a connection that has already been replaced; peerConnLost
-// passes nil to retire whatever is current.
 func (r *Replica) retirePeer(j int, lw *lockedWriter) {
 	r.mu.Lock()
 	cleared := false
@@ -1752,9 +1497,7 @@ func (r *Replica) retirePeer(j int, lw *lockedWriter) {
 		cleared = r.peerWriters[j] != nil
 		r.peerWriters[j] = nil
 	}
-	// Record that the leader's socket went, but do NOT let it trip suspicion:
-	// see suspicionLoop, which times out on missing heartbeats alone so that
-	// detection costs the same whether or not the failure closed its sockets.
+	// A broken leader socket is diagnostic; only missed heartbeats trigger suspicion.
 	if j != r.idx && j == r.leaderIdx() {
 		r.leaderLost = true
 	}
@@ -1767,8 +1510,6 @@ func (r *Replica) retirePeer(j int, lw *lockedWriter) {
 	}
 }
 
-// peerConnLost is called when the inbound connection from peer j closes, which
-// is what a killed peer looks like from here.
 func (r *Replica) peerConnLost(j int) {
 	if j < 0 || j >= r.config.N || j == r.idx {
 		return
@@ -1798,8 +1539,6 @@ func (r *Replica) gapDetectLoop() {
 		monoNow := nowNs()
 		var spawn []spawnInfo
 		r.mu.Lock()
-		// With the cursor frozen every slot above nextExpected looks like a gap,
-		// and there is no leader to agree a no-op with anyway.
 		if r.status == statusNormal && r.haveMax && len(r.clients) > 0 {
 			view := r.view()
 			r.genCursorUpToLocked(r.maxSlotSeen)
@@ -2002,10 +1741,6 @@ probe:
 		r.self, (nowNs()-gs.start)/1000, slot, clientId, reqId)
 }
 
-// collectNoOpQuorum rebroadcasts the commit every configured retry interval until a
-// quorum of distinct replicas has accepted it. Silence is not a leader failure,
-// so a missed round is answered by the next one rather than by escalating to a
-// view change.
 func (r *Replica) collectNoOpQuorum(key gapKey, gs *gapState) bool {
 	r.mu.Lock()
 	active := r.leaderGapActiveLocked(key, gs)
@@ -2070,16 +1805,12 @@ func (r *Replica) handleGapRequest(msg *BusGapRequest) {
 	}
 	leader := r.config.LeaderIndex(msg.ViewId)
 	amLeader := leader == r.idx
-	// Followers only answer the current leader's all-replica probe. The leader
-	// accepts requests from followers trying to recover their own gap.
 	if !amLeader && int(msg.SenderIdx) != leader {
 		r.mu.Unlock()
 		return
 	}
 	st := r.slotStateLocked(slot)
 	op, isBus := r.slotGapPayloadLocked(slot)
-	// Empty below our own cursor means reclaimed, not missing: the asker is
-	// simply further behind than our retain window reaches.
 	reclaimed := st == slotEmpty && r.executedLocked(slot)
 	r.mu.Unlock()
 
@@ -2102,9 +1833,6 @@ func (r *Replica) handleGapRequest(msg *BusGapRequest) {
 			&BusGapCommit{Slot: slot, SenderIdx: uint32(r.idx), ViewId: msg.ViewId})
 	default:
 		if reclaimed {
-			// Settled history, not a gap. The asker catches up through the sync
-			// round's state transfer, which reads the durable log; agreeing a
-			// no-op here would overwrite a slot we already committed.
 			return
 		}
 		r.ensureLeaderResolve(msg.ViewId, slot, msg.SenderIdx)
@@ -2183,9 +1911,6 @@ func (r *Replica) handleGapCommit(msg *BusGapCommit) {
 	}
 	key := gapKey{view: msg.ViewId, slot: msg.Slot}
 	r.mu.Lock()
-	// A no-op is a decision of one view. Applying one announced by a leader we
-	// have already deposed would overwrite a slot the new view may have merged
-	// differently, so stale commits are dropped rather than obeyed.
 	if r.status != statusNormal || msg.ViewId != r.view() ||
 		int(msg.SenderIdx) != r.config.LeaderIndex(msg.ViewId) {
 		r.mu.Unlock()
@@ -2209,13 +1934,6 @@ func (r *Replica) handleGapCommit(msg *BusGapCommit) {
 		&BusGapCommitReply{Slot: msg.Slot, SenderIdx: uint32(r.idx), ViewId: msg.ViewId})
 }
 
-// applyGapCommitLocked installs an agreed no-op and reports whether to ack it.
-//
-// The commit is retransmitted every round, so this has to be idempotent: a slot
-// already holding the no-op re-acks, since installing it moved the cursor past
-// the slot and the leader may simply have lost the first ack. Only a slot that
-// executed as something other than a no-op is refused, and refused silently —
-// withholding the ack denies the quorum instead of merely declining locally.
 func (r *Replica) applyGapCommitLocked(slot uint64) bool {
 	if r.slotStateLocked(slot) == slotNoOp {
 		return true

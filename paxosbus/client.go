@@ -14,18 +14,10 @@ import (
 const (
 	defaultStartDelayMs     = 5000
 	defaultRequestTimeoutMs = 5000
-	// DefaultCommandSize is the value size in bytes, matching the GCP baselines.
-	DefaultCommandSize = 16
+	DefaultCommandSize      = 16
 )
 
-// Votes are counted per view, never across them. A view change can hand a
-// replica an entry it had logged but never acknowledged, so it replies again in
-// the new view — and those replies must not be added to the ones the request
-// collected before the old leader died. Two half-quorums from two views are not
-// a quorum: the request simply has not committed, and the resend path re-boards
-// it (dedup hands back its original log index, so the votes it earns next are
-// for the same entry). Where a request really did commit in the old view, the
-// sticky committed flag makes the new view's extra replies a no-op.
+// Count quorum votes within one view; replies from different views cannot combine.
 type voteKey struct {
 	logIndex uint64
 	viewId   uint64
@@ -70,12 +62,6 @@ func (lw *lockedWriter) sendRawBatch(bufs [][]byte) error {
 	return lw.w.Flush()
 }
 
-// connSender decouples the bus loop from one replica connection: sendBus
-// enqueues the pre-marshaled bus and never blocks on the network, so TCP
-// backpressure from one stalled replica cannot delay buses to the healthy
-// ones. A per-connection goroutine drains the buffer in FIFO order; a send
-// error kills the sender (the TCP stream is broken anyway — receiveLoop dies
-// on the same conn) and further buses to it are dropped.
 type connSender struct {
 	lw   *lockedWriter
 	self string
@@ -144,12 +130,7 @@ type Client struct {
 	startDelayMs  uint64
 	syncWallNs    int64
 
-	// maxOwdNs is the worst one-way delay from this client to any replica.
-	// The sync message announces an ARRIVAL schedule, so every bus departs
-	// maxOwdNs before its announced line instant — by that instant it has
-	// reached even the farthest replica. 0 until Connect() measures it (or a
-	// -owd override is given); replicas ordering on the same lines then stop
-	// paying this client's inbound delay before appending later slots.
+	// maxOwdNs is the worst measured one-way delay to a replica.
 	maxOwdNs int64
 	owdAuto  bool
 
@@ -178,7 +159,6 @@ type Client struct {
 	winResends   uint64
 	winRttSumUs  uint64
 
-	// pauseMu also fences sendBus against a pause notification.
 	pauseMu        sync.Mutex
 	pauseEnabled   bool
 	paused         bool
@@ -273,8 +253,6 @@ func (c *Client) Connect() error {
 		Notice("[%s] connected to replica %d (%s)  dial_rtt=%.2fms",
 			c.self, i, addr, float64(dialRtt)/1e6)
 	}
-	// The TCP handshake (SYN -> SYN-ACK) is one round trip, so the slowest
-	// dial estimates the worst RTT to any replica without extra protocol.
 	if c.owdAuto {
 		c.maxOwdNs = int64(maxDialRtt) / 2
 	}
@@ -288,14 +266,7 @@ func (c *Client) Connect() error {
 }
 
 func (c *Client) Run() {
-	// The sync message announces the arrival-prediction line the replicas order
-	// by: expect this client's msg n at FirstMsgNs + (n-1)*interval. FirstMsgNs
-	// is a true ARRIVAL instant: msg n departs maxOwdNs earlier (see
-	// firstSendWallNs), so it reaches the farthest replica right on its line
-	// and nearer replicas early. Ordering by send instants instead made every
-	// in-order append (and thus every reply) wait out the slowest inbound
-	// region's one-way delay past the line — the straggler penalty; now the
-	// replica-side Δ only has to absorb jitter around the line, not the delay.
+	// The sync line predicts arrivals, so buses depart maxOwdNs before it.
 	c.syncWallNs = wallNs()
 	syncMsg := BusSyncMessage{
 		ClientId:   c.clientId,
@@ -321,11 +292,6 @@ func (c *Client) Run() {
 		c.startClientControl()
 	}
 
-	// Sleep until maxOwdNs BEFORE the FirstMsgNs instant announced in the sync
-	// message, on the same wall clock the replicas use for expected arrival
-	// times. Sleeping a fixed duration from "after sync send" instead would
-	// shift every actual arrival past the announced schedule, and with multiple
-	// clients each replica's in-order log append waits for the LATEST client.
 	if sleep := c.firstSendWallNs() - wallNs(); sleep > 0 {
 		time.Sleep(time.Duration(sleep))
 	}
@@ -340,8 +306,6 @@ func (c *Client) Run() {
 	c.busLoop()
 }
 
-// genLoop produces requests at a fixed rate into c.pending, stamping SendTimeNs
-// so that latency counts each request's wait for a bus
 func (c *Client) genLoop() {
 	intervalNs := int64(c.genIntervalUs) * 1000
 	if intervalNs <= 0 {
@@ -382,20 +346,14 @@ func (c *Client) genLoop() {
 	}
 }
 
-// dataPhaseStartWallNs is the wall-clock instant announced to the replicas in
-// the sync message, where bus n is expected to arrive at start + (n-1)*interval
 func (c *Client) dataPhaseStartWallNs() int64 {
 	return c.syncWallNs + int64(c.startDelayMs)*1e6
 }
 
-// firstSendWallNs is when buses actually start departing, early enough that bus
-// n reaches even the farthest replica by its line instant instead of one one-way
-// delay after it
 func (c *Client) firstSendWallNs() int64 {
 	return c.dataPhaseStartWallNs() - c.maxOwdNs
 }
 
-// runOnSchedule fires tick at base, base+interval, base+2*interval, and so on
 func (c *Client) runOnSchedule(base, intervalNs int64, tick func()) {
 	next := base
 	curEpoch := int64(0)
@@ -416,7 +374,6 @@ func (c *Client) runOnSchedule(base, intervalNs int64, tick func()) {
 	}
 }
 
-// busLoop departs one bus per interval on the announced schedule
 func (c *Client) busLoop() {
 	next := c.firstSendWallNs()
 	lastStats := wallNs()
@@ -444,8 +401,6 @@ func (c *Client) busLoop() {
 	}
 }
 
-// sendBus drains the pending and retry buffers into one bus, marshals it once,
-// and hands the same bytes to every replica's sender
 func (c *Client) sendBus() {
 	c.pauseMu.Lock()
 	defer c.pauseMu.Unlock()
@@ -474,7 +429,6 @@ func (c *Client) sendBus() {
 		rid := reqs[i].RequestId
 		e := c.rInflight[rid]
 		if e == nil {
-			// firstSendNs is the generation time
 			genNs := int64(reqs[i].SendTimeNs)
 			if genNs == 0 {
 				genNs = now
@@ -494,7 +448,6 @@ func (c *Client) sendBus() {
 		SendTimeNs: uint64(now),
 		Requests:   reqs,
 	}
-	// The bus is marshaled once, since every sender reads the same bytes
 	var wire bytes.Buffer
 	wire.WriteByte(MsgBus)
 	msg.Marshal(&wire)
@@ -504,8 +457,6 @@ func (c *Client) sendBus() {
 	}
 }
 
-// reqTimeoutLoop re-boards requests that missed quorum onto the next bus, and
-// the request id is kept so that dedup returns the log index it already had
 func (c *Client) reqTimeoutLoop() {
 	tick := time.Duration(c.resendMs) * time.Millisecond / 4
 	if tick < time.Millisecond {
@@ -540,7 +491,6 @@ func (c *Client) reqTimeoutLoop() {
 	}
 }
 
-// receiveLoop reads replies from one replica, with one goroutine per connection
 func (c *Client) receiveLoop(rid int) {
 	reader := c.readers[rid]
 	var reqReply RequestReplyMessage
@@ -565,15 +515,11 @@ func (c *Client) receiveLoop(rid int) {
 	}
 }
 
-// quorumReached reports whether mask holds a quorum that includes the leader of
-// viewId
 func (c *Client) quorumReached(mask uint32, viewId uint64) bool {
 	return bits.OnesCount32(mask) >= c.config.QuorumSize() &&
 		mask&(uint32(1)<<c.config.LeaderIndex(viewId)) != 0
 }
 
-// recordCommitLocked adds one commit's latency to the cumulative and per-second
-// counters
 func (c *Client) recordCommitLocked(latencyUs int64) {
 	c.committedCount++
 	c.totalRttUs += uint64(latencyUs)
@@ -581,8 +527,6 @@ func (c *Client) recordCommitLocked(latencyUs int64) {
 	c.winRttSumUs += uint64(latencyUs)
 }
 
-// handleRequestReply counts one replica's vote, keyed by log index because a
-// re-boarded request can land at different indexes on different replicas
 func (c *Client) handleRequestReply(msg *RequestReplyMessage) {
 	now := nowNs()
 

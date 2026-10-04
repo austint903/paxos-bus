@@ -1,17 +1,5 @@
 package paxosbus
 
-// Reading the durable logs back.
-//
-// State transfer prefers memory, but the resident window is a few seconds wide
-// and a replica can be further behind than that — so anything already reclaimed
-// is rebuilt from disk instead. The bus log stores only which log indexes a slot
-// carries, not the requests themselves, so rebuilding a bus is a join against
-// the request log list. That is exact: the list is contiguous and in index
-// order, and re-boarded passengers reference the index they were first given.
-// The one field that does not survive the round trip is SendTimeNs, which is
-// never persisted — it drives the client's own latency clock and is meaningless
-// on a replica receiving the entry.
-
 import (
 	"bytes"
 	"encoding/hex"
@@ -19,7 +7,6 @@ import (
 	"io"
 )
 
-// diskRecord covers bus records and hole placeholders.
 type diskRecord struct {
 	Slot       uint64   `json:"slot"`
 	Client     uint64   `json:"client"`
@@ -30,7 +17,6 @@ type diskRecord struct {
 	Pending    bool     `json:"pending"`
 }
 
-// reqDiskRecord is one line of the request log list.
 type reqDiskRecord struct {
 	LogIndex uint64 `json:"log_index"`
 	Client   uint64 `json:"client"`
@@ -38,8 +24,6 @@ type reqDiskRecord struct {
 	Op       string `json:"op"`
 }
 
-// readRecords returns the raw bodies for keys in [lo, hi] in a single forward
-// pass. Keys the log does not (yet) hold are simply absent.
 func (cl *durableLog) readRecords(lo, hi uint64) map[uint64][]byte {
 	if cl == nil || lo > hi {
 		return nil
@@ -56,7 +40,6 @@ func (cl *durableLog) readRecords(lo, hi uint64) map[uint64][]byte {
 	for cl.rKey <= hi {
 		line, err := cl.rbr.ReadBytes('\n')
 		if err != nil {
-			// Short read at the tail: the rest simply is not on disk yet.
 			cl.rValid = false
 			if len(line) == 0 || err != io.EOF {
 				return out
@@ -76,12 +59,8 @@ func (cl *durableLog) readRecords(lo, hi uint64) map[uint64][]byte {
 	return out
 }
 
-// seekToLocked positions the read cursor at key. Consecutive reads walk forward
-// in key order — which is how state transfer scans a range — so the common case
-// costs nothing; otherwise it jumps to the nearest sampled offset.
 func (cl *durableLog) seekToLocked(key uint64) bool {
 	if cl.rValid && cl.rKey <= key {
-		// Already positioned at or before key: skip forward line by line.
 		for cl.rKey < key {
 			line, err := cl.rbr.ReadBytes('\n')
 			if err != nil {
@@ -128,7 +107,6 @@ func (cl *durableLog) seekToLocked(key uint64) bool {
 	return true
 }
 
-// readSlotFromDisk rebuilds one slot's content from the durable logs.
 func (r *Replica) readSlotFromDisk(slot uint64) (StateEntry, bool) {
 	if r.durable == nil {
 		return StateEntry{}, false
@@ -169,9 +147,6 @@ func (r *Replica) readSlotFromDisk(slot uint64) (StateEntry, bool) {
 	return ent, true
 }
 
-// readRequestsFromDisk rebuilds a bus's passenger list from the request log
-// list. A bus's new passengers get consecutive indexes, so the whole set is
-// covered by one scan of [min, max] rather than a lookup each.
 func (r *Replica) readRequestsFromDisk(idxs []uint64) ([]RequestMessage, bool) {
 	if r.reqListLog == nil {
 		return nil, false

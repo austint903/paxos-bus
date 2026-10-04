@@ -63,8 +63,7 @@ func ReadConfig(path string) (*Config, error) {
 	if c.N > maxReplicaCount {
 		return nil, fmt.Errorf("config: n=%d exceeds %d-replica reply-mask limit", c.N, maxReplicaCount)
 	}
-	// QuorumSize is F+1. Requiring exactly 2F+1 replicas makes that a
-	// majority, so every commit and view-change quorum intersects.
+	// N=2F+1 makes every commit and view-change quorum intersect.
 	expectedF := (c.N - 1) / 2
 	if c.N%2 == 0 || c.F != expectedF {
 		return nil, fmt.Errorf("config: n=%d and f=%d are invalid (need n=2f+1, f=%d)", c.N, c.F, expectedF)
