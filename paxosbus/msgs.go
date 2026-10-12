@@ -62,12 +62,16 @@ const (
 	MsgClientStatusReply
 	MsgClientResume
 	MsgClientResumeAck
+	MsgBusScheduleInstall
+	MsgBusScheduleAck
+	MsgBusScheduleReady
 )
 
 const (
 	maxBitmapBytes  = 1 << 20
 	maxSlotListLen  = 1 << 20
 	maxStateEntries = 1 << 16
+	maxScheduleLen  = 1 << 16
 )
 
 type wireMsg interface {
@@ -78,6 +82,27 @@ type BusSyncMessage struct {
 	ClientId   uint64
 	FirstMsgNs uint64 // wall-clock ns when this client's first bus ARRIVES (it departs maxOWD earlier)
 	IntervalMs uint64 // bus interval; expect msg n at FirstMsgNs + (n-1)*IntervalMs
+}
+
+// BusScheduleInstall is the leader's authoritative, complete client schedule.
+// Epoch is the view in which the schedule was installed.
+type BusScheduleInstall struct {
+	Epoch     uint64
+	Digest    uint64
+	SenderIdx uint32
+	Schedule  []BusSyncMessage
+}
+
+type BusScheduleAck struct {
+	Epoch     uint64
+	Digest    uint64
+	SenderIdx uint32
+}
+
+type BusScheduleReady struct {
+	ClientId   uint64
+	Epoch      uint64
+	FirstMsgNs uint64
 }
 
 func (m *BusSyncMessage) New() fastrpc.Serializable {
@@ -100,6 +125,93 @@ func (m *BusSyncMessage) Unmarshal(wire io.Reader) error {
 	m.ClientId = binary.LittleEndian.Uint64(b[0:8])
 	m.FirstMsgNs = binary.LittleEndian.Uint64(b[8:16])
 	m.IntervalMs = binary.LittleEndian.Uint64(b[16:24])
+	return nil
+}
+
+func putSchedule(wire io.Writer, schedule []BusSyncMessage) {
+	var b [4]byte
+	binary.LittleEndian.PutUint32(b[:], uint32(len(schedule)))
+	wire.Write(b[:])
+	for i := range schedule {
+		schedule[i].Marshal(wire)
+	}
+}
+
+func readSchedule(wire io.Reader) ([]BusSyncMessage, error) {
+	var b [4]byte
+	if _, err := io.ReadFull(wire, b[:]); err != nil {
+		return nil, err
+	}
+	n := binary.LittleEndian.Uint32(b[:])
+	if n > maxScheduleLen {
+		return nil, fmt.Errorf("client schedule too long: %d", n)
+	}
+	out := make([]BusSyncMessage, n)
+	for i := range out {
+		if err := out[i].Unmarshal(wire); err != nil {
+			return nil, err
+		}
+	}
+	return out, nil
+}
+
+func (m *BusScheduleInstall) Marshal(wire io.Writer) {
+	var b [20]byte
+	binary.LittleEndian.PutUint64(b[0:8], m.Epoch)
+	binary.LittleEndian.PutUint64(b[8:16], m.Digest)
+	binary.LittleEndian.PutUint32(b[16:20], m.SenderIdx)
+	wire.Write(b[:])
+	putSchedule(wire, m.Schedule)
+}
+
+func (m *BusScheduleInstall) Unmarshal(wire io.Reader) error {
+	var b [20]byte
+	if _, err := io.ReadFull(wire, b[:]); err != nil {
+		return err
+	}
+	m.Epoch = binary.LittleEndian.Uint64(b[0:8])
+	m.Digest = binary.LittleEndian.Uint64(b[8:16])
+	m.SenderIdx = binary.LittleEndian.Uint32(b[16:20])
+	var err error
+	m.Schedule, err = readSchedule(wire)
+	return err
+}
+
+func (m *BusScheduleAck) Marshal(wire io.Writer) {
+	var b [20]byte
+	binary.LittleEndian.PutUint64(b[0:8], m.Epoch)
+	binary.LittleEndian.PutUint64(b[8:16], m.Digest)
+	binary.LittleEndian.PutUint32(b[16:20], m.SenderIdx)
+	wire.Write(b[:])
+}
+
+func (m *BusScheduleAck) Unmarshal(wire io.Reader) error {
+	var b [20]byte
+	if _, err := io.ReadFull(wire, b[:]); err != nil {
+		return err
+	}
+	m.Epoch = binary.LittleEndian.Uint64(b[0:8])
+	m.Digest = binary.LittleEndian.Uint64(b[8:16])
+	m.SenderIdx = binary.LittleEndian.Uint32(b[16:20])
+	return nil
+}
+
+func (m *BusScheduleReady) Marshal(wire io.Writer) {
+	var b [24]byte
+	binary.LittleEndian.PutUint64(b[0:8], m.ClientId)
+	binary.LittleEndian.PutUint64(b[8:16], m.Epoch)
+	binary.LittleEndian.PutUint64(b[16:24], m.FirstMsgNs)
+	wire.Write(b[:])
+}
+
+func (m *BusScheduleReady) Unmarshal(wire io.Reader) error {
+	var b [24]byte
+	if _, err := io.ReadFull(wire, b[:]); err != nil {
+		return err
+	}
+	m.ClientId = binary.LittleEndian.Uint64(b[0:8])
+	m.Epoch = binary.LittleEndian.Uint64(b[8:16])
+	m.FirstMsgNs = binary.LittleEndian.Uint64(b[16:24])
 	return nil
 }
 
@@ -535,6 +647,7 @@ type BusViewChange struct {
 	BitmapBase     uint64 // slot of bit 0 of FilledBitmap
 	FilledBitmap   []byte // bit i set = slot BitmapBase+i is non-empty
 	NoOpSlots      []uint64
+	Schedule       []BusSyncMessage
 }
 
 // BusStartView carries the selected merge metadata, not log entries.
@@ -549,6 +662,7 @@ type BusStartView struct {
 	SenderIdx        uint32
 	NoOpSlots        []uint64
 	SelectedReports  []uint32 // reports retained after filtering to the highest LastNormalView
+	Schedule         []BusSyncMessage
 }
 
 type BusStateQuery struct {
@@ -616,6 +730,7 @@ func (m *BusViewChange) Marshal(wire io.Writer) {
 	binary.LittleEndian.PutUint64(base[:], m.BitmapBase)
 	wire.Write(base[:])
 	putSlotList(wire, m.NoOpSlots)
+	putSchedule(wire, m.Schedule)
 }
 
 func (m *BusViewChange) Unmarshal(wire io.Reader) error {
@@ -650,7 +765,8 @@ func (m *BusViewChange) Unmarshal(wire io.Reader) error {
 		return err
 	}
 	m.NoOpSlots = slots
-	return nil
+	m.Schedule, err = readSchedule(wire)
+	return err
 }
 
 func (m *BusStartView) New() fastrpc.Serializable { return new(BusStartView) }
@@ -668,6 +784,7 @@ func (m *BusStartView) Marshal(wire io.Writer) {
 	wire.Write(b[:])
 	putSlotList(wire, m.NoOpSlots)
 	putReplicaList(wire, m.SelectedReports)
+	putSchedule(wire, m.Schedule)
 }
 
 func (m *BusStartView) Unmarshal(wire io.Reader) error {
@@ -693,7 +810,8 @@ func (m *BusStartView) Unmarshal(wire io.Reader) error {
 		return err
 	}
 	m.SelectedReports = replicas
-	return nil
+	m.Schedule, err = readSchedule(wire)
+	return err
 }
 
 type BusGetState struct {

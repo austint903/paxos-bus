@@ -377,6 +377,7 @@ setup_tunnels() {
 write_conf() {   # $1=outfile  $2=self_index
     local out="$1" self="$2" j
     echo "f 1" > "$out"
+    echo "clients $TOTAL_CLIENTS" >> "$out"
     for j in 0 1 2; do
         if [[ "$MODE" == "direct" ]]; then
             echo "replica ${RIP[$j]}:$PORT" >> "$out"
@@ -437,9 +438,8 @@ launch() {
 
     echo "==> Launching $TOTAL_CLIENTS client(s), scale=$SCALE (parallel, one ssh per host)"
     # All of a host's clients go up in ONE ssh, and the hosts launch in
-    # parallel: every client must send its sync inside every other client's
-    # START_DELAY_MS window (slot mapping diverges otherwise), so the launch
-    # spread has to stay well under it — sequential ssh per client did not.
+    # parallel so the leader can collect the complete client schedule and clear
+    # the startup barrier well inside START_DELAY_MS.
     local extra="-g $GEN_INTERVAL_US -t $RESEND_MS"
     local pos cpids=()
     for pos in "${!CLIENT_HOST_IDXS[@]}"; do

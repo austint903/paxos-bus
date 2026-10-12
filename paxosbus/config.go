@@ -11,9 +11,10 @@ import (
 const maxReplicaCount = 32
 
 type Config struct {
-	N        int
-	F        int
-	Replicas []string
+	N               int
+	F               int
+	ExpectedClients int
+	Replicas        []string
 }
 
 func ReadConfig(path string) (*Config, error) {
@@ -46,6 +47,21 @@ func ReadConfig(path string) (*Config, error) {
 				return nil, fmt.Errorf("config: malformed replica line: %q", line)
 			}
 			c.Replicas = append(c.Replicas, fields[1])
+		case "clients":
+			if len(fields) != 2 {
+				return nil, fmt.Errorf("config: malformed clients line: %q", line)
+			}
+			v, err := strconv.Atoi(fields[1])
+			if err != nil || v <= 0 {
+				return nil, fmt.Errorf("config: malformed clients line: %q", line)
+			}
+			if c.ExpectedClients != 0 {
+				return nil, fmt.Errorf("config: duplicate clients line")
+			}
+			if v > maxScheduleLen {
+				return nil, fmt.Errorf("config: clients=%d exceeds schedule limit %d", v, maxScheduleLen)
+			}
+			c.ExpectedClients = v
 		default:
 			return nil, fmt.Errorf("config: unknown directive: %q", line)
 		}
@@ -58,6 +74,9 @@ func ReadConfig(path string) (*Config, error) {
 	}
 	if len(c.Replicas) == 0 {
 		return nil, fmt.Errorf("config: no replica lines in %s", path)
+	}
+	if c.ExpectedClients == 0 {
+		return nil, fmt.Errorf("config: missing clients line in %s", path)
 	}
 	c.N = len(c.Replicas)
 	if c.N > maxReplicaCount {

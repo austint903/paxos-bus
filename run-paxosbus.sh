@@ -115,6 +115,7 @@ CONF="$CONFIG_DIR/paxosbus.conf"
 F=$(( (NUM_REPLICAS - 1) / 2 ))
 {
     echo "f $F"
+    echo "clients $NUM_CLIENTS"
     for i in $(seq 0 $((NUM_REPLICAS - 1))); do
         echo "replica 172.29.0.$((BASE_REPLICA_OCTET + i)):$REPLICA_PORT"
     done

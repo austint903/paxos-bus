@@ -445,6 +445,7 @@ prepare_artifacts() {
 
     {
         echo "f 1"
+        echo "clients $((4 * CLIENTS_PER_REGION))"
         echo "replica ${REGION_IPS[0]}:$PORT"
         echo "replica ${REGION_IPS[1]}:$PORT"
         echo "replica ${REGION_IPS[3]}:$PORT"
