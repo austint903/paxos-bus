@@ -110,7 +110,7 @@ func (r *Replica) clientControlReplyLocked(code uint8, m *clientControlMessage, 
 	}
 	s.writer = lw
 	view := r.view()
-	if s.holdView < view {
+	if s.holdView < view || !r.scheduleActiveLocked() {
 		s.holdView = view
 		s.holdUntil = wallNs() + int64(r.viewChangeFallbackTimeout)
 	}
@@ -122,7 +122,7 @@ func (r *Replica) clientControlReplyLocked(code uint8, m *clientControlMessage, 
 	}
 	reply.Normal = false
 	line := r.clients[m.ClientId]
-	if r.status != statusNormal || m.ViewId != view || line == nil ||
+	if r.status != statusNormal || !r.scheduleActiveLocked() || m.ViewId != view || line == nil ||
 		m.Token == 0 || m.NextSeq == 0 || m.ArrivalNs > math.MaxInt64 ||
 		line.intervalNs <= 0 || line.baseNs < 0 ||
 		m.NextSeq-1 > uint64((math.MaxInt64-line.baseNs)/line.intervalNs) {
@@ -238,7 +238,38 @@ func (c *Client) controlPeerLoop(idx int) {
 }
 
 func (c *Client) handleControlReply(code uint8, m clientControlMessage) {
-	if code == MsgClientPause || code == MsgClientStatusReply {
+	c.pauseMu.Lock()
+	if int(m.ReplicaIdx) < len(c.controlStatus) {
+		c.controlStatus[m.ReplicaIdx] = m
+	}
+	best := c.viewHint
+	for _, candidateReport := range c.controlStatus {
+		candidate := candidateReport.ViewId
+		if candidate <= best {
+			continue
+		}
+		normal := 0
+		leaderNormal := false
+		for i := range c.controlStatus {
+			report := c.controlStatus[i]
+			if report.Normal && report.ViewId == candidate {
+				normal++
+				leaderNormal = leaderNormal || i == c.config.LeaderIndex(candidate)
+			}
+		}
+		if normal >= c.config.QuorumSize() && leaderNormal {
+			best = candidate
+		}
+	}
+	c.viewHint = best
+	if !c.startupComplete && c.startupResuming && best > c.pauseView {
+		c.pauseView = best
+		close(c.pauseChanged)
+		c.pauseChanged = make(chan struct{})
+	}
+	canPause := c.startupComplete
+	c.pauseMu.Unlock()
+	if canPause && (code == MsgClientPause || code == MsgClientStatusReply) {
 		c.pauseForView(m.ViewId)
 	}
 	if code != MsgClientPause && m.Token != 0 {

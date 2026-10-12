@@ -18,7 +18,7 @@ func main() {
 	genIntervalUs := flag.Uint64("g", 500, "request generation interval in microseconds")
 	commandSize := flag.Int("command-size", paxosbus.DefaultCommandSize, "write value size in bytes (all requests are PUTs)")
 	verbose := flag.Bool("v", false, "log every per-replica REPLY line (3 log writes per request at high rates; COMMITTED lines are always logged)")
-	startDelayMs := flag.Uint64("w", 5000, "delay in ms between sync and the data phase; every client must sync within this window")
+	startDelayMs := flag.Uint64("w", 5000, "delay in ms between schedule announcement and the data phase; the leader schedule barrier should complete within this window")
 	maxOwdMs := flag.Float64("owd", 0, "max one-way delay to any replica in ms; buses depart this early so they arrive on the announced schedule (0 = auto-measure as max TCP dial RTT / 2)")
 	pause := flag.Bool("pause-on-view-change", true, "pause generation and buses until a leader-containing quorum acknowledges resume")
 	resumeWait := flag.Uint64("recovery-wait-ms", 1000, "minimum resume scheduling lead in ms; an acknowledged handshake is also required")

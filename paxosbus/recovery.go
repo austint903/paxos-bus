@@ -369,6 +369,10 @@ func (r *Replica) beginViewChangeLocked(newView uint64) *viewChangeStart {
 	r.cancelRecoveryLocked()
 	r.viewId.Store(newView)
 	r.status = statusViewChange
+	r.scheduleReady = false
+	r.scheduleAnnouncements = make(map[uint64]BusSyncMessage)
+	r.scheduleWaiters = make(map[uint64]*lockedWriter)
+	r.scheduleInstallActive = false
 	r.leaderLost = false
 	r.sync = nil
 	r.clearSyncCatchupLocked()
@@ -530,6 +534,7 @@ func (r *Replica) buildViewChangeLocked(newView uint64) *BusViewChange {
 		ViewId:         newView,
 		LastNormalView: r.lastNormalView,
 		NextExpected:   r.nextExpected,
+		Schedule:       append([]BusSyncMessage(nil), r.schedule...),
 	}
 	if r.haveStable {
 		m.StableSlot, m.HasStable = r.stableSlot, true
@@ -608,6 +613,8 @@ type mergePlan struct {
 	selected         []uint32          // reports retained at the highest LastNormalView
 	catchUp          uint32            // who to pull the committed prefix from
 	hasCatchUp       bool
+	schedule         []BusSyncMessage
+	scheduleConflict bool
 }
 
 // Merge only reports from the highest LastNormalView; agreed no-ops win.
@@ -629,6 +636,19 @@ func mergeSuffix(reports []*BusViewChange) mergePlan {
 		if m.LastNormalView == best {
 			survivors = append(survivors, m)
 			plan.selected = append(plan.selected, m.SenderIdx)
+		}
+	}
+	for _, m := range survivors {
+		if len(m.Schedule) == 0 {
+			continue
+		}
+		if len(plan.schedule) == 0 {
+			plan.schedule = append([]BusSyncMessage(nil), m.Schedule...)
+			continue
+		}
+		if !schedulesEqual(plan.schedule, m.Schedule) {
+			plan.scheduleConflict = true
+			break
 		}
 	}
 	sort.Slice(plan.selected, func(i, j int) bool { return plan.selected[i] < plan.selected[j] })
@@ -708,6 +728,18 @@ func (r *Replica) driveViewChange(vc *vcState) {
 		list = append(list, m)
 	}
 	plan := mergeSuffix(list)
+	if plan.scheduleConflict {
+		Warning("[%s] view %d has conflicting client schedules; refusing to install the view", r.self, vc.view)
+		r.startViewChange(vc.view + 1)
+		return
+	}
+	if len(plan.schedule) > 0 {
+		if err := r.validateSchedule(plan.schedule); err != nil {
+			Warning("[%s] view %d has no valid authoritative client schedule: %v", r.self, vc.view, err)
+			r.startViewChange(vc.view + 1)
+			return
+		}
+	}
 	Notice("[%s] view %d merge: quorum=%d stable=%d max=%d noops=%d entries_needed=%d",
 		r.self, vc.view, len(reports), plan.stableSlot, plan.maxSlot,
 		len(plan.noops), len(plan.donors))
@@ -730,6 +762,7 @@ func (r *Replica) driveViewChange(vc *vcState) {
 	r.startViewView = vc.view
 	r.startViewSource = plan.sourceNormalView
 	r.startViewUsed = append(r.startViewUsed[:0], plan.selected...)
+	r.installScheduleLocked(plan.schedule, vc.view, false)
 	r.installCanonicalViewLocked(vc.view, plan.stableSlot, plan.hasStable,
 		canonicalMax, hasCanonical, plan.noops, false)
 	msg := r.initialStartViewMsgLocked(vc.view, &plan, canonicalMax, hasCanonical)
@@ -930,6 +963,7 @@ func (r *Replica) initialStartViewMsgLocked(view uint64, plan *mergePlan,
 		HasMax:           hasMax,
 		SelectedReports:  append([]uint32(nil), plan.selected...),
 		NoOpSlots:        append([]uint64(nil), plan.noops...),
+		Schedule:         append([]BusSyncMessage(nil), plan.schedule...),
 	}
 	if plan.hasStable {
 		msg.StableSlot, msg.HasStable = plan.stableSlot, true
@@ -957,6 +991,7 @@ func (r *Replica) startViewMsg() *BusStartView {
 		SourceNormalView: r.startViewSource,
 		SenderIdx:        uint32(r.idx),
 		SelectedReports:  append([]uint32(nil), r.startViewUsed...),
+		Schedule:         append([]BusSyncMessage(nil), r.schedule...),
 	}
 	if r.startViewView != msg.ViewId {
 		msg.SelectedReports = nil
@@ -985,6 +1020,7 @@ func (r *Replica) handleStartView(msg *BusStartView) {
 	cp := *msg
 	cp.NoOpSlots = append([]uint64(nil), msg.NoOpSlots...)
 	cp.SelectedReports = append([]uint32(nil), msg.SelectedReports...)
+	cp.Schedule = append([]BusSyncMessage(nil), msg.Schedule...)
 	if !r.validStartView(&cp) {
 		return
 	}
@@ -1013,6 +1049,12 @@ func (r *Replica) handleStartView(msg *BusStartView) {
 }
 
 func (r *Replica) validStartView(msg *BusStartView) bool {
+	if len(msg.Schedule) > 0 {
+		if err := r.validateSchedule(msg.Schedule); err != nil {
+			Warning("[%s] ignoring start view %d with invalid client schedule: %v", r.self, msg.ViewId, err)
+			return false
+		}
+	}
 	if msg.SourceNormalView > msg.ViewId {
 		return false
 	}
@@ -1111,6 +1153,7 @@ func (r *Replica) installStartView(msg *BusStartView) {
 	r.startViewView = msg.ViewId
 	r.startViewSource = msg.SourceNormalView
 	r.startViewUsed = append(r.startViewUsed[:0], msg.SelectedReports...)
+	r.installScheduleLocked(msg.Schedule, msg.ViewId, false)
 	rewound, didRewind, prepared := r.prepareRecoveryLocked(rec, msg, retain)
 	r.mu.Unlock()
 
@@ -1354,6 +1397,7 @@ func (r *Replica) finishRecoveryIfComplete(rec *viewRecovery) bool {
 	r.lastNormalView = rec.view
 	r.cancelViewChangeWatchdogLocked()
 	r.status = statusNormal
+	r.scheduleReady = r.scheduleCompleteForViewLocked(rec.view)
 	r.lastHeartbeatNs = nowNs()
 	r.leaderLost = false
 	r.recovery = nil
@@ -1455,6 +1499,7 @@ func (r *Replica) publishNormalViewLocked(view uint64) {
 	r.lastNormalView = view
 	r.cancelViewChangeWatchdogLocked()
 	r.status = statusNormal
+	r.scheduleReady = r.scheduleCompleteForViewLocked(view)
 	r.lastHeartbeatNs = nowNs()
 	r.leaderLost = false
 	r.advanceNextExpectedLocked()

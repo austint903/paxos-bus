@@ -2,6 +2,7 @@ package paxosbus
 
 import (
 	"bufio"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -261,17 +262,24 @@ type Replica struct {
 	viewId atomic.Uint64
 	self   string
 
-	mu              sync.Mutex
-	clients         map[uint64]*clientLine
-	clientControls  map[uint64]*clientControlState // guarded by r.mu
-	status          replicaStatus
-	lastNormalView  uint64
-	recovery        *viewRecovery
-	recoveryGen     uint64
-	startViewSeen   uint64
-	startViewView   uint64
-	startViewSource uint64
-	startViewUsed   []uint32
+	mu                    sync.Mutex
+	clients               map[uint64]*clientLine
+	clientControls        map[uint64]*clientControlState // guarded by r.mu
+	schedule              []BusSyncMessage
+	scheduleEpoch         uint64
+	scheduleReady         bool
+	scheduleAnnouncements map[uint64]BusSyncMessage
+	scheduleWaiters       map[uint64]*lockedWriter
+	scheduleInstallActive bool
+	scheduleAckCh         chan BusScheduleAck
+	status                replicaStatus
+	lastNormalView        uint64
+	recovery              *viewRecovery
+	recoveryGen           uint64
+	startViewSeen         uint64
+	startViewView         uint64
+	startViewSource       uint64
+	startViewUsed         []uint32
 
 	globalLog    map[uint64]*globalEntry
 	nextExpected uint64
@@ -347,6 +355,7 @@ type Replica struct {
 	winRecovered  uint64
 	winNoops      uint64
 	winDropped    uint64
+	winFenced     uint64
 	winReplyMax   int
 }
 
@@ -415,6 +424,9 @@ func NewReplica(config *Config, idx int, label, logDir string, mode dropMode, ev
 		self:                      self,
 		gapDeltaNs:                int64(gapDeltaMs) * 1e6,
 		clients:                   make(map[uint64]*clientLine),
+		scheduleAnnouncements:     make(map[uint64]BusSyncMessage),
+		scheduleWaiters:           make(map[uint64]*lockedWriter),
+		scheduleAckCh:             make(chan BusScheduleAck, config.N*4),
 		globalLog:                 make(map[uint64]*globalEntry),
 		dedup:                     make(map[reqKey]uint64),
 		State:                     state.InitState(),
@@ -590,6 +602,10 @@ func (r *Replica) Run() error {
 	if err != nil {
 		return err
 	}
+	return r.serve(l)
+}
+
+func (r *Replica) serve(l net.Listener) error {
 	r.mu.Lock()
 	r.lastHeartbeatNs = nowNs()
 	r.mu.Unlock()
@@ -606,6 +622,9 @@ func (r *Replica) Run() error {
 	for {
 		conn, err := l.Accept()
 		if err != nil {
+			if errors.Is(err, net.ErrClosed) {
+				return nil
+			}
 			Warning("[%s] accept error: %v", r.self, err)
 			continue
 		}
@@ -653,7 +672,7 @@ func (r *Replica) clientListener(conn net.Conn) {
 				Warning("[%s] bad sync message: %v", r.self, err)
 				return
 			}
-			r.handleSync(&syncMsg)
+			r.handleSync(&syncMsg, lw)
 
 		case MsgBus:
 			if err := busMsg.Unmarshal(reader); err != nil {
@@ -725,6 +744,24 @@ func (r *Replica) clientListener(conn net.Conn) {
 			peerIdx = int(m.SenderIdx)
 			r.handleSyncCommit(&m)
 
+		case MsgBusScheduleInstall:
+			var m BusScheduleInstall
+			if err := m.Unmarshal(reader); err != nil {
+				Warning("[%s] bad schedule install: %v", r.self, err)
+				return
+			}
+			peerIdx = int(m.SenderIdx)
+			r.handleScheduleInstall(&m)
+
+		case MsgBusScheduleAck:
+			var m BusScheduleAck
+			if err := m.Unmarshal(reader); err != nil {
+				Warning("[%s] bad schedule acknowledgement: %v", r.self, err)
+				return
+			}
+			peerIdx = int(m.SenderIdx)
+			r.handleScheduleAck(&m)
+
 		case MsgBusViewChangeRequest:
 			var m BusViewChangeRequest
 			if err := m.Unmarshal(reader); err != nil {
@@ -786,18 +823,6 @@ func (r *Replica) clientListener(conn net.Conn) {
 	}
 }
 
-func (r *Replica) handleSync(msg *BusSyncMessage) {
-	r.mu.Lock()
-	r.clients[msg.ClientId] = &clientLine{
-		baseNs:     int64(msg.FirstMsgNs),
-		intervalNs: int64(msg.IntervalMs) * 1e6,
-	}
-	r.resetCursorLocked()
-	r.mu.Unlock()
-	Notice("[%s] sync from client %d: first msg expected at %dns (in %dms), interval=%dms",
-		r.self, msg.ClientId, msg.FirstMsgNs, (int64(msg.FirstMsgNs)-wallNs())/1e6, msg.IntervalMs)
-}
-
 func (r *Replica) resetCursorLocked() {
 	r.cursorSlot = 0
 	r.cursorNextN = make(map[uint64]uint64)
@@ -809,6 +834,7 @@ type admission uint8
 const (
 	admitted      admission = iota
 	admitUnsynced           // sender never announced an arrival line
+	admitFenced             // the authoritative schedule is not installed for this view
 	admitDropped            // swallowed by the fault injector
 )
 
@@ -819,6 +845,10 @@ func (r *Replica) admitLocked(clientId, seq uint64, actualNs int64) admission {
 	}
 	if seq > line.maxSeqSeen {
 		line.maxSeqSeen = seq
+	}
+	if !r.scheduleActiveLocked() {
+		r.winFenced++
+		return admitFenced
 	}
 	if r.shouldDropLocked(seq) {
 		r.winDropped++
@@ -853,6 +883,9 @@ func (r *Replica) handleBus(msg *BusMessage, lw *lockedWriter) {
 	case admitUnsynced:
 		r.mu.Unlock()
 		Warning("[%s] bus from unsynced client %d, ignoring", r.self, msg.ClientId)
+		return
+	case admitFenced:
+		r.mu.Unlock()
 		return
 	case admitDropped:
 		r.mu.Unlock()
@@ -1383,11 +1416,11 @@ func (r *Replica) statsLoop() {
 		recv := r.winRecv
 		sum, min, max := r.winDeltaSumUs, r.winDeltaMinUs, r.winDeltaMaxUs
 		gaps, recovered, noops := r.winGaps, r.winRecovered, r.winNoops
-		dropped := r.winDropped
+		dropped, fenced := r.winDropped, r.winFenced
 		replyMax := r.winReplyMax
 		r.winRecv, r.winDeltaSumUs, r.winDeltaMinUs, r.winDeltaMaxUs = 0, 0, 0, 0
 		r.winGaps, r.winRecovered, r.winNoops = 0, 0, 0
-		r.winDropped = 0
+		r.winDropped, r.winFenced = 0, 0
 		r.winReplyMax = 0
 		status, stable, haveStable := r.status, r.stableSlot, r.haveStable
 		executed, resident, dedupSize := r.nextExpected, len(r.globalLog), len(r.dedup)
@@ -1411,7 +1444,7 @@ func (r *Replica) statsLoop() {
 		}
 		Notice("[%s] 1s: bus_log_len=%d bus_log_high=%d entry_log_len=%d pruned_below=%d",
 			r.self, executed, busLogHigh, entryLogLen, prunedBelow)
-		if recv == 0 && gaps == 0 && recovered == 0 && noops == 0 && dropped == 0 {
+		if recv == 0 && gaps == 0 && recovered == 0 && noops == 0 && dropped == 0 && fenced == 0 {
 			continue
 		}
 		var avg int64
@@ -1422,8 +1455,8 @@ func (r *Replica) statsLoop() {
 		if haveStable {
 			stableStr = strconv.FormatUint(stable, 10)
 		}
-		Notice("[%s] 1s: received=%d dropped=%d delta_avg=%+dus delta_min=%+dus delta_max=%+dus gaps=%d recovered=%d noops=%d reply_backlog_max=%d durable_backlog_max=%d",
-			r.self, recv, dropped, avg, min, max, gaps, recovered, noops, replyMax, durMax)
+		Notice("[%s] 1s: received=%d dropped=%d fenced=%d delta_avg=%+dus delta_min=%+dus delta_max=%+dus gaps=%d recovered=%d noops=%d reply_backlog_max=%d durable_backlog_max=%d",
+			r.self, recv, dropped, fenced, avg, min, max, gaps, recovered, noops, replyMax, durMax)
 		Notice("[%s] 1s: view=%d status=%s executed=%d stable=%s resident_slots=%d resident_mb=%d dedup=%d",
 			r.self, r.view(), status, executed, stableStr, resident, residentMB, dedupSize)
 	}
