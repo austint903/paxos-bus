@@ -178,3 +178,66 @@ func TestSnapshotRejectedDuringRecovery(t *testing.T) {
 		t.Fatal("recovered authoritative schedule was not committed")
 	}
 }
+
+func TestRecoveryCursorStartsAtRetainedPrefix(t *testing.T) {
+	r := scheduleReplica()
+	start := uint64(10e6)
+	end := start + 3_000_000*1e6
+	history := []BusSyncMessage{{ClientId: 0, FirstMsgNs: start, IntervalMs: 1, EndTime: end}, {ClientId: 1, FirstMsgNs: start, IntervalMs: 1, EndTime: end}}
+	pending := append(append([]BusSyncMessage(nil), history...), BusSyncMessage{ClientId: 0, FirstMsgNs: end, IntervalMs: 1, EndTime: end + 10e6})
+	r.installScheduleLocked(pending, 0, true)
+	r.prunedBelow = 5_000_001
+	r.nextExpected = r.prunedBelow + 20
+	r.installScheduleLocked(history, 1, false)
+	if r.cursorSlot != r.prunedBelow || len(r.slotMeta) != 0 {
+		t.Fatal("cursor did not start at retained prefix")
+	}
+	first := r.slotOwnerLocked(r.prunedBelow)
+	if first.clientId != 1 || first.reqId != start+2_500_000*1e6 {
+		t.Fatalf("retained owner: %+v", first)
+	}
+	next := r.slotOwnerLocked(r.prunedBelow + 1)
+	if next.clientId != 0 || next.reqId != first.reqId+1e6 {
+		t.Fatalf("next owner: %+v", next)
+	}
+	if len(r.slotMeta) != 2 {
+		t.Fatalf("regenerated %d historical slots", len(r.slotMeta))
+	}
+	r.slotOwnerLocked(r.prunedBelow - 1)
+	if len(r.slotMeta) != 2 {
+		t.Fatal("recreated pruned metadata")
+	}
+}
+func TestHandshakeReturnsAuthoritativeCommittedInterval(t *testing.T) {
+	r := scheduleReplica()
+	w := uint64(r.config.ScheduleWindow())
+	start := (uint64(time.Now().UnixNano()) / w) * w
+	r.installScheduleLocked([]BusSyncMessage{{ClientId: 0, FirstMsgNs: start, IntervalMs: 1, EndTime: start + w}}, 0, true)
+	a, b := net.Pipe()
+	defer a.Close()
+	defer b.Close()
+	a.SetReadDeadline(time.Now().Add(time.Second))
+	r.handleHsRequest(&HsRequest{ClientId: 0, StartTime: start, IntervalMs: 2}, &lockedWriter{w: bufio.NewWriter(b), conn: b})
+	reader := bufio.NewReader(a)
+	code, err := reader.ReadByte()
+	if err != nil || code != MsgHsReply {
+		t.Fatalf("missing authoritative reply: %v", err)
+	}
+	var reply HsReply
+	if err := reply.Unmarshal(reader); err != nil {
+		t.Fatal(err)
+	}
+	if reply.IntervalMs != 1 || reply.StartTime != start || reply.EndTime != start+w {
+		t.Fatalf("wrong committed reply %+v", reply)
+	}
+}
+func TestExpiredCollectionsDiscarded(t *testing.T) {
+	r := scheduleReplica()
+	r.scheduleRequests = map[uint64]map[uint64]HsRequest{10e6: {0: {ClientId: 0}}, 20e6: {0: {ClientId: 0}}}
+	r.scheduleWindowWaiters = map[uint64]map[uint64]*lockedWriter{10e6: {}, 20e6: {}}
+	r.scheduleProposal = &SchdPrepare{StartTime: 1, EndTime: 2}
+	r.expireScheduleRequestsLocked(25e6)
+	if len(r.scheduleRequests) != 1 || r.scheduleRequests[20e6] == nil || len(r.scheduleWindowWaiters) != 1 || r.scheduleProposal == nil {
+		t.Fatal("expired collection cleanup changed live state")
+	}
+}

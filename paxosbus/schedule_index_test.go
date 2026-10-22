@@ -37,4 +37,19 @@ func TestIndexedScheduleMatchesEnumeratedSlots(t *testing.T) {
 			t.Fatalf("rejected bus %+v", bus)
 		}
 	}
+	for pruned := 0; pruned < len(buses); pruned += 37 {
+		r.prunedBelow = uint64(pruned)
+		r.resetCursorLocked()
+		for slot := pruned; slot < len(buses) && slot < pruned+20; slot++ {
+			owner := r.slotOwnerLocked(uint64(slot))
+			want := buses[slot]
+			if owner.clientId != want.id || owner.reqId != want.arrival {
+				t.Fatalf("pruned=%d slot=%d owner=%+v want=%+v", pruned, slot, owner, want)
+			}
+		}
+		if len(r.slotMeta) > 20 {
+			t.Fatalf("regenerated pruned metadata: %d", len(r.slotMeta))
+		}
+	}
+
 }

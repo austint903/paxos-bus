@@ -121,10 +121,8 @@ func (r *Replica) handleHsRequest(m *HsRequest, lw *lockedWriter) {
 	}
 	for _, s := range r.schedule {
 		if s.FirstMsgNs == m.StartTime && s.ClientId == m.ClientId && s.EndTime <= r.scheduleCommittedEnd {
-			if s.IntervalMs == m.IntervalMs {
-				reply := HsReply{ReplicaId: uint32(r.idx), ViewId: r.view(), IntervalMs: s.IntervalMs, StartTime: s.FirstMsgNs, EndTime: s.EndTime}
-				go lw.sendMsg(MsgHsReply, &reply)
-			}
+			reply := HsReply{ReplicaId: uint32(r.idx), ViewId: r.view(), IntervalMs: s.IntervalMs, StartTime: s.FirstMsgNs, EndTime: s.EndTime}
+			go lw.sendMsg(MsgHsReply, &reply)
 			return
 		}
 	}
@@ -155,6 +153,7 @@ func (r *Replica) scheduleLoop() {
 			r.mu.Unlock()
 			continue
 		}
+		r.expireScheduleRequestsLocked(uint64(wallNs()))
 		if !r.scheduleInstallActive {
 			var start uint64
 			now := uint64(wallNs())
@@ -325,4 +324,14 @@ func (r *Replica) handleScheduleInstall(m *BusScheduleInstall) bool {
 		return true
 	}
 	return false
+}
+
+func (r *Replica) expireScheduleRequestsLocked(now uint64) {
+	w := uint64(r.config.ScheduleWindow())
+	for start := range r.scheduleRequests {
+		if start <= now && w <= now-start {
+			delete(r.scheduleRequests, start)
+			delete(r.scheduleWindowWaiters, start)
+		}
+	}
 }

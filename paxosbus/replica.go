@@ -859,9 +859,49 @@ func (r *Replica) clientListener(conn net.Conn) {
 }
 
 func (r *Replica) resetCursorLocked() {
-	r.cursorSlot = 0
+	r.cursorSlot = r.prunedBelow
 	r.cursorNextN = make(map[uint64]uint64)
 	r.slotMeta = make(map[uint64]slotMetaEntry)
+	if r.prunedBelow == 0 {
+		return
+	}
+	var low, high uint64
+	ids := make([]uint64, 0, len(r.clients))
+	for id, line := range r.clients {
+		ids = append(ids, id)
+		if len(line.windows) > 0 {
+			end := line.windows[len(line.windows)-1].EndTime
+			if end > high {
+				high = end
+			}
+		}
+	}
+	for low < high {
+		mid := low + (high-low)/2
+		var count uint64
+		for _, line := range r.clients {
+			count += countBefore(line, int64(mid), true)
+		}
+		if count > r.prunedBelow {
+			high = mid
+		} else {
+			low = mid + 1
+		}
+	}
+	var before uint64
+	for _, line := range r.clients {
+		before += countBefore(line, int64(low), false)
+	}
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	for _, id := range ids {
+		line := r.clients[id]
+		next := low
+		if line.nextSequence(low) == low && before < r.prunedBelow {
+			next++
+			before++
+		}
+		r.cursorNextN[id] = next
+	}
 }
 
 type admission uint8
