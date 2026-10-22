@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"bytes"
 	crand "crypto/rand"
-	"math"
 	"math/bits"
 	"net"
 	"strconv"
@@ -47,7 +46,9 @@ func (lw *lockedWriter) sendMsg(code uint8, msg wireMsg) error {
 		lw.conn.SetWriteDeadline(time.Now().Add(clientControlWriteTimeout))
 		defer lw.conn.SetWriteDeadline(time.Time{})
 	}
-	lw.w.WriteByte(code)
+	if err := lw.w.WriteByte(code); err != nil {
+		return err
+	}
 	msg.Marshal(lw.w)
 	return lw.w.Flush()
 }
@@ -124,13 +125,18 @@ type Client struct {
 	resendMs   uint64
 	self       string
 
-	genIntervalUs   uint64
-	requestOp       []byte // immutable write value, shared by this client's requests
-	reqTimeoutNs    int64
-	verbose         bool
-	startDelayMs    uint64
-	syncWallNs      int64
-	scheduleReplies chan BusScheduleReady
+	genIntervalUs    uint64
+	requestOp        []byte // immutable write value, shared by this client's requests
+	reqTimeoutNs     int64
+	verbose          bool
+	startDelayMs     uint64
+	syncWallNs       int64
+	scheduleMu       sync.Mutex
+	desiredInterval  uint64
+	windows          map[uint64]HsReply
+	submitted        map[uint64]map[uint64]bool
+	handshakeReplies chan HsReply
+	arrivalNs        uint64
 
 	// maxOwdNs is the worst measured one-way delay to a replica.
 	maxOwdNs int64
@@ -162,20 +168,12 @@ type Client struct {
 	winRttSumUs  uint64
 
 	pauseMu         sync.Mutex
-	pauseEnabled    bool
 	paused          bool
 	activeView      uint64
 	pauseView       uint64
 	viewHint        uint64
 	controlStatus   []clientControlMessage
 	startupComplete bool
-	startupResuming bool
-	pauseChanged    chan struct{}
-	resumeSendNs    int64
-	resumeWait      time.Duration
-	controlPeers    []*clientControlPeer
-	controlReplies  chan clientControlReply
-	controlSeq      uint64 // owned by the recovery loop
 }
 
 func NewClient(config *Config, clientId, intervalMs, resendMs uint64, label string,
@@ -196,29 +194,28 @@ func NewClient(config *Config, clientId, intervalMs, resendMs uint64, label stri
 		panic("cannot generate write payload: " + err.Error())
 	}
 	c := &Client{
-		config:          config,
-		clientId:        clientId,
-		intervalMs:      intervalMs,
-		resendMs:        resendMs,
-		self:            self,
-		genIntervalUs:   genIntervalUs,
-		requestOp:       requestOp,
-		reqTimeoutNs:    int64(resendMs) * 1e6,
-		verbose:         verbose,
-		startDelayMs:    startDelayMs,
-		maxOwdNs:        int64(maxOwdMs * 1e6),
-		owdAuto:         maxOwdMs == 0,
-		conns:           make([]net.Conn, config.N),
-		readers:         make([]*bufio.Reader, config.N),
-		writers:         make([]*lockedWriter, config.N),
-		busSenders:      make([]*connSender, config.N),
-		rInflight:       make(map[uint64]*reqInflight),
-		scheduleReplies: make(chan BusScheduleReady, config.N),
-		controlStatus:   make([]clientControlMessage, config.N),
-		pauseEnabled:    true,
-		pauseChanged:    make(chan struct{}),
-		resumeWait:      time.Second,
-		controlReplies:  make(chan clientControlReply, config.N*8),
+		config:           config,
+		clientId:         clientId,
+		intervalMs:       intervalMs,
+		desiredInterval:  intervalMs,
+		windows:          make(map[uint64]HsReply),
+		submitted:        make(map[uint64]map[uint64]bool),
+		handshakeReplies: make(chan HsReply, 64),
+		resendMs:         resendMs,
+		self:             self,
+		genIntervalUs:    genIntervalUs,
+		requestOp:        requestOp,
+		reqTimeoutNs:     int64(resendMs) * 1e6,
+		verbose:          verbose,
+		startDelayMs:     startDelayMs,
+		maxOwdNs:         int64(maxOwdMs * 1e6),
+		owdAuto:          maxOwdMs == 0,
+		conns:            make([]net.Conn, config.N),
+		readers:          make([]*bufio.Reader, config.N),
+		writers:          make([]*lockedWriter, config.N),
+		busSenders:       make([]*connSender, config.N),
+		rInflight:        make(map[uint64]*reqInflight),
+		controlStatus:    make([]clientControlMessage, config.N),
 	}
 	resend := ""
 	if resendMs > 0 {
@@ -277,8 +274,6 @@ func (c *Client) Run() {
 	for i := range c.readers {
 		go c.receiveLoop(i)
 	}
-	// Control status also discovers a replacement leader if view 0 fails before
-	// the schedule is committed, even when traffic pausing is disabled.
 	c.startClientControl()
 	c.awaitInitialSchedule()
 
@@ -296,55 +291,6 @@ func (c *Client) Run() {
 	c.busLoop()
 }
 
-func (c *Client) awaitInitialSchedule() {
-	ticker := time.NewTicker(clientControlPoll)
-	defer ticker.Stop()
-	c.syncWallNs = wallNs()
-	announcement := BusSyncMessage{
-		ClientId: c.clientId, FirstMsgNs: uint64(c.dataPhaseStartWallNs()), IntervalMs: c.intervalMs,
-	}
-	announcedView := ^uint64(0)
-	for {
-		c.pauseMu.Lock()
-		view := c.viewHint
-		c.pauseMu.Unlock()
-		announcedView = view
-		leader := c.config.LeaderIndex(view)
-		if err := c.writers[leader].sendMsg(MsgBusSync, &announcement); err != nil {
-			Warning("[%s] failed to announce schedule to leader %d in view %d: %v", c.self, leader, view, err)
-		}
-		select {
-		case ready := <-c.scheduleReplies:
-			c.pauseMu.Lock()
-			currentView := c.viewHint
-			c.pauseMu.Unlock()
-			if ready.ClientId != c.clientId || ready.Epoch != announcedView || ready.Epoch != currentView ||
-				ready.FirstMsgNs > math.MaxInt64 {
-				continue
-			}
-			c.syncWallNs = int64(ready.FirstMsgNs) - int64(c.startDelayMs)*1e6
-			if c.firstSendWallNs() <= wallNs() {
-				c.pauseMu.Lock()
-				c.paused = true
-				c.pauseView = ready.Epoch
-				c.startupResuming = true
-				c.pauseMu.Unlock()
-				c.clientRecoveryLoop()
-			}
-			c.pauseMu.Lock()
-			if c.activeView < ready.Epoch {
-				c.activeView = ready.Epoch
-			}
-			c.startupComplete = true
-			c.startupResuming = false
-			c.pauseMu.Unlock()
-			Notice("[%s] authoritative schedule ready at view %d, waiting until data phase", c.self, ready.Epoch)
-			return
-		case <-ticker.C:
-		}
-	}
-}
-
 func (c *Client) genLoop() {
 	intervalNs := int64(c.genIntervalUs) * 1000
 	if intervalNs <= 0 {
@@ -352,19 +298,15 @@ func (c *Client) genLoop() {
 	}
 	next := nowNs()
 	var rid uint64
-	var lastResume int64
 	for {
-		waited := c.waitWhilePaused()
-		c.pauseMu.Lock()
-		resume := c.resumeSendNs
-		c.pauseMu.Unlock()
-		if waited || resume != lastResume {
-			next = nowNs() // do not generate the work skipped during the pause
-			lastResume = resume
+		if !c.generationEnabled() {
+			time.Sleep(time.Millisecond)
+			next = nowNs()
+			continue
 		}
 		now := nowNs()
 		for now >= next {
-			if c.isPaused() {
+			if c.isPaused() || !c.generationEnabled() {
 				break
 			}
 			rid++
@@ -413,34 +355,6 @@ func (c *Client) runOnSchedule(base, intervalNs int64, tick func()) {
 	}
 }
 
-func (c *Client) busLoop() {
-	next := c.firstSendWallNs()
-	intervalNs := int64(c.intervalMs) * 1e6
-	lastStats := wallNs()
-	var lastResume int64
-	for {
-		c.waitWhilePaused()
-		c.pauseMu.Lock()
-		resume := c.resumeSendNs
-		c.pauseMu.Unlock()
-		if resume != lastResume {
-			next, lastResume = resume, resume
-		}
-		if delay := next - wallNs(); delay > 0 {
-			c.waitUnlessPause(time.Duration(delay))
-		}
-		if c.isPaused() {
-			continue
-		}
-		c.sendBus()
-		next += intervalNs
-		if now := wallNs(); now-lastStats >= int64(time.Second) {
-			c.emitStats()
-			lastStats = now
-		}
-	}
-}
-
 func (c *Client) sendBus() {
 	c.pauseMu.Lock()
 	defer c.pauseMu.Unlock()
@@ -463,7 +377,7 @@ func (c *Client) sendBus() {
 	reqs = append(reqs, batch...)
 
 	c.mu.Lock()
-	c.busSeqNum++
+	c.busSeqNum = c.arrivalNs
 	seq := c.busSeqNum
 	for i := range reqs {
 		rid := reqs[i].RequestId
@@ -504,7 +418,7 @@ func (c *Client) reqTimeoutLoop() {
 	}
 	ticker := time.NewTicker(tick)
 	for range ticker.C {
-		if c.isPaused() {
+		if !c.generationEnabled() {
 			continue
 		}
 		now := nowNs()
@@ -547,16 +461,6 @@ func (c *Client) receiveLoop(rid int) {
 				return
 			}
 			c.handleRequestReply(&reqReply)
-		case MsgBusScheduleReady:
-			var ready BusScheduleReady
-			if err := ready.Unmarshal(reader); err != nil {
-				Warning("[%s] bad schedule acknowledgement from replica %d: %v", c.self, rid, err)
-				return
-			}
-			select {
-			case c.scheduleReplies <- ready:
-			default:
-			}
 		default:
 			Warning("[%s] unknown message type %d from replica %d",
 				c.self, msgType, rid)
