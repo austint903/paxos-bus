@@ -111,7 +111,7 @@ Project configuration:
   Set PAXOSBUS_GCP_ENV_FILE to load a different file.
 
 Run logs are copied to:
-  paxosbus/logs/gcp/gcp-run-YYYYMMDD-HHMMSS[-TAG]/
+  <main-checkout>/paxosbus/logs/gcp-paxosbus/reconfig/gcp-run-YYYYMMDD-HHMMSS[-TAG]/
 EOF
 }
 
@@ -513,11 +513,13 @@ stop_configured_vms() {
 }
 
 initialize_run_dir() {
-    local name ts git_dirty git_commit
+    local name ts git_dirty git_commit main_dir
     ts="$(date +%Y%m%d-%H%M%S)"
     name="gcp-run-$ts"
     [[ -n "$RUN_TAG" ]] && name="$name-$RUN_TAG"
-    RUN_LOG_DIR="$SCRIPT_DIR/paxosbus/logs/gcp/$name"
+    main_dir="$(dirname "$(git -C "$SCRIPT_DIR" rev-parse --path-format=absolute --git-common-dir)")"
+    [[ "$main_dir/" != */.codex/* ]] || die "experiment logs must be outside .codex"
+    RUN_LOG_DIR="$main_dir/paxosbus/logs/gcp-paxosbus/reconfig/$name"
     mkdir -p "$RUN_LOG_DIR"
     KILL_INFO_FILE="$RUN_LOG_DIR/kill-info.txt"
     RUN_ACTIVE=1
