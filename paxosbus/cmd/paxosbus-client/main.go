@@ -23,6 +23,8 @@ func main() {
 	startDelayMs := flag.Uint64("w", 5000, "delay in ms between schedule announcement and the data phase; the leader schedule barrier should complete within this window")
 	maxOwdMs := flag.Float64("owd", 0, "max one-way delay to any replica in ms; buses depart this early so they arrive on the announced schedule (0 = auto-measure as max TCP dial RTT / 2)")
 	reconfigure := flag.String("reconfigure", "", "comma-separated duration:bus-interval-ms changes after startup, e.g. 35s:0,55s:1")
+	pauseWindowAfter := flag.Duration("pause-window-after", 0, "disable buses for one schedule window this long after the first scheduled window; must be a positive multiple of the schedule window")
+	scheduleStart := flag.Uint64("schedule-start-ns", 0, "earliest initial schedule start as a window-aligned Unix nanosecond timestamp")
 	flag.Parse()
 	if *commandSize <= 0 || uint64(*commandSize) > uint64(^uint32(0)) {
 		fmt.Fprintln(os.Stderr, "command-size must be between 1 and 4294967295 bytes")
@@ -51,6 +53,18 @@ func main() {
 
 	client := paxosbus.NewClient(config, *clientId, *intervalMs, *resendMs, *label,
 		*genIntervalUs, *verbose, *startDelayMs, *maxOwdMs, *commandSize)
+	if *scheduleStart != 0 {
+		if err := client.SetScheduleStart(*scheduleStart); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+	}
+	if *pauseWindowAfter != 0 {
+		if err := client.PauseScheduleWindowAfter(*pauseWindowAfter); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+	}
 	if err := client.Connect(); err != nil {
 		fmt.Fprintf(os.Stderr, "cannot connect: %v\n", err)
 		os.Exit(1)

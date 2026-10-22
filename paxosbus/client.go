@@ -133,6 +133,9 @@ type Client struct {
 	syncWallNs       int64
 	scheduleMu       sync.Mutex
 	desiredInterval  uint64
+	firstSchedule    uint64
+	scheduleStart    uint64
+	pauseWindowAfter time.Duration
 	windows          map[uint64]HsReply
 	submitted        map[uint64]map[uint64]bool
 	handshakeReplies chan HsReply
