@@ -20,6 +20,7 @@ PORT="${PAXOSBUS_PORT:-}"
 GCP_GOARCH="${GCP_GOARCH:-}"
 GEN_INTERVAL_US="${GEN_INTERVAL_US:-${REQUEST_INTERVAL_US:-500}}"
 INTERVAL_MS="${INTERVAL_MS:-${BUS_INTERVAL_MS:-1}}"
+COMMAND_SIZE="${COMMAND_SIZE:-16}"
 SCHEDULE_WINDOW_MS="${SCHEDULE_WINDOW_MS:-10000}"
 DURATION_S="${DURATION_S:-60}"
 PAUSE_WINDOW_AFTER_S="${PAUSE_WINDOW_AFTER_S:-0}"
@@ -63,6 +64,7 @@ Usage: $0 [run|setup|list] [options]
 Workload:
   -g, --request-interval-us US    Request generation interval (default: 500)
   -p, --bus-interval-ms MS        Bus generation interval (default: 1)
+      --command-size BYTES       Request payload bytes (default: 16)
       --schedule-window-ms MS   Schedule reconfiguration window (default: 10000)
       --pause-window-after-s S   Pause clients 2,4,6,8 for one window after S active seconds
   -d, --duration-s SECONDS        Data-phase duration (default: 60)
@@ -131,11 +133,13 @@ while [[ $# -gt 0 ]]; do
         -p|--bus-interval-ms)
             need_arg "$1" "${2:-}"; INTERVAL_MS="$2"; shift ;;
         --bus-interval-ms=*) INTERVAL_MS="${1#*=}" ;;
+        --command-size)
+            need_arg "$1" "${2:-}"; COMMAND_SIZE="$2"; shift ;;
         --schedule-window-ms)
             need_arg "$1" "${2:-}"; SCHEDULE_WINDOW_MS="$2"; shift ;;
         --schedule-window-ms=*) SCHEDULE_WINDOW_MS="${1#*=}" ;;
         --pause-window-after-s)
-            PAUSE_WINDOW_AFTER_S="$2"; shift 2 ;;
+            need_arg "$1" "${2:-}"; PAUSE_WINDOW_AFTER_S="$2"; shift ;;
         -d|--duration-s)
             need_arg "$1" "${2:-}"; DURATION_S="$2"; shift ;;
         --duration-s=*) DURATION_S="${1#*=}" ;;
@@ -223,6 +227,8 @@ done
 
 require_uint request-interval-us "$GEN_INTERVAL_US"
 require_uint bus-interval-ms "$INTERVAL_MS"
+require_uint command-size "$COMMAND_SIZE"
+((COMMAND_SIZE <= 4294967295)) || die "command-size exceeds uint32"
 require_uint schedule-window-ms "$SCHEDULE_WINDOW_MS"
 require_uint duration-s "$DURATION_S"
 require_uint pause-window-after-s "$PAUSE_WINDOW_AFTER_S" 1
@@ -363,7 +369,7 @@ scp_from() {
     local attempt
     for attempt in 1 2 3; do
         if gcloud compute scp "${instance}:${remote_path}" "${local_path}.partial" \
-            --tunnel-through-iap --zone="$zone" --project="$PROJECT_ID" --compress --quiet; then
+            --tunnel-through-iap --zone="$zone" --project="$PROJECT_ID" --compress --scp-flag=-oServerAliveInterval=15 --scp-flag=-oServerAliveCountMax=3 --quiet; then
             mv "${local_path}.partial" "$local_path"
             return 0
         fi
@@ -533,6 +539,7 @@ initialize_run_dir() {
         echo "ssh_transport=iap"
         echo "scenario=$SCENARIO"
         echo "interval_ms=$INTERVAL_MS"
+        echo "command_size=$COMMAND_SIZE"
         echo "gen_interval_us=$GEN_INTERVAL_US"
         echo "duration_s=$DURATION_S"
         echo "pause_window_after_s=$PAUSE_WINDOW_AFTER_S"
@@ -626,11 +633,9 @@ launch_clients() {
     echo "==> Launching $total clients ($CLIENTS_PER_REGION per region; one process per VM)"
     local node_idx ids pid pause_args start_args="" rc=0
     local pids=()
-    if ((PAUSE_WINDOW_AFTER_S > 0)); then
-        SCHEDULE_START_NS="$(python3 -c 'import sys,time; w=int(sys.argv[1])*1000000; print((time.time_ns()//w+4)*w)' "$SCHEDULE_WINDOW_MS")"
-        start_args="-schedule-start-ns $SCHEDULE_START_NS"
-        echo "schedule_start_ns=$SCHEDULE_START_NS" >> "$RUN_LOG_DIR/run-meta.txt"
-    fi
+    SCHEDULE_START_NS="$(python3 -c 'import sys,time; w=int(sys.argv[1])*1000000; print((time.time_ns()//w+4)*w)' "$SCHEDULE_WINDOW_MS")"
+    start_args="-schedule-start-ns $SCHEDULE_START_NS"
+    echo "schedule_start_ns=$SCHEDULE_START_NS" >> "$RUN_LOG_DIR/run-meta.txt"
     for node_idx in "${!NODE_VMS[@]}"; do
         ((node_idx >= 3)) || continue
         ids="$(client_ids_for_node "$node_idx")"
@@ -640,7 +645,7 @@ launch_clients() {
             for id in $ids; do
                 rm -f /tmp/paxosbus-client-\$id.log
                 nohup ~/$REMOTE_DIR/paxosbus-client \\
-                  -c $REMOTE_CONF -I \$id -p $INTERVAL_MS -g $GEN_INTERVAL_US \\
+                  -c $REMOTE_CONF -I \$id -p $INTERVAL_MS -g $GEN_INTERVAL_US -command-size $COMMAND_SIZE \\
                   -t $RESEND_MS -w $START_DELAY_MS -l ${NODE_LABELS[$node_idx]} $pause_args $start_args \\
                   </dev/null >/tmp/paxosbus-client-\$id.log 2>&1 &
                 echo \$! >/tmp/paxosbus-client-\$id.pid
