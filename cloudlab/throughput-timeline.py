@@ -76,14 +76,12 @@ def timeline(run_dir, output, bin_us, origin_us=None, duration_us=None, expected
     output.parent.mkdir(parents=True, exist_ok=True)
     with output.open("w", newline="") as stream:
         writer = csv.writer(stream)
-        writer.writerow(["time_s", "bin_end_s", "committed_requests", "throughput_req_s"] +
-                        [f"client_{cid}_req_s" for cid in clients])
+        writer.writerow(["time_s", "throughput_k_req_sec"])
         for start in range(0, duration_us, bin_us):
             end = min(start + bin_us, duration_us)
             values = [counts[cid][start // bin_us] for cid in clients]
             scale = 1_000_000 / (end - start)
-            writer.writerow([f"{(start + start_us) / 1e6:.6f}", f"{(end + start_us) / 1e6:.6f}", sum(values),
-                             f"{sum(values) * scale:.3f}"] + [f"{n * scale:.3f}" for n in values])
+            writer.writerow([f"{(start + start_us) / 1e6:.6f}", f"{sum(values) * scale / 1000:.6f}"])
     samples, cumulative, percentiles = sum(latencies.values()), 0, {}
     for latency, count in sorted(latencies.items()):
         cumulative += count
@@ -93,7 +91,8 @@ def timeline(run_dir, output, bin_us, origin_us=None, duration_us=None, expected
     metadata = {"origin_unix_ns": origin_us * 1000, "origin_source": source,
                 "log_timezone": "UTC", "log_month_encoding": "zero-based",
                 "start_seconds": start_us / 1e6, "bin_seconds": bin_us / 1e6, "duration_seconds": duration_us / 1e6,
-                "interval": "[time_s, bin_end_s)", "measurement": "client quorum commit log timestamps",
+                "interval": "[time_s, time_s + bin_seconds)", "measurement": "client quorum commit log timestamps",
+                "columns": ["time_s", "throughput_k_req_sec"],
                 "clock_alignment": "shared wall clock; no per-client time shifts",
                 "latency_definition": "generation to quorum commit; requests committed inside the selected window",
                 "schedule_plans": plans, "latency": {"samples": samples, **percentiles},
@@ -113,7 +112,7 @@ def plot_timeline(output, metadata):
         rows = list(csv.DictReader(stream))
     fig, ax = plt.subplots(figsize=(10, 4))
     ax.plot([float(row["time_s"]) for row in rows],
-            [float(row["throughput_req_s"]) / 1000 for row in rows], linewidth=0.8,
+            [float(row["throughput_k_req_sec"]) for row in rows], linewidth=0.8,
             label=f"Committed throughput ({metadata['bin_seconds']:g}s bins)")
     origin = metadata["origin_unix_ns"]
     windows = sorted({((plan["pause_start_ns"] - origin) / 1e9,
