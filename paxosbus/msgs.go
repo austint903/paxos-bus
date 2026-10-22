@@ -37,9 +37,9 @@ func unmarshalRequests(p []byte) ([]RequestMessage, error) {
 }
 
 const (
-	MsgBusSync uint8 = iota + 1
-	_                // retired: direct, unbatched request
-	_                // retired: direct, unbatched reply
+	_ uint8 = iota + 1
+	_       // retired: direct, unbatched request
+	_       // retired: direct, unbatched reply
 	MsgBusGapRequest
 	MsgBusGapReply
 	MsgBusGapCommit
@@ -60,18 +60,17 @@ const (
 	MsgClientPause
 	MsgClientStatusQuery
 	MsgClientStatusReply
-	MsgClientResume
-	MsgClientResumeAck
+	_
+	_
 	MsgBusScheduleInstall
-	MsgBusScheduleAck
-	MsgBusScheduleReady
 )
 
 const (
-	maxBitmapBytes  = 1 << 20
-	maxSlotListLen  = 1 << 20
-	maxStateEntries = 1 << 16
-	maxScheduleLen  = 1 << 16
+	maxBitmapBytes        = 1 << 20
+	maxSlotListLen        = 1 << 20
+	maxStateEntries       = 1 << 16
+	maxScheduleLen        = 1 << 16
+	maxScheduleHistoryLen = 1 << 24
 )
 
 type wireMsg interface {
@@ -79,6 +78,7 @@ type wireMsg interface {
 }
 
 type BusSyncMessage struct {
+	EndTime    uint64
 	ClientId   uint64
 	FirstMsgNs uint64 // wall-clock ns when this client's first bus ARRIVES (it departs maxOWD earlier)
 	IntervalMs uint64 // bus interval; expect msg n at FirstMsgNs + (n-1)*IntervalMs
@@ -93,35 +93,25 @@ type BusScheduleInstall struct {
 	Schedule  []BusSyncMessage
 }
 
-type BusScheduleAck struct {
-	Epoch     uint64
-	Digest    uint64
-	SenderIdx uint32
-}
-
-type BusScheduleReady struct {
-	ClientId   uint64
-	Epoch      uint64
-	FirstMsgNs uint64
-}
-
 func (m *BusSyncMessage) New() fastrpc.Serializable {
 	return new(BusSyncMessage)
 }
 
 func (m *BusSyncMessage) Marshal(wire io.Writer) {
-	var b [24]byte
+	var b [32]byte
 	binary.LittleEndian.PutUint64(b[0:8], m.ClientId)
 	binary.LittleEndian.PutUint64(b[8:16], m.FirstMsgNs)
 	binary.LittleEndian.PutUint64(b[16:24], m.IntervalMs)
+	binary.LittleEndian.PutUint64(b[24:32], m.EndTime)
 	wire.Write(b[:])
 }
 
 func (m *BusSyncMessage) Unmarshal(wire io.Reader) error {
-	var b [24]byte
+	var b [32]byte
 	if _, err := io.ReadFull(wire, b[:]); err != nil {
 		return err
 	}
+	m.EndTime = binary.LittleEndian.Uint64(b[24:32])
 	m.ClientId = binary.LittleEndian.Uint64(b[0:8])
 	m.FirstMsgNs = binary.LittleEndian.Uint64(b[8:16])
 	m.IntervalMs = binary.LittleEndian.Uint64(b[16:24])
@@ -143,7 +133,7 @@ func readSchedule(wire io.Reader) ([]BusSyncMessage, error) {
 		return nil, err
 	}
 	n := binary.LittleEndian.Uint32(b[:])
-	if n > maxScheduleLen {
+	if n > maxScheduleHistoryLen {
 		return nil, fmt.Errorf("client schedule too long: %d", n)
 	}
 	out := make([]BusSyncMessage, n)
@@ -175,44 +165,6 @@ func (m *BusScheduleInstall) Unmarshal(wire io.Reader) error {
 	var err error
 	m.Schedule, err = readSchedule(wire)
 	return err
-}
-
-func (m *BusScheduleAck) Marshal(wire io.Writer) {
-	var b [20]byte
-	binary.LittleEndian.PutUint64(b[0:8], m.Epoch)
-	binary.LittleEndian.PutUint64(b[8:16], m.Digest)
-	binary.LittleEndian.PutUint32(b[16:20], m.SenderIdx)
-	wire.Write(b[:])
-}
-
-func (m *BusScheduleAck) Unmarshal(wire io.Reader) error {
-	var b [20]byte
-	if _, err := io.ReadFull(wire, b[:]); err != nil {
-		return err
-	}
-	m.Epoch = binary.LittleEndian.Uint64(b[0:8])
-	m.Digest = binary.LittleEndian.Uint64(b[8:16])
-	m.SenderIdx = binary.LittleEndian.Uint32(b[16:20])
-	return nil
-}
-
-func (m *BusScheduleReady) Marshal(wire io.Writer) {
-	var b [24]byte
-	binary.LittleEndian.PutUint64(b[0:8], m.ClientId)
-	binary.LittleEndian.PutUint64(b[8:16], m.Epoch)
-	binary.LittleEndian.PutUint64(b[16:24], m.FirstMsgNs)
-	wire.Write(b[:])
-}
-
-func (m *BusScheduleReady) Unmarshal(wire io.Reader) error {
-	var b [24]byte
-	if _, err := io.ReadFull(wire, b[:]); err != nil {
-		return err
-	}
-	m.ClientId = binary.LittleEndian.Uint64(b[0:8])
-	m.Epoch = binary.LittleEndian.Uint64(b[8:16])
-	m.FirstMsgNs = binary.LittleEndian.Uint64(b[16:24])
-	return nil
 }
 
 type RequestMessage struct {

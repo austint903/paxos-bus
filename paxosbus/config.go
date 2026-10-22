@@ -6,15 +6,17 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"time"
 )
 
 const maxReplicaCount = 32
 
 type Config struct {
-	N               int
-	F               int
-	ExpectedClients int
-	Replicas        []string
+	N                int
+	F                int
+	ExpectedClients  int
+	ScheduleWindowMs uint64
+	Replicas         []string
 }
 
 func ReadConfig(path string) (*Config, error) {
@@ -47,6 +49,15 @@ func ReadConfig(path string) (*Config, error) {
 				return nil, fmt.Errorf("config: malformed replica line: %q", line)
 			}
 			c.Replicas = append(c.Replicas, fields[1])
+		case "schedule-window-ms":
+			if len(fields) != 2 {
+				return nil, fmt.Errorf("config: malformed schedule-window-ms")
+			}
+			v, err := strconv.ParseUint(fields[1], 10, 64)
+			if err != nil || v == 0 || v > uint64((1<<63-1)/int64(time.Millisecond)/4) {
+				return nil, fmt.Errorf("config: invalid schedule-window-ms")
+			}
+			c.ScheduleWindowMs = v
 		case "clients":
 			if len(fields) != 2 {
 				return nil, fmt.Errorf("config: malformed clients line: %q", line)
@@ -101,4 +112,11 @@ func (c *Config) LeaderIndex(viewId uint64) int {
 func (c *Config) Port(i int) string {
 	addr := c.Replicas[i]
 	return addr[strings.LastIndex(addr, ":")+1:]
+}
+
+func (c *Config) ScheduleWindow() time.Duration {
+	if c.ScheduleWindowMs == 0 {
+		return 10 * time.Second
+	}
+	return time.Duration(c.ScheduleWindowMs) * time.Millisecond
 }

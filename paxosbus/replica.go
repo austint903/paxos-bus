@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"sort"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -33,24 +34,21 @@ const (
 )
 
 type clientLine struct {
-	baseNs          int64
-	intervalNs      int64
-	maxSeqSeen      uint64
-	resumeSeq       uint64
-	arrivalOffsetNs int64
+	windows      []BusSyncMessage
+	windowCounts []uint64
+	baseNs       int64
+	intervalNs   int64
+	maxSeqSeen   uint64
 }
 
 func (cl *clientLine) expectedNs(n uint64) int64 {
+	if len(cl.windows) > 0 {
+		return int64(n)
+	}
 	return cl.baseNs + int64(n-1)*cl.intervalNs
 }
 
-func (cl *clientLine) arrivalNs(n uint64) int64 {
-	t := cl.expectedNs(n)
-	if cl.resumeSeq != 0 && n >= cl.resumeSeq {
-		t += cl.arrivalOffsetNs
-	}
-	return t
-}
+func (cl *clientLine) arrivalNs(n uint64) int64 { return cl.expectedNs(n) }
 
 type globalEntry struct {
 	clientId uint64
@@ -114,6 +112,9 @@ func computeGlobalSlot(lines map[uint64]*clientLine, clientId, reqId uint64) uin
 	}
 	y := self.expectedNs(reqId)
 	slot := reqId - 1
+	if len(self.windows) > 0 {
+		slot = countBefore(self, y, false)
+	}
 	for cid, line := range lines {
 		if cid == clientId {
 			continue
@@ -124,6 +125,15 @@ func computeGlobalSlot(lines map[uint64]*clientLine, clientId, reqId uint64) uin
 }
 
 func countBefore(line *clientLine, y int64, tiePrecedes bool) uint64 {
+	if len(line.windows) > 0 {
+		i := sort.Search(len(line.windows), func(i int) bool { return line.windows[i].EndTime > uint64(y) })
+		total := line.windowCounts[i]
+		if i < len(line.windows) {
+			w := line.windows[i]
+			total += countBefore(&clientLine{baseNs: int64(w.FirstMsgNs), intervalNs: int64(w.IntervalMs) * 1e6}, y, tiePrecedes)
+		}
+		return total
+	}
 	d := y - line.baseNs
 	k := line.intervalNs
 	if k <= 0 {
@@ -268,10 +278,16 @@ type Replica struct {
 	schedule              []BusSyncMessage
 	scheduleEpoch         uint64
 	scheduleReady         bool
-	scheduleAnnouncements map[uint64]BusSyncMessage
-	scheduleWaiters       map[uint64]*lockedWriter
 	scheduleInstallActive bool
-	scheduleAckCh         chan BusScheduleAck
+	scheduleCommittedEnd  uint64
+	scheduleRequests      map[uint64]map[uint64]HsRequest
+	scheduleWindowWaiters map[uint64]map[uint64]*lockedWriter
+	scheduleProposal      *SchdPrepare
+	schedulePrepared      map[uint32]bool
+	scheduleLastSend      time.Time
+	schedulePeers         []*lockedWriter
+	schedulePeerMu        []sync.Mutex
+	scheduleSendQueues    []chan scheduleEnvelope
 	status                replicaStatus
 	lastNormalView        uint64
 	recovery              *viewRecovery
@@ -424,9 +440,6 @@ func NewReplica(config *Config, idx int, label, logDir string, mode dropMode, ev
 		self:                      self,
 		gapDeltaNs:                int64(gapDeltaMs) * 1e6,
 		clients:                   make(map[uint64]*clientLine),
-		scheduleAnnouncements:     make(map[uint64]BusSyncMessage),
-		scheduleWaiters:           make(map[uint64]*lockedWriter),
-		scheduleAckCh:             make(chan BusScheduleAck, config.N*4),
 		globalLog:                 make(map[uint64]*globalEntry),
 		dedup:                     make(map[reqKey]uint64),
 		State:                     state.InitState(),
@@ -609,6 +622,16 @@ func (r *Replica) serve(l net.Listener) error {
 	r.mu.Lock()
 	r.lastHeartbeatNs = nowNs()
 	r.mu.Unlock()
+	r.schedulePeers = make([]*lockedWriter, r.config.N)
+	r.schedulePeerMu = make([]sync.Mutex, r.config.N)
+	r.scheduleSendQueues = make([]chan scheduleEnvelope, r.config.N)
+	for peer := range r.config.Replicas {
+		if peer != r.idx {
+			r.scheduleSendQueues[peer] = make(chan scheduleEnvelope, 16)
+			go r.scheduleSender(peer)
+		}
+	}
+	go r.scheduleLoop()
 	go r.statsLoop()
 	go r.connectPeers()
 	go r.gapDetectLoop()
@@ -641,6 +664,8 @@ func (r *Replica) clientListener(conn net.Conn) {
 	lw := &lockedWriter{w: bufio.NewWriter(conn), conn: conn}
 
 	peerIdx := -1
+	scheduleSnapshotOK := false
+	var scheduleSnapshotView uint64
 	defer func() {
 		if peerIdx >= 0 {
 			r.peerConnLost(peerIdx)
@@ -648,8 +673,7 @@ func (r *Replica) clientListener(conn net.Conn) {
 	}()
 
 	var (
-		syncMsg BusSyncMessage
-		busMsg  BusMessage
+		busMsg BusMessage
 	)
 
 	for {
@@ -660,19 +684,39 @@ func (r *Replica) clientListener(conn net.Conn) {
 			return
 		}
 		switch msgType {
-		case MsgClientStatusQuery, MsgClientResume:
+		case MsgHsRequest:
+			var m HsRequest
+			if m.Unmarshal(reader) != nil {
+				return
+			}
+			r.handleHsRequest(&m, lw)
+		case MsgSchdPrepare:
+			var m SchdPrepare
+			if m.Unmarshal(reader) != nil {
+				return
+			}
+			if scheduleSnapshotOK && m.ViewId == scheduleSnapshotView {
+				r.handleSchdPrepare(&m)
+			}
+			scheduleSnapshotOK = false
+		case MsgSchdPrepareReply:
+			var m SchdPrepareReply
+			if m.Unmarshal(reader) != nil {
+				return
+			}
+			r.handleSchdPrepareReply(&m)
+		case MsgSchdCommit:
+			var m SchdCommit
+			if m.Unmarshal(reader) != nil {
+				return
+			}
+			r.handleSchdCommit(&m)
+		case MsgClientStatusQuery:
 			var m clientControlMessage
 			if err := m.Unmarshal(reader); err != nil {
 				return
 			}
 			r.handleClientControl(msgType, &m, lw)
-
-		case MsgBusSync:
-			if err := syncMsg.Unmarshal(reader); err != nil {
-				Warning("[%s] bad sync message: %v", r.self, err)
-				return
-			}
-			r.handleSync(&syncMsg, lw)
 
 		case MsgBus:
 			if err := busMsg.Unmarshal(reader); err != nil {
@@ -750,17 +794,8 @@ func (r *Replica) clientListener(conn net.Conn) {
 				Warning("[%s] bad schedule install: %v", r.self, err)
 				return
 			}
-			peerIdx = int(m.SenderIdx)
-			r.handleScheduleInstall(&m)
-
-		case MsgBusScheduleAck:
-			var m BusScheduleAck
-			if err := m.Unmarshal(reader); err != nil {
-				Warning("[%s] bad schedule acknowledgement: %v", r.self, err)
-				return
-			}
-			peerIdx = int(m.SenderIdx)
-			r.handleScheduleAck(&m)
+			scheduleSnapshotOK = r.handleScheduleInstall(&m)
+			scheduleSnapshotView = m.Epoch
 
 		case MsgBusViewChangeRequest:
 			var m BusViewChangeRequest
@@ -824,9 +859,49 @@ func (r *Replica) clientListener(conn net.Conn) {
 }
 
 func (r *Replica) resetCursorLocked() {
-	r.cursorSlot = 0
+	r.cursorSlot = r.prunedBelow
 	r.cursorNextN = make(map[uint64]uint64)
 	r.slotMeta = make(map[uint64]slotMetaEntry)
+	if r.prunedBelow == 0 {
+		return
+	}
+	var low, high uint64
+	ids := make([]uint64, 0, len(r.clients))
+	for id, line := range r.clients {
+		ids = append(ids, id)
+		if len(line.windows) > 0 {
+			end := line.windows[len(line.windows)-1].EndTime
+			if end > high {
+				high = end
+			}
+		}
+	}
+	for low < high {
+		mid := low + (high-low)/2
+		var count uint64
+		for _, line := range r.clients {
+			count += countBefore(line, int64(mid), true)
+		}
+		if count > r.prunedBelow {
+			high = mid
+		} else {
+			low = mid + 1
+		}
+	}
+	var before uint64
+	for _, line := range r.clients {
+		before += countBefore(line, int64(low), false)
+	}
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	for _, id := range ids {
+		line := r.clients[id]
+		next := low
+		if line.nextSequence(low) == low && before < r.prunedBelow {
+			next++
+			before++
+		}
+		r.cursorNextN[id] = next
+	}
 }
 
 type admission uint8
@@ -840,7 +915,7 @@ const (
 
 func (r *Replica) admitLocked(clientId, seq uint64, actualNs int64) admission {
 	line, ok := r.clients[clientId]
-	if !ok {
+	if !ok || seq == 0 || !line.validSequence(seq, r.scheduleCommittedEnd) {
 		return admitUnsynced
 	}
 	if seq > line.maxSeqSeen {
@@ -850,7 +925,11 @@ func (r *Replica) admitLocked(clientId, seq uint64, actualNs int64) admission {
 		r.winFenced++
 		return admitFenced
 	}
-	if r.shouldDropLocked(seq) {
+	ordinal := seq
+	if len(line.windows) > 0 {
+		ordinal = countBefore(line, int64(seq), false) + 1
+	}
+	if r.shouldDropLocked(ordinal) {
 		r.winDropped++
 		return admitDropped
 	}
@@ -1389,6 +1468,12 @@ func (r *Replica) genCursorUpToLocked(target uint64) {
 			n := r.cursorNextN[cid]
 			if n == 0 {
 				n = 1
+			}
+			if len(line.windows) > 0 {
+				n = line.nextSequence(n)
+				if n == 0 {
+					continue
+				}
 			}
 			y := line.expectedNs(n)
 			if !found || y < bestY || (y == bestY && cid < bestCid) {

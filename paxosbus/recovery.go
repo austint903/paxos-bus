@@ -370,9 +370,10 @@ func (r *Replica) beginViewChangeLocked(newView uint64) *viewChangeStart {
 	r.viewId.Store(newView)
 	r.status = statusViewChange
 	r.scheduleReady = false
-	r.scheduleAnnouncements = make(map[uint64]BusSyncMessage)
-	r.scheduleWaiters = make(map[uint64]*lockedWriter)
 	r.scheduleInstallActive = false
+	r.scheduleProposal = nil
+	r.scheduleRequests = nil
+	r.scheduleWindowWaiters = nil
 	r.leaderLost = false
 	r.sync = nil
 	r.clearSyncCatchupLocked()
@@ -646,7 +647,11 @@ func mergeSuffix(reports []*BusViewChange) mergePlan {
 			plan.schedule = append([]BusSyncMessage(nil), m.Schedule...)
 			continue
 		}
-		if !schedulesEqual(plan.schedule, m.Schedule) {
+		if schedulePrefix(plan.schedule, m.Schedule) {
+			plan.schedule = append([]BusSyncMessage(nil), m.Schedule...)
+			continue
+		}
+		if !schedulePrefix(m.Schedule, plan.schedule) {
 			plan.scheduleConflict = true
 			break
 		}
@@ -1398,6 +1403,7 @@ func (r *Replica) finishRecoveryIfComplete(rec *viewRecovery) bool {
 	r.cancelViewChangeWatchdogLocked()
 	r.status = statusNormal
 	r.scheduleReady = r.scheduleCompleteForViewLocked(rec.view)
+	r.commitScheduleHistoryLocked()
 	r.lastHeartbeatNs = nowNs()
 	r.leaderLost = false
 	r.recovery = nil
@@ -1500,6 +1506,7 @@ func (r *Replica) publishNormalViewLocked(view uint64) {
 	r.cancelViewChangeWatchdogLocked()
 	r.status = statusNormal
 	r.scheduleReady = r.scheduleCompleteForViewLocked(view)
+	r.commitScheduleHistoryLocked()
 	r.lastHeartbeatNs = nowNs()
 	r.leaderLost = false
 	r.advanceNextExpectedLocked()

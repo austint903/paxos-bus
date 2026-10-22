@@ -221,12 +221,21 @@ InitClientState ==
   /\ vPending    = [ c \in Clients |-> {} ]
   /\ vBusPayload = [ c \in Clients |-> [ n \in BusNums |-> Empty ] ]
 
-vars == << networkVars, replicaVars, clientVars >>
+VARIABLES vScheduleMessages, vScheduleRequests, vSchedulePrepared, vScheduleCommitted
+scheduleVars == << vScheduleMessages, vScheduleRequests, vSchedulePrepared, vScheduleCommitted >>
+InitScheduleState ==
+  /\ vScheduleMessages = {}
+  /\ vScheduleRequests = [n \in BusNums |-> [c \in Clients |-> Empty]]
+  /\ vSchedulePrepared = [r \in Replicas |-> [n \in BusNums |-> Empty]]
+  /\ vScheduleCommitted = [r \in Replicas |-> [n \in BusNums |-> Empty]]
+
+vars == << networkVars, replicaVars, clientVars, scheduleVars >>
 
 \* `^\textbf{Initial state}^'
 Init == /\ InitNetworkState
         /\ InitReplicaState
         /\ InitClientState
+        /\ InitScheduleState
 
 (* `^\textbf{Helpers}^' *)
 
@@ -333,11 +342,103 @@ ClientReboards(c, q) ==
   /\ UNCHANGED << vBusPayload, networkVars, replicaVars >>
 
 
+ScheduleReply(c, n, enabled) ==
+  \E m \in vScheduleMessages : /\ m.mtype = "hsReply"
+                               /\ m.dest = c /\ m.startTime = n
+                               /\ (m.interval > 0) = enabled
+ScheduleAuthorized(c, n) == ScheduleReply(c, n, TRUE)
+ScheduleDisabled(c, n) == ScheduleReply(c, n, FALSE)
+
+HsRequest(c, n, interval) ==
+  /\ vSchedulePrepared[Leader(0)][n] = Empty
+  /\ vScheduleMessages' = vScheduleMessages \cup
+       {[mtype |-> "hsRequest", dest |-> Leader(0), clientID |-> c,
+         startTime |-> n, interval |-> interval]}
+  /\ UNCHANGED << vScheduleRequests, vSchedulePrepared, vScheduleCommitted >>
+
+CollectHsRequest(m) ==
+  /\ vViewID[m.dest] = 0 /\ vReplicaStatus[m.dest] = StNormal
+  /\ vSchedulePrepared[m.dest][m.startTime] = Empty
+  /\ vScheduleRequests' = [vScheduleRequests EXCEPT ![m.startTime][m.clientID] = m.interval]
+  /\ UNCHANGED << vScheduleMessages, vSchedulePrepared, vScheduleCommitted >>
+
+SchdPrepare(n) ==
+  LET r == Leader(0)
+      schedule == vScheduleRequests[n]
+  IN /\ vViewID[r] = 0 /\ vReplicaStatus[r] = StNormal
+     /\ vSchedulePrepared[r][n] = Empty
+     /\ \A c \in Clients : schedule[c] # Empty
+     /\ vSchedulePrepared' = [vSchedulePrepared EXCEPT ![r][n] = schedule]
+     /\ vScheduleMessages' = vScheduleMessages \cup
+          {[mtype |-> "schdPrepare", dest |-> d, replicaID |-> r, viewID |-> 0,
+            hsReqList |-> schedule, startTime |-> n, endTime |-> n + 1] : d \in Replicas}
+     /\ UNCHANGED << vScheduleRequests, vScheduleCommitted >>
+
+SchdPrepareReply(m) ==
+  /\ vViewID[m.dest] = m.viewID /\ vReplicaStatus[m.dest] = StNormal
+  /\ m.replicaID = Leader(m.viewID)
+  /\ vSchedulePrepared[m.dest][m.startTime] \in {Empty, m.hsReqList}
+  /\ vSchedulePrepared' = [vSchedulePrepared EXCEPT ![m.dest][m.startTime] = m.hsReqList]
+  /\ vScheduleMessages' = vScheduleMessages \cup
+       {[mtype |-> "schdPrepareReply", dest |-> m.replicaID, replicaID |-> m.dest,
+         viewID |-> m.viewID, startTime |-> m.startTime, endTime |-> m.endTime]}
+  /\ UNCHANGED << vScheduleRequests, vScheduleCommitted >>
+
+ScheduleVoters(n) ==
+  {m.replicaID : m \in {q \in vScheduleMessages :
+    q.mtype = "schdPrepareReply" /\ q.startTime = n /\ q.viewID = 0}}
+
+SchdCommit(n) ==
+  LET r == Leader(0)
+      schedule == vSchedulePrepared[r][n]
+  IN /\ vViewID[r] = 0 /\ vReplicaStatus[r] = StNormal
+     /\ schedule # Empty /\ ScheduleVoters(n) \in Quorums
+     /\ vScheduleMessages' = vScheduleMessages \cup
+          {[mtype |-> "schdCommit", dest |-> d, replicaID |-> r, viewID |-> 0,
+            startTime |-> n, endTime |-> n + 1] : d \in Replicas} \cup
+          {[mtype |-> "hsReply", dest |-> c, replicaID |-> r, viewID |-> 0,
+            interval |-> schedule[c], startTime |-> n, endTime |-> n + 1] : c \in Clients}
+     /\ UNCHANGED << vScheduleRequests, vSchedulePrepared, vScheduleCommitted >>
+
+InstallSchedule(m) ==
+  /\ vViewID[m.dest] = m.viewID /\ vReplicaStatus[m.dest] = StNormal
+  /\ m.replicaID = Leader(m.viewID)
+  /\ vSchedulePrepared[m.dest][m.startTime] # Empty
+  /\ vScheduleCommitted' = [vScheduleCommitted EXCEPT
+       ![m.dest][m.startTime] = vSchedulePrepared[m.dest][m.startTime]]
+  /\ UNCHANGED << vScheduleMessages, vScheduleRequests, vSchedulePrepared >>
+
+SkipDisabledSlot(r, c, n) ==
+  /\ vScheduleCommitted[r][n] # Empty
+  /\ vScheduleCommitted[r][n][c] = 0
+  /\ vLog[r][BusSlot(c, n)] = Empty
+  /\ vLog' = [vLog EXCEPT ![r][BusSlot(c, n)] = NoOp]
+  /\ UNCHANGED << vNextExpected, vReplicaStatus, vViewID, vLastNormView,
+                  syncVars, vcVars, gapVars, networkVars, clientVars, scheduleVars >>
+
+ScheduleNext ==
+  \/ \E c \in Clients, n \in BusNums, interval \in 0..2 : HsRequest(c, n, interval)
+  \/ \E n \in BusNums : SchdPrepare(n) \/ SchdCommit(n)
+  \/ \E m \in vScheduleMessages :
+       \/ /\ m.mtype = "hsRequest" /\ CollectHsRequest(m)
+       \/ /\ m.mtype = "schdPrepare" /\ SchdPrepareReply(m)
+       \/ /\ m.mtype = "schdCommit" /\ InstallSchedule(m)
+
+ScheduleAgreement ==
+  \A r, s \in Replicas, n \in BusNums :
+    (vScheduleCommitted[r][n] # Empty /\ vScheduleCommitted[s][n] # Empty)
+      => vScheduleCommitted[r][n] = vScheduleCommitted[s][n]
+
+ScheduleQuorum ==
+  \A m \in vScheduleMessages :
+    m.mtype \in {"schdCommit", "hsReply"} => ScheduleVoters(m.startTime) \in Quorums
+
 \* Client c sends bus n
 ClientSendsBus(c, n) ==
   LET bus == BoardingOrder(vPending[c])
   IN /\ vBusPayload[c][n] = Empty
-     /\ \A k \in 1..(n - 1) : vBusPayload[c][k] # Empty \* Every lower number bus departed 
+     /\ ScheduleAuthorized(c, n)
+     /\ \A k \in 1..(n - 1) : vBusPayload[c][k] # Empty \/ ScheduleDisabled(c, k)
      /\ vBusPayload' = [ vBusPayload EXCEPT ![c][n] = bus ]
      /\ vPending'    = [ vPending EXCEPT ![c] = {} ]
      /\ Send({[ mtype  |-> MBus,
@@ -353,6 +454,8 @@ ClientSendsBus(c, n) ==
 \* Replica side handling bus
 HandleBus(r, m) ==
   /\ vLog[r][m.slot] = Empty
+  /\ vScheduleCommitted[r][m.busNum] # Empty
+  /\ vScheduleCommitted[r][m.busNum][m.sender] > 0
   /\ vLog' = [ vLog EXCEPT ![r][m.slot] = m.bus ]
   /\ UNCHANGED << vNextExpected, vReplicaStatus, vViewID, vLastNormView,
                   syncVars, vcVars, gapVars, networkVars, clientVars >>
@@ -828,6 +931,9 @@ SlotCommitted(q, s, v) ==
 
 \* Type correctness invariant
 TypeOK ==
+  /\ vScheduleRequests \in [BusNums -> [Clients -> (0..2) \cup {Empty}]]
+  /\ vSchedulePrepared \in [Replicas -> [BusNums -> [Clients -> 0..2] \cup {Empty}]]
+  /\ vScheduleCommitted \in [Replicas -> [BusNums -> [Clients -> 0..2] \cup {Empty}]]
   /\ \A m \in messages :
        m.mtype \in {MBus, MRequestReply, MGapRequest, MGapReply,
                     MGapCommit, MGapCommitRep, MSyncPrepare, MSyncRep,
@@ -912,7 +1018,7 @@ StablePrefixesAgree ==
 --------------------------------------------------------------------------------
 (* `^\textbf{\large State transitions}^' *)
 
-Next == \* Handle Messages
+ProtocolNext == \* Handle Messages
         \/ \E m \in messages : /\ m.mtype = MBus
                                /\ HandleBus(m.dest, m)
         \/ \E m \in messages : /\ m.mtype = MGapRequest
@@ -952,6 +1058,10 @@ Next == \* Handle Messages
         \/ \E r \in Replicas : StartSync(r)
         \* Failure case: real leader failure, or a false suspicion
         \/ \E r \in Replicas : StartViewChange(r)
+
+Next == \/ (ProtocolNext /\ UNCHANGED scheduleVars)
+        \/ (ScheduleNext /\ UNCHANGED << networkVars, replicaVars, clientVars >>)
+        \/ \E r \in Replicas, c \in Clients, n \in BusNums : SkipDisabledSlot(r, c, n)
 
 ReplicaOrderValue == <<"r0", "r1", "r2">>
 ClientOrderValue  == <<"c0", "c1">>

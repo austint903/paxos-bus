@@ -57,6 +57,7 @@ PORT="${PAXOSBUS_PORT:-}"
 GCP_GOARCH="${GCP_GOARCH:-}"
 GEN_INTERVAL_US="${GEN_INTERVAL_US:-${REQUEST_INTERVAL_US:-500}}"
 INTERVAL_MS="${INTERVAL_MS:-${BUS_INTERVAL_MS:-1}}"
+SCHEDULE_WINDOW_MS="${SCHEDULE_WINDOW_MS:-10000}"
 DURATION_S="${DURATION_S:-60}"
 CLIENTS_PER_REGION="${CLIENTS_PER_REGION:-2}"
 START_DELAY_MS="${START_DELAY_MS:-10000}"
@@ -97,6 +98,7 @@ Usage: $0 [run|setup|list] [options]
 Workload:
   -g, --request-interval-us US    Request generation interval (default: 500)
   -p, --bus-interval-ms MS        Bus generation interval (default: 1)
+      --schedule-window-ms MS   Schedule reconfiguration window (default: 10000)
   -d, --duration-s SECONDS        Data-phase duration (default: 60)
   -c, --clients-per-region N      Clients on each of 4 region VMs (default: 2)
       --start-delay-ms MS         Client sync-to-data delay (default: 10000)
@@ -163,6 +165,9 @@ while [[ $# -gt 0 ]]; do
         -p|--bus-interval-ms)
             need_arg "$1" "${2:-}"; INTERVAL_MS="$2"; shift ;;
         --bus-interval-ms=*) INTERVAL_MS="${1#*=}" ;;
+        --schedule-window-ms)
+            need_arg "$1" "${2:-}"; SCHEDULE_WINDOW_MS="$2"; shift ;;
+        --schedule-window-ms=*) SCHEDULE_WINDOW_MS="${1#*=}" ;;
         -d|--duration-s)
             need_arg "$1" "${2:-}"; DURATION_S="$2"; shift ;;
         --duration-s=*) DURATION_S="${1#*=}" ;;
@@ -248,6 +253,7 @@ done
 
 require_uint request-interval-us "$GEN_INTERVAL_US"
 require_uint bus-interval-ms "$INTERVAL_MS"
+require_uint schedule-window-ms "$SCHEDULE_WINDOW_MS"
 require_uint duration-s "$DURATION_S"
 require_uint clients-per-region "$CLIENTS_PER_REGION"
 require_uint start-delay-ms "$START_DELAY_MS"
@@ -382,11 +388,16 @@ scp_to_dir() {
 
 scp_from() {
     local instance="$1" zone="$2" remote_path="$3" local_path="$4"
-    gcloud compute scp "${instance}:${remote_path}" "$local_path" \
-        --tunnel-through-iap \
-        --zone="$zone" \
-        --project="$PROJECT_ID" \
-        --quiet
+    local attempt
+    for attempt in 1 2 3; do
+        if gcloud compute scp "${instance}:${remote_path}" "${local_path}.partial" \
+            --tunnel-through-iap --zone="$zone" --project="$PROJECT_ID" --compress --quiet; then
+            mv "${local_path}.partial" "$local_path"
+            return 0
+        fi
+        rm -f "${local_path}.partial"
+    done
+    return 1
 }
 
 ensure_running() {
@@ -446,6 +457,7 @@ prepare_artifacts() {
     {
         echo "f 1"
         echo "clients $((4 * CLIENTS_PER_REGION))"
+        echo "schedule-window-ms $SCHEDULE_WINDOW_MS"
         echo "replica ${REGION_IPS[0]}:$PORT"
         echo "replica ${REGION_IPS[1]}:$PORT"
         echo "replica ${REGION_IPS[3]}:$PORT"
@@ -554,6 +566,7 @@ initialize_run_dir() {
         echo "total_clients=$((4 * CLIENTS_PER_REGION))"
         echo "clients_per_region=$CLIENTS_PER_REGION"
         echo "start_delay_ms=$START_DELAY_MS"
+        echo "schedule_window_ms=$SCHEDULE_WINDOW_MS"
         echo "resend_ms=$RESEND_MS"
         echo "failure_at_s=$([[ "$SCENARIO" == failure ]] && echo "$FAILURE_AT_S" || echo 0)"
         echo "kill_leader_at_s=$([[ "$SCENARIO" == failure ]] && echo "$FAILURE_AT_S" || echo 0)"
@@ -669,7 +682,7 @@ launch_clients() {
 }
 
 schedule_leader_failure() {
-    local wait_s=$(((START_DELAY_MS + 999) / 1000 + FAILURE_AT_S))
+    local wait_s=$(((2 * SCHEDULE_WINDOW_MS + 999) / 1000 + FAILURE_AT_S))
     (
         sleep "$wait_s"
         local output remote_ts
@@ -692,7 +705,7 @@ schedule_leader_failure() {
 }
 
 tail_for_run() {
-    local warmup_s=$(((START_DELAY_MS + 999) / 1000))
+    local warmup_s=$(((2 * SCHEDULE_WINDOW_MS + 999) / 1000))
     local run_for=$((warmup_s + DURATION_S + 6))
     local region_idx ridx first_id pid
     local tail_pids=()
@@ -706,13 +719,13 @@ tail_for_run() {
     for region_idx in 0 1 3; do
         ridx="$(replica_index_for_region "$region_idx")"
         ssh_to "${REGION_VMS[$region_idx]}" "${REGION_ZONES[$region_idx]}" \
-            "tail -n +1 -F /tmp/paxosbus-replica-$ridx.log | sed -u 's/^/[r$ridx] /'" &
+            "tail -n +1 -F /tmp/paxosbus-replica-$ridx.log | grep --line-buffered -E '1s:|SUSPECT|VIEW|PANIC' | sed -u 's/^/[r$ridx] /'" &
         tail_pids+=($!)
     done
     for region_idx in 0 1 2 3; do
         first_id=$((region_idx * CLIENTS_PER_REGION + 1))
         ssh_to "${REGION_VMS[$region_idx]}" "${REGION_ZONES[$region_idx]}" \
-            "tail -n +1 -F /tmp/paxosbus-client-$first_id.log | sed -u 's/^/[c$first_id] /'" &
+            "tail -n +1 -F /tmp/paxosbus-client-$first_id.log | grep --line-buffered -E '1s:|data phase|CLIENT-PAUSE|PANIC' | sed -u 's/^/[c$first_id] /'" &
         tail_pids+=($!)
     done
     LOCAL_BG_PIDS+=("${tail_pids[@]}")
@@ -772,7 +785,8 @@ collect_logs() {
     if [[ "$got" == "$want" ]]; then
         echo "  collected $got/$want log files into $RUN_LOG_DIR"
     else
-        echo "  WARN: collected only $got/$want log files into $RUN_LOG_DIR" >&2
+        LOGS_COLLECTED=1
+        die "collected only $got/$want log files into $RUN_LOG_DIR"
     fi
 
     LOGS_COLLECTED=1
