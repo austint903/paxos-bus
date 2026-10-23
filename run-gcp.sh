@@ -635,7 +635,7 @@ launch_clients() {
     echo "==> Launching $total clients ($CLIENTS_PER_REGION per region; one process per VM)"
     local node_idx ids pid pause_args start_args="" rc=0
     local pids=()
-    SCHEDULE_START_NS="$(python3 -c 'import sys,time; w=int(sys.argv[1])*1000000; print((time.time_ns()//w+4)*w)' "$SCHEDULE_WINDOW_MS")"
+    SCHEDULE_START_NS="$(python3 -c 'import sys,time; w=int(sys.argv[1])*1000000; print((time.time_ns()//w+max(4,(30000000000+w-1)//w+1))*w)' "$SCHEDULE_WINDOW_MS")"
     start_args="-schedule-start-ns $SCHEDULE_START_NS"
     echo "schedule_start_ns=$SCHEDULE_START_NS" >> "$RUN_LOG_DIR/run-meta.txt"
     for node_idx in "${!NODE_VMS[@]}"; do
