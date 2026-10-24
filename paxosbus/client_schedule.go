@@ -98,10 +98,8 @@ func (c *Client) scheduleLoop() {
 		connected := true
 		for connected {
 			now := wallNs()
-			target := scheduleTarget(now, window)
-			c.scheduleMu.Lock()
-			interval := c.desiredInterval
-			c.scheduleMu.Unlock()
+			target := c.scheduleRequestTarget(now)
+			interval := c.scheduleInterval(target)
 			requests[target] = HsRequest{ClientId: c.clientId, StartTime: target, IntervalMs: interval}
 			for start, req := range requests {
 				if start+uint64(window) <= uint64(now) {
@@ -179,31 +177,45 @@ func (c *Client) generationEnabled() bool {
 	return ok && m.IntervalMs > 0 && c.scheduleViewAllowed(m.ViewId)
 }
 
+func (c *Client) nextBusArrival(now, last uint64) (uint64, bool) {
+	c.scheduleMu.Lock()
+	defer c.scheduleMu.Unlock()
+	var next uint64
+	found := false
+	for start, m := range c.windows {
+		if start > now {
+			continue
+		}
+		if m.IntervalMs == 0 || !c.scheduleViewAllowed(m.ViewId) {
+			if m.EndTime <= now {
+				delete(c.windows, start)
+			}
+			continue
+		}
+		arrival := start
+		if last >= start {
+			step := m.IntervalMs * 1_000_000
+			arrival += ((last-start)/step + 1) * step
+		}
+		if arrival >= m.EndTime {
+			if m.EndTime <= now {
+				delete(c.windows, start)
+			}
+			continue
+		}
+		if !found || arrival < next {
+			next, found = arrival, true
+		}
+	}
+	return next, found
+}
+
 func (c *Client) busLoop() {
-	window := uint64(c.config.ScheduleWindow())
 	var lastArrival uint64
 	lastStats := wallNs()
 	for {
-		now := wallNs() + c.maxOwdNs
-		start := uint64(now) / window * window
-		c.scheduleMu.Lock()
-		m, ok := c.windows[start]
-		for old := range c.windows {
-			if old+window < start {
-				delete(c.windows, old)
-			}
-		}
-		c.scheduleMu.Unlock()
-		if !ok || m.IntervalMs == 0 || !c.scheduleViewAllowed(m.ViewId) {
-			time.Sleep(time.Millisecond)
-			continue
-		}
-		step := m.IntervalMs * 1_000_000
-		next := m.StartTime
-		if lastArrival >= next {
-			next = m.StartTime + ((lastArrival-m.StartTime)/step+1)*step
-		}
-		if next >= m.EndTime {
+		next, ok := c.nextBusArrival(uint64(wallNs()+c.maxOwdNs), lastArrival)
+		if !ok {
 			time.Sleep(time.Millisecond)
 			continue
 		}
