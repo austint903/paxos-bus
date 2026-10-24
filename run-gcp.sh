@@ -1,43 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# PaxosBus WAN runner for the four GCP region VMs.
-#
-# This script runs on the operator's laptop. Every management connection uses:
-#
-#   gcloud compute ssh <INSTANCE_NAME> --tunnel-through-iap \
-#     --zone=<ZONE> --project=<PROJECT_ID>
-#
-# Project ID, VM names/zones, protocol port, and VM architecture are loaded
-# from .env next to this script (override with PAXOSBUS_GCP_ENV_FILE). PaxosBus
-# traffic itself uses the VMs' internal VPC addresses. There is no controller/
-# jump VM. The configured regional topology is:
-#
-#   US             replica 0 (initial leader) + clients
-#   Europe         replica 1                  + clients
-#   Asia                                      + clients
-#   South America  replica 2                  + clients
-#
-# By default, two clients run in each region (8 total). Client IDs are globally
-# unique and assigned in the region order above. Only the four VMs named in
-# .env are used, so unrelated VMs such as pb-test and pb-test2 are never touched.
-# Binaries are built from the current local checkout and copied to all four VMs,
-# so a run measures the code that invoked this script.
-#
-# Examples:
-#   ./run-gcp.sh
-#   ./run-gcp.sh --clients-per-region 4 --request-interval-us 250
-#   ./run-gcp.sh --bus-interval-ms 2 --duration-s 120
-#   ./run-gcp.sh --failure --failure-at-s 20 --detection-time-ms 2000
-#   ./run-gcp.sh list                    # inventory only; never starts VMs
-#   ./run-gcp.sh --dry-run               # print topology/options; never starts VMs
-#   ./run-gcp.sh setup                   # start, build, and deploy; do not run
-#
-# Existing environment names used by run-cloudlab.sh remain supported:
-#   GEN_INTERVAL_US INTERVAL_MS DURATION_S CLIENTS_PER_REGION START_DELAY_MS
-#   RESEND_MS DROP_MODE DROP_EVERY GAP_RETRY_TIMEOUT_MS KILL_LEADER_AT_S
-#   COLLECT_DURABLE RUN_TAG
-
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ENV_FILE="${PAXOSBUS_GCP_ENV_FILE:-$SCRIPT_DIR/.env}"
 if [[ ! -f "$ENV_FILE" ]]; then
@@ -57,8 +20,11 @@ PORT="${PAXOSBUS_PORT:-}"
 GCP_GOARCH="${GCP_GOARCH:-}"
 GEN_INTERVAL_US="${GEN_INTERVAL_US:-${REQUEST_INTERVAL_US:-500}}"
 INTERVAL_MS="${INTERVAL_MS:-${BUS_INTERVAL_MS:-1}}"
+COMMAND_SIZE="${COMMAND_SIZE:-16}"
 SCHEDULE_WINDOW_MS="${SCHEDULE_WINDOW_MS:-10000}"
 DURATION_S="${DURATION_S:-60}"
+PAUSE_WINDOW_AFTER_S="${PAUSE_WINDOW_AFTER_S:-0}"
+SCHEDULE_START_NS=0
 CLIENTS_PER_REGION="${CLIENTS_PER_REGION:-2}"
 START_DELAY_MS="${START_DELAY_MS:-10000}"
 RESEND_MS="${RESEND_MS:-2000}"
@@ -98,9 +64,11 @@ Usage: $0 [run|setup|list] [options]
 Workload:
   -g, --request-interval-us US    Request generation interval (default: 500)
   -p, --bus-interval-ms MS        Bus generation interval (default: 1)
+      --command-size BYTES       Request payload bytes (default: 16)
       --schedule-window-ms MS   Schedule reconfiguration window (default: 10000)
+      --pause-window-after-s S   Pause clients 2,4,6,8 for one window after S active seconds
   -d, --duration-s SECONDS        Data-phase duration (default: 60)
-  -c, --clients-per-region N      Clients on each of 4 region VMs (default: 2)
+  -c, --clients-per-region N      Dedicated clients per region (must be 2)
       --start-delay-ms MS         Client sync-to-data delay (default: 10000)
   -t, --resend-ms MS              Client no-quorum resend timeout (default: 2000)
 
@@ -122,7 +90,7 @@ Gap/recovery and output:
       --retain-mb MB              In-memory request-payload cap (default: 256)
       --collect-durable           Copy durable replica logs (can be very large)
       --no-collect-durable        Do not copy durable logs (default)
-      --stop-vms                  Stop all 4 VMs after a run (default)
+      --stop-vms                  Stop all 11 VMs after a run (default)
       --keep-vms-running          Leave VMs running after a run
       --run-tag TAG               Append a safe tag to the run directory
 
@@ -136,14 +104,14 @@ GCP/control:
 Subcommands:
   run    Start/deploy/run/collect (default)
   setup  Start and deploy binaries/config only
-  list   Show the four discovered experiment VMs; start nothing
+  list   Show the eleven discovered experiment VMs; start nothing
 
 Project configuration:
   $ENV_FILE
   Set PAXOSBUS_GCP_ENV_FILE to load a different file.
 
 Run logs are copied to:
-  paxosbus/logs/gcp/gcp-run-YYYYMMDD-HHMMSS[-TAG]/
+  <main-checkout>/paxosbus/logs/gcp-paxosbus/reconfig/gcp-run-YYYYMMDD-HHMMSS[-TAG]/
 EOF
 }
 
@@ -165,9 +133,13 @@ while [[ $# -gt 0 ]]; do
         -p|--bus-interval-ms)
             need_arg "$1" "${2:-}"; INTERVAL_MS="$2"; shift ;;
         --bus-interval-ms=*) INTERVAL_MS="${1#*=}" ;;
+        --command-size)
+            need_arg "$1" "${2:-}"; COMMAND_SIZE="$2"; shift ;;
         --schedule-window-ms)
             need_arg "$1" "${2:-}"; SCHEDULE_WINDOW_MS="$2"; shift ;;
         --schedule-window-ms=*) SCHEDULE_WINDOW_MS="${1#*=}" ;;
+        --pause-window-after-s)
+            need_arg "$1" "${2:-}"; PAUSE_WINDOW_AFTER_S="$2"; shift ;;
         -d|--duration-s)
             need_arg "$1" "${2:-}"; DURATION_S="$2"; shift ;;
         --duration-s=*) DURATION_S="${1#*=}" ;;
@@ -244,18 +216,25 @@ require_uint() {
     fi
 }
 
-for config_var in PROJECT_ID PORT GCP_US_VM GCP_US_ZONE \
-                  GCP_EUROPE_VM GCP_EUROPE_ZONE GCP_ASIA_VM GCP_ASIA_ZONE \
-                  GCP_SOUTHAMERICA_VM GCP_SOUTHAMERICA_ZONE GCP_GOARCH; do
+for config_var in PROJECT_ID PORT GCP_US_REPLICA_VM GCP_US_ZONE \
+                  GCP_EUROPE_REPLICA_VM GCP_EUROPE_ZONE GCP_ASIA_ZONE \
+                  GCP_SOUTHAMERICA_REPLICA_VM GCP_SOUTHAMERICA_ZONE GCP_GOARCH \
+                  GCP_US_CLIENT0_VM GCP_US_CLIENT1_VM GCP_EUROPE_CLIENT0_VM GCP_EUROPE_CLIENT1_VM \
+                  GCP_ASIA_CLIENT0_VM GCP_ASIA_CLIENT1_VM GCP_SOUTHAMERICA_CLIENT0_VM GCP_SOUTHAMERICA_CLIENT1_VM; do
     [[ -n "${!config_var:-}" ]] || \
         die "$config_var must be set in $ENV_FILE"
 done
 
 require_uint request-interval-us "$GEN_INTERVAL_US"
 require_uint bus-interval-ms "$INTERVAL_MS"
+require_uint command-size "$COMMAND_SIZE"
+((COMMAND_SIZE <= 4294967295)) || die "command-size exceeds uint32"
 require_uint schedule-window-ms "$SCHEDULE_WINDOW_MS"
 require_uint duration-s "$DURATION_S"
+require_uint pause-window-after-s "$PAUSE_WINDOW_AFTER_S" 1
+((PAUSE_WINDOW_AFTER_S == 0 || (PAUSE_WINDOW_AFTER_S * 1000 % SCHEDULE_WINDOW_MS == 0 && DURATION_S * 1000 > PAUSE_WINDOW_AFTER_S * 1000 + SCHEDULE_WINDOW_MS))) || die "pause must align with a schedule window and leave time to resume"
 require_uint clients-per-region "$CLIENTS_PER_REGION"
+[[ "$CLIENTS_PER_REGION" == 2 ]] || die "dedicated topology requires two client VMs per region"
 require_uint start-delay-ms "$START_DELAY_MS"
 require_uint resend-ms "$RESEND_MS" 1
 require_uint failure-at-s "$FAILURE_AT_S" 1
@@ -296,66 +275,65 @@ fi
 
 command -v gcloud >/dev/null 2>&1 || die "gcloud is not installed or not on PATH"
 
-# Region order controls the globally unique client ID ranges.
-REGION_KEYS=(us europe asia southamerica)
-REGION_VMS=("$GCP_US_VM" "$GCP_EUROPE_VM" "$GCP_ASIA_VM" "$GCP_SOUTHAMERICA_VM")
-REGION_ZONES=("$GCP_US_ZONE" "$GCP_EUROPE_ZONE" "$GCP_ASIA_ZONE" "$GCP_SOUTHAMERICA_ZONE")
-REGION_LABELS=("${GCP_US_ZONE%-*}" "${GCP_EUROPE_ZONE%-*}" \
-               "${GCP_ASIA_ZONE%-*}" "${GCP_SOUTHAMERICA_ZONE%-*}")
-REGION_STATUSES=("" "" "" "")
-REGION_IPS=("" "" "" "")
+NODE_KEYS=(replica0 replica1 replica2 client1 client2 client3 client4 client5 client6 client7 client8)
+NODE_VMS=("$GCP_US_REPLICA_VM" "$GCP_EUROPE_REPLICA_VM" "$GCP_SOUTHAMERICA_REPLICA_VM"
+    "$GCP_US_CLIENT0_VM" "$GCP_US_CLIENT1_VM" "$GCP_EUROPE_CLIENT0_VM" "$GCP_EUROPE_CLIENT1_VM"
+    "$GCP_ASIA_CLIENT0_VM" "$GCP_ASIA_CLIENT1_VM" "$GCP_SOUTHAMERICA_CLIENT0_VM" "$GCP_SOUTHAMERICA_CLIENT1_VM")
+NODE_ZONES=("$GCP_US_ZONE" "$GCP_EUROPE_ZONE" "$GCP_SOUTHAMERICA_ZONE"
+    "$GCP_US_ZONE" "$GCP_US_ZONE" "$GCP_EUROPE_ZONE" "$GCP_EUROPE_ZONE"
+    "$GCP_ASIA_ZONE" "$GCP_ASIA_ZONE" "$GCP_SOUTHAMERICA_ZONE" "${GCP_SOUTHAMERICA_CLIENT1_ZONE:-$GCP_SOUTHAMERICA_ZONE}")
+NODE_LABELS=()
+NODE_STATUSES=()
+NODE_IPS=()
+for idx in "${!NODE_VMS[@]}"; do
+    NODE_LABELS+=("${NODE_ZONES[$idx]%-*}")
+    for ((previous=0; previous<idx; previous++)); do
+        [[ "${NODE_VMS[$idx]}" != "${NODE_VMS[$previous]}" ]] || die "each process requires a separate VM"
+    done
+    [[ "${NODE_VMS[$idx]}" =~ ^[a-z][-a-z0-9]*$ ]] || die "invalid VM name"
+done
 
 discover_instances() {
     echo "==> Loading configured GCP instances from $ENV_FILE"
     local idx details status ip
-    for idx in 0 1 2 3; do
-        details="$(gcloud compute instances describe "${REGION_VMS[$idx]}" \
-            --zone="${REGION_ZONES[$idx]}" \
+    for idx in "${!NODE_VMS[@]}"; do
+        details="$(gcloud compute instances describe "${NODE_VMS[$idx]}" \
+            --zone="${NODE_ZONES[$idx]}" \
             --project="$PROJECT_ID" \
             --format="value(status,networkInterfaces[0].networkIP)")" \
-            || die "could not describe ${REGION_VMS[$idx]} in ${REGION_ZONES[$idx]}"
+            || die "could not describe ${NODE_VMS[$idx]} in ${NODE_ZONES[$idx]}"
         read -r status ip <<< "$details"
-        [[ -n "$status" ]] || die "${REGION_VMS[$idx]} returned no status"
-        [[ -n "$ip" ]] || die "${REGION_VMS[$idx]} has no internal IP"
-        REGION_STATUSES[$idx]="$status"
-        REGION_IPS[$idx]="$ip"
+        [[ -n "$status" ]] || die "${NODE_VMS[$idx]} returned no status"
+        [[ -n "$ip" ]] || die "${NODE_VMS[$idx]} has no internal IP"
+        NODE_STATUSES[$idx]="$status"
+        NODE_IPS[$idx]="$ip"
     done
 }
 
-client_ids_for_region() {
-    local region_idx="$1" first last id
-    first=$((region_idx * CLIENTS_PER_REGION + 1))
-    last=$(((region_idx + 1) * CLIENTS_PER_REGION))
-    for ((id = first; id <= last; id++)); do
-        printf '%s ' "$id"
-    done
+client_ids_for_node() {
+    if (($1 >= 3)); then echo $(($1 - 2)); fi
 }
 
-replica_index_for_region() {
-    case "$1" in
-        0) echo 0 ;;
-        1) echo 1 ;;
-        3) echo 2 ;;
-        *) return 1 ;;
-    esac
+replica_index_for_node() {
+    if (($1 < 3)); then echo "$1"; else return 1; fi
 }
 
 print_topology() {
     local idx ridx role ids
     echo "==> GCP topology"
-    for idx in 0 1 2 3; do
-        ids="$(client_ids_for_region "$idx")"
-        if ridx="$(replica_index_for_region "$idx")"; then
-            role="replica $ridx + clients $ids"
-            [[ "$ridx" == 0 ]] && role="replica 0 (leader) + clients $ids"
+    for idx in "${!NODE_VMS[@]}"; do
+        ids="$(client_ids_for_node "$idx")"
+        if ridx="$(replica_index_for_node "$idx")"; then
+            role="replica $ridx"
+            [[ "$ridx" == 0 ]] && role="replica 0 (leader)"
         else
             role="clients $ids(no replica)"
         fi
         printf "  %-14s %-24s %-22s %-10s %s  %s\n" \
-            "${REGION_KEYS[$idx]}" "${REGION_VMS[$idx]}" "${REGION_ZONES[$idx]}" \
-            "${REGION_STATUSES[$idx]}" "${REGION_IPS[$idx]}" "$role"
+            "${NODE_KEYS[$idx]}" "${NODE_VMS[$idx]}" "${NODE_ZONES[$idx]}" \
+            "${NODE_STATUSES[$idx]}" "${NODE_IPS[$idx]}" "$role"
     done
-    echo "  total: $((4 * CLIENTS_PER_REGION)) clients, 3 replicas"
+    echo "  total: 11 VMs, 8 clients, 3 replicas"
     echo "  load: request=${GEN_INTERVAL_US}us bus=${INTERVAL_MS}ms duration=${DURATION_S}s"
     if [[ "$SCENARIO" == "failure" ]]; then
         echo "  scenario: kill leader at +${FAILURE_AT_S}s; detection timeout=${SUSPECT_TIMEOUT_MS}ms"
@@ -391,7 +369,7 @@ scp_from() {
     local attempt
     for attempt in 1 2 3; do
         if gcloud compute scp "${instance}:${remote_path}" "${local_path}.partial" \
-            --tunnel-through-iap --zone="$zone" --project="$PROJECT_ID" --compress --quiet; then
+            --tunnel-through-iap --zone="$zone" --project="$PROJECT_ID" --compress --scp-flag=-oServerAliveInterval=15 --scp-flag=-oServerAliveCountMax=3 --quiet; then
             mv "${local_path}.partial" "$local_path"
             return 0
         fi
@@ -403,14 +381,14 @@ scp_from() {
 ensure_running() {
     local idx pid rc=0
     local pids=()
-    for idx in 0 1 2 3; do
-        [[ "${REGION_STATUSES[$idx]}" == "RUNNING" ]] && continue
+    for idx in "${!NODE_VMS[@]}"; do
+        [[ "${NODE_STATUSES[$idx]}" == "RUNNING" ]] && continue
         if [[ "$AUTO_START" == 0 ]]; then
-            die "${REGION_VMS[$idx]} is ${REGION_STATUSES[$idx]}; start it or omit --no-start"
+            die "${NODE_VMS[$idx]} is ${NODE_STATUSES[$idx]}; start it or omit --no-start"
         fi
-        echo "  starting ${REGION_VMS[$idx]} (${REGION_ZONES[$idx]})"
-        gcloud compute instances start "${REGION_VMS[$idx]}" \
-            --zone="${REGION_ZONES[$idx]}" --project="$PROJECT_ID" --quiet &
+        echo "  starting ${NODE_VMS[$idx]} (${NODE_ZONES[$idx]})"
+        gcloud compute instances start "${NODE_VMS[$idx]}" \
+            --zone="${NODE_ZONES[$idx]}" --project="$PROJECT_ID" --quiet &
         pids+=($!)
     done
     if ((${#pids[@]})); then
@@ -418,18 +396,18 @@ ensure_running() {
     fi
     [[ "$rc" == 0 ]] || die "at least one VM failed to start"
 
-    echo "==> Waiting for IAP SSH on all four VMs"
-    for idx in 0 1 2 3; do
+    echo "==> Waiting for IAP SSH on all eleven VMs"
+    for idx in "${!NODE_VMS[@]}"; do
         local attempt ready=0
         for attempt in $(seq 1 24); do
-            if ssh_to "${REGION_VMS[$idx]}" "${REGION_ZONES[$idx]}" "true" >/dev/null 2>&1; then
+            if ssh_to "${NODE_VMS[$idx]}" "${NODE_ZONES[$idx]}" "true" >/dev/null 2>&1; then
                 ready=1
                 break
             fi
             sleep 5
         done
-        [[ "$ready" == 1 ]] || die "IAP SSH did not become ready on ${REGION_VMS[$idx]}"
-        echo "  ${REGION_VMS[$idx]} ready"
+        [[ "$ready" == 1 ]] || die "IAP SSH did not become ready on ${NODE_VMS[$idx]}"
+        echo "  ${NODE_VMS[$idx]} ready"
     done
 }
 
@@ -458,9 +436,9 @@ prepare_artifacts() {
         echo "f 1"
         echo "clients $((4 * CLIENTS_PER_REGION))"
         echo "schedule-window-ms $SCHEDULE_WINDOW_MS"
-        echo "replica ${REGION_IPS[0]}:$PORT"
-        echo "replica ${REGION_IPS[1]}:$PORT"
-        echo "replica ${REGION_IPS[3]}:$PORT"
+        echo "replica ${NODE_IPS[0]}:$PORT"
+        echo "replica ${NODE_IPS[1]}:$PORT"
+        echo "replica ${NODE_IPS[2]}:$PORT"
     } > "$LOCAL_CONF"
     echo "==> paxosbus.conf (internal VPC transport)"
     sed 's/^/  /' "$LOCAL_CONF"
@@ -470,17 +448,17 @@ deploy_artifacts() {
     echo "==> Deploying binaries + config over IAP"
     local idx pid rc=0
     local pids=()
-    for idx in 0 1 2 3; do
-        ssh_to "${REGION_VMS[$idx]}" "${REGION_ZONES[$idx]}" \
+    for idx in "${!NODE_VMS[@]}"; do
+        ssh_to "${NODE_VMS[$idx]}" "${NODE_ZONES[$idx]}" \
             "mkdir -p ~/$REMOTE_DIR" >/dev/null
     done
-    for idx in 0 1 2 3; do
+    for idx in "${!NODE_VMS[@]}"; do
         {
-            scp_to_dir "${REGION_VMS[$idx]}" "${REGION_ZONES[$idx]}" \
+            scp_to_dir "${NODE_VMS[$idx]}" "${NODE_ZONES[$idx]}" \
                 "$LOCAL_REPLICA" "$LOCAL_CLIENT" "$LOCAL_CONF"
-            ssh_to "${REGION_VMS[$idx]}" "${REGION_ZONES[$idx]}" \
+            ssh_to "${NODE_VMS[$idx]}" "${NODE_ZONES[$idx]}" \
                 "chmod +x ~/$REMOTE_DIR/paxosbus-replica ~/$REMOTE_DIR/paxosbus-client; cp ~/$REMOTE_DIR/paxosbus.conf $REMOTE_CONF"
-            echo "  deployed ${REGION_VMS[$idx]}"
+            echo "  deployed ${NODE_VMS[$idx]}"
         } &
         pids+=($!)
     done
@@ -502,8 +480,8 @@ stop_remote() {
     echo "==> Stopping replicas and clients (logs kept on the VMs)"
     local idx pid
     local pids=()
-    for idx in 0 1 2 3; do
-        ssh_to "${REGION_VMS[$idx]}" "${REGION_ZONES[$idx]}" \
+    for idx in "${!NODE_VMS[@]}"; do
+        ssh_to "${NODE_VMS[$idx]}" "${NODE_ZONES[$idx]}" \
             "pkill -f '[p]axosbus-replica' 2>/dev/null || true; pkill -f '[p]axosbus-client' 2>/dev/null || true" \
             >/dev/null 2>&1 &
         pids+=($!)
@@ -513,12 +491,12 @@ stop_remote() {
 }
 
 stop_configured_vms() {
-    echo "==> Stopping all four configured GCP VMs"
+    echo "==> Stopping all eleven configured GCP VMs"
     local idx pid rc=0
     local pids=()
-    for idx in 0 1 2 3; do
-        gcloud compute instances stop "${REGION_VMS[$idx]}" \
-            --zone="${REGION_ZONES[$idx]}" \
+    for idx in "${!NODE_VMS[@]}"; do
+        gcloud compute instances stop "${NODE_VMS[$idx]}" \
+            --zone="${NODE_ZONES[$idx]}" \
             --project="$PROJECT_ID" \
             --quiet &
         pids+=($!)
@@ -535,11 +513,13 @@ stop_configured_vms() {
 }
 
 initialize_run_dir() {
-    local name ts git_dirty git_commit
+    local name ts git_dirty git_commit main_dir
     ts="$(date +%Y%m%d-%H%M%S)"
     name="gcp-run-$ts"
     [[ -n "$RUN_TAG" ]] && name="$name-$RUN_TAG"
-    RUN_LOG_DIR="$SCRIPT_DIR/paxosbus/logs/gcp/$name"
+    main_dir="$(dirname "$(git -C "$SCRIPT_DIR" rev-parse --path-format=absolute --git-common-dir)")"
+    [[ "$main_dir/" != */.codex/* ]] || die "experiment logs must be outside .codex"
+    RUN_LOG_DIR="$main_dir/paxosbus/logs/gcp-paxosbus/reconfig/$name"
     mkdir -p "$RUN_LOG_DIR"
     KILL_INFO_FILE="$RUN_LOG_DIR/kill-info.txt"
     RUN_ACTIVE=1
@@ -561,8 +541,11 @@ initialize_run_dir() {
         echo "ssh_transport=iap"
         echo "scenario=$SCENARIO"
         echo "interval_ms=$INTERVAL_MS"
+        echo "command_size=$COMMAND_SIZE"
         echo "gen_interval_us=$GEN_INTERVAL_US"
         echo "duration_s=$DURATION_S"
+        echo "pause_window_after_s=$PAUSE_WINDOW_AFTER_S"
+        echo "pause_client_ids=2,4,6,8"
         echo "total_clients=$((4 * CLIENTS_PER_REGION))"
         echo "clients_per_region=$CLIENTS_PER_REGION"
         echo "start_delay_ms=$START_DELAY_MS"
@@ -582,15 +565,15 @@ initialize_run_dir() {
         echo "collect_durable=$COLLECT_DURABLE"
         echo "stop_vms_after_run=$STOP_VMS_AFTER_RUN"
         echo "leader_idx=0"
-        echo "leader_label=${REGION_LABELS[0]}"
+        echo "leader_label=${NODE_LABELS[0]}"
         local idx
-        for idx in 0 1 2 3; do
-            echo "region_${REGION_KEYS[$idx]}_vm=${REGION_VMS[$idx]}"
-            echo "region_${REGION_KEYS[$idx]}_zone=${REGION_ZONES[$idx]}"
-            echo "region_${REGION_KEYS[$idx]}_ip=${REGION_IPS[$idx]}"
-            echo "region_${REGION_KEYS[$idx]}_client_ids=$(client_ids_for_region "$idx")"
+        for idx in "${!NODE_VMS[@]}"; do
+            echo "region_${NODE_KEYS[$idx]}_vm=${NODE_VMS[$idx]}"
+            echo "region_${NODE_KEYS[$idx]}_zone=${NODE_ZONES[$idx]}"
+            echo "region_${NODE_KEYS[$idx]}_ip=${NODE_IPS[$idx]}"
+            echo "region_${NODE_KEYS[$idx]}_client_ids=$(client_ids_for_node "$idx")"
         done
-        echo "replicas=${REGION_LABELS[0]} ${REGION_LABELS[1]} ${REGION_LABELS[3]}"
+        echo "replicas=${NODE_LABELS[0]} ${NODE_LABELS[1]} ${NODE_LABELS[2]}"
         if [[ "$DROP_MODE" != "none" && "$DROP_EVERY" != "0" ]]; then
             echo "mode=drop-$DROP_MODE"
         else
@@ -604,8 +587,8 @@ kill_stale_processes() {
     echo "==> Killing stale PaxosBus processes on all VMs"
     local idx pid
     local pids=()
-    for idx in 0 1 2 3; do
-        ssh_to "${REGION_VMS[$idx]}" "${REGION_ZONES[$idx]}" \
+    for idx in "${!NODE_VMS[@]}"; do
+        ssh_to "${NODE_VMS[$idx]}" "${NODE_ZONES[$idx]}" \
             "pkill -f '[p]axosbus-replica' 2>/dev/null || true; pkill -f '[p]axosbus-client' 2>/dev/null || true" &
         pids+=($!)
     done
@@ -614,16 +597,16 @@ kill_stale_processes() {
 
 launch_replicas() {
     echo "==> Launching 3 replicas (US leader, Europe, South America)"
-    local region_idx ridx pid rc=0
+    local node_idx ridx pid rc=0
     local pids=()
     STARTED_REMOTE=1
-    for region_idx in 0 1 3; do
-        ridx="$(replica_index_for_region "$region_idx")"
-        ssh_to "${REGION_VMS[$region_idx]}" "${REGION_ZONES[$region_idx]}" "
+    for node_idx in 0 1 2; do
+        ridx="$(replica_index_for_node "$node_idx")"
+        ssh_to "${NODE_VMS[$node_idx]}" "${NODE_ZONES[$node_idx]}" "
             rm -f /tmp/paxosbus-replica-$ridx.log
             rm -rf /tmp/paxosbus-durable && mkdir -p /tmp/paxosbus-durable
             nohup ~/$REMOTE_DIR/paxosbus-replica \\
-              -c $REMOTE_CONF -i $ridx -l ${REGION_LABELS[$region_idx]} -d /tmp/paxosbus-durable \\
+              -c $REMOTE_CONF -i $ridx -l ${NODE_LABELS[$node_idx]} -d /tmp/paxosbus-durable \\
               -drop-mode $DROP_MODE -drop-every $DROP_EVERY \\
               -sync-interval-ms $SYNC_INTERVAL_MS -suspect-timeout-ms $SUSPECT_TIMEOUT_MS \\
               -view-change-timeout-ms $VIEW_CHANGE_TIMEOUT_MS \\
@@ -634,7 +617,7 @@ launch_replicas() {
             echo \$! >/tmp/paxosbus-replica-$ridx.pid
             sleep 1
             if pgrep -f '[p]axosbus-replica' >/dev/null; then
-                echo '  [replica $ridx @ ${REGION_LABELS[$region_idx]}] running'
+                echo '  [replica $ridx @ ${NODE_LABELS[$node_idx]}] running'
             else
                 echo '  [replica $ridx] NOT RUNNING'
                 cat /tmp/paxosbus-replica-$ridx.log 2>/dev/null || true
@@ -649,17 +632,23 @@ launch_replicas() {
 
 launch_clients() {
     local total=$((4 * CLIENTS_PER_REGION))
-    echo "==> Launching $total clients ($CLIENTS_PER_REGION per region; one IAP SSH per host)"
-    local region_idx ids pid rc=0
+    echo "==> Launching $total clients ($CLIENTS_PER_REGION per region; one process per VM)"
+    local node_idx ids pid pause_args start_args="" rc=0
     local pids=()
-    for region_idx in 0 1 2 3; do
-        ids="$(client_ids_for_region "$region_idx")"
-        ssh_to "${REGION_VMS[$region_idx]}" "${REGION_ZONES[$region_idx]}" "
+    SCHEDULE_START_NS="$(python3 -c 'import sys,time; w=int(sys.argv[1])*1000000; print((time.time_ns()//w+max(4,(30000000000+w-1)//w+1))*w)' "$SCHEDULE_WINDOW_MS")"
+    start_args="-schedule-start-ns $SCHEDULE_START_NS"
+    echo "schedule_start_ns=$SCHEDULE_START_NS" >> "$RUN_LOG_DIR/run-meta.txt"
+    for node_idx in "${!NODE_VMS[@]}"; do
+        ((node_idx >= 3)) || continue
+        ids="$(client_ids_for_node "$node_idx")"
+        pause_args=""
+        if ((PAUSE_WINDOW_AFTER_S > 0 && ids % 2 == 0)); then pause_args="-pause-window-after ${PAUSE_WINDOW_AFTER_S}s"; fi
+        ssh_to "${NODE_VMS[$node_idx]}" "${NODE_ZONES[$node_idx]}" "
             for id in $ids; do
                 rm -f /tmp/paxosbus-client-\$id.log
                 nohup ~/$REMOTE_DIR/paxosbus-client \\
-                  -c $REMOTE_CONF -I \$id -p $INTERVAL_MS -g $GEN_INTERVAL_US \\
-                  -t $RESEND_MS -w $START_DELAY_MS -l ${REGION_LABELS[$region_idx]} \\
+                  -c $REMOTE_CONF -I \$id -p $INTERVAL_MS -g $GEN_INTERVAL_US -command-size $COMMAND_SIZE \\
+                  -t $RESEND_MS -w $START_DELAY_MS -l ${NODE_LABELS[$node_idx]} $pause_args $start_args \\
                   </dev/null >/tmp/paxosbus-client-\$id.log 2>&1 &
                 echo \$! >/tmp/paxosbus-client-\$id.pid
             done
@@ -667,9 +656,9 @@ launch_clients() {
             failed=0
             for id in $ids; do
                 if pgrep -f \"[p]axosbus-client.*-I \$id -p\" >/dev/null; then
-                    echo \"  [client \$id @ ${REGION_LABELS[$region_idx]}] running\"
+                    echo \"  [client \$id @ ${NODE_LABELS[$node_idx]}] running\"
                 else
-                    echo \"  [client \$id @ ${REGION_LABELS[$region_idx]}] NOT RUNNING\"
+                    echo \"  [client \$id @ ${NODE_LABELS[$node_idx]}] NOT RUNNING\"
                     cat /tmp/paxosbus-client-\$id.log 2>/dev/null || true
                     failed=1
                 fi
@@ -686,28 +675,31 @@ schedule_leader_failure() {
     (
         sleep "$wait_s"
         local output remote_ts
-        output="$(ssh_to "${REGION_VMS[0]}" "${REGION_ZONES[0]}" \
+        output="$(ssh_to "${NODE_VMS[0]}" "${NODE_ZONES[0]}" \
             "date +%s.%N; pkill -9 -f '[p]axosbus-replica' 2>/dev/null || true" 2>/dev/null || true)"
         remote_ts="${output%%$'\n'*}"
         {
             echo "kill_leader_idx=0"
-            echo "kill_leader_label=${REGION_LABELS[0]}"
-            echo "kill_leader_host=${REGION_VMS[0]}"
+            echo "kill_leader_label=${NODE_LABELS[0]}"
+            echo "kill_leader_host=${NODE_VMS[0]}"
             echo "kill_at_data_phase_s=$FAILURE_AT_S"
             echo "detection_time_ms=$SUSPECT_TIMEOUT_MS"
             echo "kill_wall_local=$(date +%s.%N)"
             echo "kill_wall_leader=$remote_ts"
         } > "$KILL_INFO_FILE"
         echo ""
-        echo "══════ KILLED leader replica 0 (${REGION_LABELS[0]}) at +${FAILURE_AT_S}s of data phase ══════"
+        echo "══════ KILLED leader replica 0 (${NODE_LABELS[0]}) at +${FAILURE_AT_S}s of data phase ══════"
     ) &
     LOCAL_BG_PIDS+=($!)
 }
 
 tail_for_run() {
     local warmup_s=$(((2 * SCHEDULE_WINDOW_MS + 999) / 1000))
+    if ((SCHEDULE_START_NS > 0)); then
+        warmup_s="$(python3 -c 'import sys,time; print(max(0,(int(sys.argv[1])-time.time_ns()+999999999)//1000000000))' "$SCHEDULE_START_NS")"
+    fi
     local run_for=$((warmup_s + DURATION_S + 6))
-    local region_idx ridx first_id pid
+    local node_idx ridx first_id pid
     local tail_pids=()
 
     if [[ "$SCENARIO" == "failure" ]]; then
@@ -716,15 +708,16 @@ tail_for_run() {
     fi
     echo "==> Live tail for ${run_for}s (${warmup_s}s sync + ${DURATION_S}s data + slack)"
     echo "----------------------------------------------------------------"
-    for region_idx in 0 1 3; do
-        ridx="$(replica_index_for_region "$region_idx")"
-        ssh_to "${REGION_VMS[$region_idx]}" "${REGION_ZONES[$region_idx]}" \
+    for node_idx in 0 1 2; do
+        ridx="$(replica_index_for_node "$node_idx")"
+        ssh_to "${NODE_VMS[$node_idx]}" "${NODE_ZONES[$node_idx]}" \
             "tail -n +1 -F /tmp/paxosbus-replica-$ridx.log | grep --line-buffered -E '1s:|SUSPECT|VIEW|PANIC' | sed -u 's/^/[r$ridx] /'" &
         tail_pids+=($!)
     done
-    for region_idx in 0 1 2 3; do
-        first_id=$((region_idx * CLIENTS_PER_REGION + 1))
-        ssh_to "${REGION_VMS[$region_idx]}" "${REGION_ZONES[$region_idx]}" \
+    for node_idx in "${!NODE_VMS[@]}"; do
+        ((node_idx >= 3)) || continue
+        first_id=$((node_idx - 2))
+        ssh_to "${NODE_VMS[$node_idx]}" "${NODE_ZONES[$node_idx]}" \
             "tail -n +1 -F /tmp/paxosbus-client-$first_id.log | grep --line-buffered -E '1s:|data phase|CLIENT-PAUSE|PANIC' | sed -u 's/^/[c$first_id] /'" &
         tail_pids+=($!)
     done
@@ -742,19 +735,19 @@ tail_for_run() {
 collect_logs() {
     [[ -n "$RUN_LOG_DIR" ]] || return 0
     echo "==> Copying replica + client logs to $RUN_LOG_DIR"
-    local region_idx ridx id pid
+    local node_idx ridx id pid
     local pids=()
-    for region_idx in 0 1 2 3; do
+    for node_idx in "${!NODE_VMS[@]}"; do
         (
-            if ridx="$(replica_index_for_region "$region_idx")"; then
-                scp_from "${REGION_VMS[$region_idx]}" "${REGION_ZONES[$region_idx]}" \
+            if ridx="$(replica_index_for_node "$node_idx")"; then
+                scp_from "${NODE_VMS[$node_idx]}" "${NODE_ZONES[$node_idx]}" \
                     "/tmp/paxosbus-replica-$ridx.log" "$RUN_LOG_DIR/replica-$ridx.log" \
-                    || echo "  WARN: missing replica-$ridx log on ${REGION_VMS[$region_idx]}"
+                    || echo "  WARN: missing replica-$ridx log on ${NODE_VMS[$node_idx]}"
             fi
-            for id in $(client_ids_for_region "$region_idx"); do
-                scp_from "${REGION_VMS[$region_idx]}" "${REGION_ZONES[$region_idx]}" \
+            for id in $(client_ids_for_node "$node_idx"); do
+                scp_from "${NODE_VMS[$node_idx]}" "${NODE_ZONES[$node_idx]}" \
                     "/tmp/paxosbus-client-$id.log" "$RUN_LOG_DIR/paxosbus-client-$id.log" \
-                    || echo "  WARN: missing client-$id log on ${REGION_VMS[$region_idx]}"
+                    || echo "  WARN: missing client-$id log on ${NODE_VMS[$node_idx]}"
             done
         ) &
         pids+=($!)
@@ -765,13 +758,13 @@ collect_logs() {
         echo "==> Copying durable replica logs (this can be large)"
         mkdir -p "$RUN_LOG_DIR/durable"
         pids=()
-        for region_idx in 0 1 3; do
-            ridx="$(replica_index_for_region "$region_idx")"
-            gcloud compute scp "${REGION_VMS[$region_idx]}:/tmp/paxosbus-durable" \
+        for node_idx in 0 1 2; do
+            ridx="$(replica_index_for_node "$node_idx")"
+            gcloud compute scp "${NODE_VMS[$node_idx]}:/tmp/paxosbus-durable" \
                 "$RUN_LOG_DIR/durable/replica-$ridx" \
-                --tunnel-through-iap --zone="${REGION_ZONES[$region_idx]}" \
+                --tunnel-through-iap --zone="${NODE_ZONES[$node_idx]}" \
                 --project="$PROJECT_ID" --recurse --compress --quiet \
-                || echo "  WARN: missing durable logs on ${REGION_VMS[$region_idx]}" &
+                || echo "  WARN: missing durable logs on ${NODE_VMS[$node_idx]}" &
             pids+=($!)
         done
         for pid in "${pids[@]}"; do wait "$pid" || true; done
