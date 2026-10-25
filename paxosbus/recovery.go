@@ -609,16 +609,15 @@ type mergePlan struct {
 	hasStable        bool
 	maxSlot          uint64
 	hasMax           bool
-	noops            []uint64          // sorted; slots in (stableSlot, maxSlot] agreed empty
-	donors           map[uint64]uint32 // slot -> a replica known to hold the entry
-	selected         []uint32          // reports retained at the highest LastNormalView
-	catchUp          uint32            // who to pull the committed prefix from
+	noops            []uint64 // sorted; slots in (stableSlot, maxSlot] agreed empty
+	donors           map[uint64][]uint32
+	selected         []uint32 // reports retained at the highest LastNormalView
+	catchUp          uint32   // who to pull the committed prefix from
 	hasCatchUp       bool
 	schedule         []BusSyncMessage
 	scheduleConflict bool
 }
 
-// Merge only reports from the highest LastNormalView; agreed no-ops win.
 func mergeSuffix(reports []*BusViewChange) mergePlan {
 	var plan mergePlan
 	if len(reports) == 0 {
@@ -677,28 +676,30 @@ func mergeSuffix(reports []*BusViewChange) mergePlan {
 	}
 
 	noop := make(map[uint64]struct{})
-	for _, m := range survivors {
-		for _, s := range m.NoOpSlots {
-			if s >= base && s <= plan.maxSlot {
-				noop[s] = struct{}{}
-			}
-		}
-	}
-	plan.donors = make(map[uint64]uint32)
+	plan.donors = make(map[uint64][]uint32)
 	for s := base; s <= plan.maxSlot; s++ {
-		if _, isNoOp := noop[s]; isNoOp {
-			continue
-		}
-		found := false
 		for _, m := range survivors {
-			if s >= m.BitmapBase && bitSet(m.FilledBitmap, s-m.BitmapBase) {
-				plan.donors[s] = m.SenderIdx
-				found = true
-				break
+			if s < m.BitmapBase || !bitSet(m.FilledBitmap, s-m.BitmapBase) {
+				continue
+			}
+			isNoOp := false
+			for _, noOpSlot := range m.NoOpSlots {
+				if noOpSlot == s {
+					isNoOp = true
+					break
+				}
+			}
+			if !isNoOp {
+				plan.donors[s] = append(plan.donors[s], m.SenderIdx)
 			}
 		}
-		if !found {
+		if len(plan.donors[s]) == 0 {
 			noop[s] = struct{}{}
+			delete(plan.donors, s)
+		} else {
+			sort.Slice(plan.donors[s], func(i, j int) bool {
+				return plan.donors[s][i] < plan.donors[s][j]
+			})
 		}
 	}
 	plan.noops = make([]uint64, 0, len(noop))
@@ -855,6 +856,20 @@ func (r *Replica) waitMergeRetry(vc *vcState, watchdog *viewChangeWatchdog) bool
 	}
 }
 
+func (r *Replica) prepareMergedRequestSlotLocked(slot uint64) bool {
+	if r.slotStateLocked(slot) == slotReceived {
+		return true
+	}
+	if slot < r.nextExpected && !r.rewindToLocked(slot) {
+		return false
+	}
+	if e := r.globalLog[slot]; e != nil && e.state == slotNoOp {
+		r.releaseEntryBytesLocked(e)
+		delete(r.globalLog, slot)
+	}
+	return true
+}
+
 func (r *Replica) fetchMergedState(vc *vcState, watchdog *viewChangeWatchdog,
 	plan *mergePlan) bool {
 
@@ -896,33 +911,37 @@ func (r *Replica) fetchMergedState(vc *vcState, watchdog *viewChangeWatchdog,
 		}
 	}
 
-	for attempt := 0; attempt < mergeFetchAttempts; attempt++ {
-		if !r.mergeActive(vc, watchdog) {
-			return false
-		}
-		byDonor := make(map[uint32][]uint64)
-		r.mu.Lock()
-		for slot, donor := range plan.donors {
-			if e := r.globalLog[slot]; e != nil && e.state != slotEmpty {
-				continue
-			}
-			if slot < r.nextExpected {
-				continue
-			}
-			byDonor[donor] = append(byDonor[donor], slot)
-		}
-		r.mu.Unlock()
-		if len(byDonor) == 0 {
-			return r.mergeActive(vc, watchdog)
-		}
-		for donor, slots := range byDonor {
-			if int(donor) == r.idx {
-				continue
-			}
-			sort.Slice(slots, func(i, j int) bool { return slots[i] < slots[j] })
-			r.fetchRangeBlocking(vc, int(donor), slots[0], slots[len(slots)-1], slots)
-			if !r.mergeActive(vc, watchdog) {
-				return false
+	slots := make([]uint64, 0, len(plan.donors))
+	for slot := range plan.donors {
+		slots = append(slots, slot)
+	}
+	sort.Slice(slots, func(i, j int) bool { return slots[i] < slots[j] })
+	for _, slot := range slots {
+		fetched := false
+		canFetch := true
+		for attempt := 0; attempt < mergeFetchAttempts && !fetched && canFetch; attempt++ {
+			for _, donor := range plan.donors[slot] {
+				if !r.mergeActive(vc, watchdog) {
+					return false
+				}
+				r.mu.Lock()
+				fetched = r.slotStateLocked(slot) == slotReceived
+				if !fetched {
+					canFetch = r.prepareMergedRequestSlotLocked(slot)
+				}
+				r.mu.Unlock()
+				if fetched || !canFetch {
+					break
+				}
+				if int(donor) != r.idx {
+					r.fetchRangeBlocking(vc, int(donor), slot, slot, []uint64{slot})
+				}
+				r.mu.Lock()
+				fetched = r.slotStateLocked(slot) == slotReceived
+				r.mu.Unlock()
+				if fetched {
+					break
+				}
 			}
 		}
 	}
@@ -930,10 +949,8 @@ func (r *Replica) fetchMergedState(vc *vcState, watchdog *viewChangeWatchdog,
 	r.mu.Lock()
 	var stuck []uint64
 	for slot := range plan.donors {
-		if e := r.globalLog[slot]; e == nil || e.state == slotEmpty {
-			if slot >= r.nextExpected {
-				stuck = append(stuck, slot)
-			}
+		if e := r.globalLog[slot]; e == nil || e.state != slotReceived {
+			stuck = append(stuck, slot)
 		}
 	}
 	r.mu.Unlock()
