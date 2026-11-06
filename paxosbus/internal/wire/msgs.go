@@ -1,4 +1,4 @@
-package paxosbus
+package wire
 
 import (
 	"bytes"
@@ -9,7 +9,7 @@ import (
 	fastrpc "github.com/imdea-software/swiftpaxos/rpc"
 )
 
-func marshalRequests(reqs []RequestMessage) []byte {
+func MarshalRequests(reqs []RequestMessage) []byte {
 	var buf bytes.Buffer
 	var b [4]byte
 	binary.LittleEndian.PutUint32(b[:], uint32(len(reqs)))
@@ -20,7 +20,7 @@ func marshalRequests(reqs []RequestMessage) []byte {
 	return buf.Bytes()
 }
 
-func unmarshalRequests(p []byte) ([]RequestMessage, error) {
+func UnmarshalRequests(p []byte) ([]RequestMessage, error) {
 	rd := bytes.NewReader(p)
 	var b [4]byte
 	if _, err := io.ReadFull(rd, b[:]); err != nil {
@@ -66,14 +66,14 @@ const (
 )
 
 const (
-	maxBitmapBytes        = 1 << 20
+	MaxBitmapBytes        = 1 << 20
 	maxSlotListLen        = 1 << 20
-	maxStateEntries       = 1 << 16
-	maxScheduleLen        = 1 << 16
-	maxScheduleHistoryLen = 1 << 24
+	MaxStateEntries       = 1 << 16
+	MaxScheduleLen        = 1 << 16
+	MaxScheduleHistoryLen = 1 << 24
 )
 
-type wireMsg interface {
+type WireMsg interface {
 	Marshal(io.Writer)
 }
 
@@ -133,7 +133,7 @@ func readSchedule(wire io.Reader) ([]BusSyncMessage, error) {
 		return nil, err
 	}
 	n := binary.LittleEndian.Uint32(b[:])
-	if n > maxScheduleHistoryLen {
+	if n > MaxScheduleHistoryLen {
 		return nil, fmt.Errorf("client schedule too long: %d", n)
 	}
 	out := make([]BusSyncMessage, n)
@@ -472,7 +472,7 @@ func readReplicaList(wire io.Reader) ([]uint32, error) {
 		return nil, err
 	}
 	n := binary.LittleEndian.Uint32(b[:])
-	if n > maxStateEntries {
+	if n > MaxStateEntries {
 		return nil, fmt.Errorf("replica list too long: %d", n)
 	}
 	out := make([]uint32, n)
@@ -700,7 +700,7 @@ func (m *BusViewChange) Unmarshal(wire io.Reader) error {
 	m.MaxSlotFilled = binary.LittleEndian.Uint64(b[45:53])
 	m.HasMax = b[53] != 0
 	bmLen := binary.LittleEndian.Uint32(b[54:58])
-	if bmLen > maxBitmapBytes {
+	if bmLen > MaxBitmapBytes {
 		return fmt.Errorf("view-change bitmap too long: %d", bmLen)
 	}
 	m.FilledBitmap = make([]byte, bmLen)
@@ -880,7 +880,7 @@ func (m *BusNewState) Unmarshal(wire io.Reader) error {
 	m.FetchId = binary.LittleEndian.Uint64(b[24:32])
 	m.SenderIdx = binary.LittleEndian.Uint32(b[32:36])
 	n := binary.LittleEndian.Uint32(b[36:40])
-	if n > maxStateEntries {
+	if n > MaxStateEntries {
 		return fmt.Errorf("state transfer too many entries: %d", n)
 	}
 	m.Entries = make([]StateEntry, n)

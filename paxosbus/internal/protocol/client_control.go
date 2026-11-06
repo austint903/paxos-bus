@@ -8,6 +8,8 @@ import (
 	"io"
 	"net"
 	"time"
+
+	pbwire "github.com/imdea-software/swiftpaxos/paxosbus/internal/wire"
 )
 
 const clientControlPoll = 250 * time.Millisecond
@@ -78,7 +80,7 @@ func (r *Replica) pauseClients(view uint64) {
 	r.mu.Unlock()
 	for id, w := range writers {
 		msg := clientControlMessage{ClientId: id, ViewId: view, ReplicaIdx: uint32(r.idx)}
-		go sendClientControl(w, MsgClientPause, &msg)
+		go sendClientControl(w, pbwire.MsgClientPause, &msg)
 	}
 }
 
@@ -119,7 +121,7 @@ func (r *Replica) handleClientControl(code uint8, m *clientControlMessage, lw *l
 	r.mu.Lock()
 	reply := r.clientControlReplyLocked(code, m, lw)
 	r.mu.Unlock()
-	sendClientControl(lw, MsgClientStatusReply, &reply)
+	sendClientControl(lw, pbwire.MsgClientStatusReply, &reply)
 }
 
 func (c *Client) startClientControl() {
@@ -151,7 +153,7 @@ func (c *Client) controlPeerLoop(idx int) {
 					return
 				case <-ticker.C:
 				}
-				if sendClientControl(lw, MsgClientStatusQuery, &message) != nil {
+				if sendClientControl(lw, pbwire.MsgClientStatusQuery, &message) != nil {
 					return
 				}
 			}
@@ -162,7 +164,7 @@ func (c *Client) controlPeerLoop(idx int) {
 			if err != nil {
 				break
 			}
-			if code != MsgClientPause && code != MsgClientStatusReply {
+			if code != pbwire.MsgClientPause && code != pbwire.MsgClientStatusReply {
 				break
 			}
 			var m clientControlMessage
@@ -208,7 +210,7 @@ func (c *Client) handleControlReply(code uint8, m clientControlMessage) {
 	c.viewHint = best
 	canPause := c.startupComplete
 	c.pauseMu.Unlock()
-	if canPause && (code == MsgClientPause || code == MsgClientStatusReply) {
+	if canPause && (code == pbwire.MsgClientPause || code == pbwire.MsgClientStatusReply) {
 		c.pauseForView(m.ViewId)
 	}
 
