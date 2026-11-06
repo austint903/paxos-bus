@@ -7,19 +7,21 @@ import (
 	"math"
 	"sort"
 	"time"
+
+	pbwire "github.com/imdea-software/swiftpaxos/paxosbus/internal/wire"
 )
 
 const scheduleRetryInterval = 250 * time.Millisecond
 
-func canonicalSchedule(announcements map[uint64]BusSyncMessage) []BusSyncMessage {
-	out := make([]BusSyncMessage, 0, len(announcements))
+func canonicalSchedule(announcements map[uint64]pbwire.BusSyncMessage) []pbwire.BusSyncMessage {
+	out := make([]pbwire.BusSyncMessage, 0, len(announcements))
 	for _, m := range announcements {
 		out = append(out, m)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].ClientId < out[j].ClientId })
 	return out
 }
-func scheduleDigest(schedule []BusSyncMessage) uint64 {
+func scheduleDigest(schedule []pbwire.BusSyncMessage) uint64 {
 	h := fnv.New64a()
 	var b [32]byte
 	for _, m := range schedule {
@@ -31,8 +33,8 @@ func scheduleDigest(schedule []BusSyncMessage) uint64 {
 	}
 	return h.Sum64()
 }
-func (r *Replica) validateSchedule(schedule []BusSyncMessage) error {
-	if len(schedule) > maxScheduleHistoryLen {
+func (r *Replica) validateSchedule(schedule []pbwire.BusSyncMessage) error {
+	if len(schedule) > pbwire.MaxScheduleHistoryLen {
 		return fmt.Errorf("schedule history exceeds limit")
 	}
 	for i, m := range schedule {
@@ -48,7 +50,7 @@ func (r *Replica) validateSchedule(schedule []BusSyncMessage) error {
 	}
 	return nil
 }
-func schedulesEqual(a, b []BusSyncMessage) bool {
+func schedulesEqual(a, b []pbwire.BusSyncMessage) bool {
 	if len(a) != len(b) {
 		return false
 	}
@@ -59,10 +61,10 @@ func schedulesEqual(a, b []BusSyncMessage) bool {
 	}
 	return true
 }
-func schedulePrefix(a, b []BusSyncMessage) bool {
+func schedulePrefix(a, b []pbwire.BusSyncMessage) bool {
 	return len(a) <= len(b) && schedulesEqual(a, b[:len(a)])
 }
-func (r *Replica) installScheduleLocked(schedule []BusSyncMessage, epoch uint64, ready bool) {
+func (r *Replica) installScheduleLocked(schedule []pbwire.BusSyncMessage, epoch uint64, ready bool) {
 	if schedulesEqual(r.schedule, schedule) {
 		r.scheduleEpoch = epoch
 		r.scheduleReady = ready
@@ -87,7 +89,7 @@ func (r *Replica) installScheduleLocked(schedule []BusSyncMessage, epoch uint64,
 		line.windowCounts = append(line.windowCounts, line.windowCounts[len(line.windowCounts)-1]+count)
 	}
 	r.clients = lines
-	r.schedule = append([]BusSyncMessage(nil), schedule...)
+	r.schedule = append([]pbwire.BusSyncMessage(nil), schedule...)
 	r.scheduleEpoch = epoch
 	r.scheduleReady = ready
 	if ready {
@@ -108,7 +110,7 @@ func (r *Replica) scheduleActiveLocked() bool {
 func (r *Replica) scheduleCompleteForViewLocked(view uint64) bool {
 	return r.scheduleEpoch == view && len(r.schedule) > 0
 }
-func (r *Replica) handleHsRequest(m *HsRequest, lw *lockedWriter) {
+func (r *Replica) handleHsRequest(m *pbwire.HsRequest, lw *lockedWriter) {
 	w := uint64(r.config.ScheduleWindow())
 	now := uint64(wallNs())
 	if m.StartTime > math.MaxInt64-w || m.StartTime%w != 0 || m.IntervalMs > math.MaxInt64/1_000_000 {
@@ -121,8 +123,8 @@ func (r *Replica) handleHsRequest(m *HsRequest, lw *lockedWriter) {
 	}
 	for _, s := range r.schedule {
 		if s.FirstMsgNs == m.StartTime && s.ClientId == m.ClientId && s.EndTime <= r.scheduleCommittedEnd {
-			reply := HsReply{ReplicaId: uint32(r.idx), ViewId: r.view(), IntervalMs: s.IntervalMs, StartTime: s.FirstMsgNs, EndTime: s.EndTime}
-			go lw.sendMsg(MsgHsReply, &reply)
+			reply := pbwire.HsReply{ReplicaId: uint32(r.idx), ViewId: r.view(), IntervalMs: s.IntervalMs, StartTime: s.FirstMsgNs, EndTime: s.EndTime}
+			go lw.sendMsg(pbwire.MsgHsReply, &reply)
 			return
 		}
 	}
@@ -130,11 +132,11 @@ func (r *Replica) handleHsRequest(m *HsRequest, lw *lockedWriter) {
 		return
 	}
 	if r.scheduleRequests == nil {
-		r.scheduleRequests = make(map[uint64]map[uint64]HsRequest)
+		r.scheduleRequests = make(map[uint64]map[uint64]pbwire.HsRequest)
 		r.scheduleWindowWaiters = make(map[uint64]map[uint64]*lockedWriter)
 	}
 	if r.scheduleRequests[m.StartTime] == nil {
-		r.scheduleRequests[m.StartTime] = make(map[uint64]HsRequest)
+		r.scheduleRequests[m.StartTime] = make(map[uint64]pbwire.HsRequest)
 		r.scheduleWindowWaiters[m.StartTime] = make(map[uint64]*lockedWriter)
 	}
 	requests := r.scheduleRequests[m.StartTime]
@@ -167,12 +169,12 @@ func (r *Replica) scheduleLoop() {
 				requests := r.scheduleRequests[start]
 				delete(r.scheduleRequests, start)
 				if start >= r.scheduleCommittedEnd {
-					list := make([]HsRequest, 0, len(requests))
+					list := make([]pbwire.HsRequest, 0, len(requests))
 					for _, q := range requests {
 						list = append(list, q)
 					}
 					sort.Slice(list, func(i, j int) bool { return list[i].ClientId < list[j].ClientId })
-					msg := SchdPrepare{ReplicaId: uint32(r.idx), ViewId: r.view(), HsReqList: list, StartTime: start, EndTime: start + w}
+					msg := pbwire.SchdPrepare{ReplicaId: uint32(r.idx), ViewId: r.view(), HsReqList: list, StartTime: start, EndTime: start + w}
 					if r.acceptSchedulePrepareLocked(&msg) {
 						r.scheduleInstallActive = true
 						r.scheduleProposal = &msg
@@ -191,7 +193,7 @@ func (r *Replica) scheduleLoop() {
 			}
 			r.mu.Unlock()
 			if send {
-				r.broadcastSchedule(MsgBusScheduleInstall, &BusScheduleInstall{Epoch: view, Digest: scheduleDigest(history), SenderIdx: uint32(r.idx), Schedule: history})
+				r.broadcastSchedule(pbwire.MsgBusScheduleInstall, &pbwire.BusScheduleInstall{Epoch: view, Digest: scheduleDigest(history), SenderIdx: uint32(r.idx), Schedule: history})
 			}
 			continue
 		}
@@ -216,20 +218,20 @@ func (r *Replica) scheduleLoop() {
 		if !send {
 			continue
 		}
-		snapshot := BusScheduleInstall{Epoch: msg.ViewId, Digest: scheduleDigest(history), SenderIdx: uint32(r.idx), Schedule: history}
-		r.broadcastSchedule(MsgBusScheduleInstall, &scheduleBatch{snapshot: snapshot, prepare: msg, committed: committed})
+		snapshot := pbwire.BusScheduleInstall{Epoch: msg.ViewId, Digest: scheduleDigest(history), SenderIdx: uint32(r.idx), Schedule: history}
+		r.broadcastSchedule(pbwire.MsgBusScheduleInstall, &scheduleBatch{snapshot: snapshot, prepare: msg, committed: committed})
 		if committed {
 			for _, q := range msg.HsReqList {
 				if lw := waiters[q.ClientId]; lw != nil {
-					reply := HsReply{ReplicaId: uint32(r.idx), ViewId: msg.ViewId, IntervalMs: q.IntervalMs, StartTime: msg.StartTime, EndTime: msg.EndTime}
-					go lw.sendMsg(MsgHsReply, &reply)
+					reply := pbwire.HsReply{ReplicaId: uint32(r.idx), ViewId: msg.ViewId, IntervalMs: q.IntervalMs, StartTime: msg.StartTime, EndTime: msg.EndTime}
+					go lw.sendMsg(pbwire.MsgHsReply, &reply)
 				}
 			}
 		}
 	}
 }
-func (r *Replica) committedScheduleLocked() []BusSyncMessage {
-	var out []BusSyncMessage
+func (r *Replica) committedScheduleLocked() []pbwire.BusSyncMessage {
+	var out []pbwire.BusSyncMessage
 	for _, m := range r.schedule {
 		if m.EndTime <= r.scheduleCommittedEnd {
 			out = append(out, m)
@@ -237,16 +239,16 @@ func (r *Replica) committedScheduleLocked() []BusSyncMessage {
 	}
 	return out
 }
-func (r *Replica) acceptSchedulePrepareLocked(m *SchdPrepare) bool {
+func (r *Replica) acceptSchedulePrepareLocked(m *pbwire.SchdPrepare) bool {
 	if m.ViewId != r.view() || r.status != statusNormal || int(m.ReplicaId) != r.leaderIdx() || m.EndTime-m.StartTime != uint64(r.config.ScheduleWindow()) || m.EndTime <= m.StartTime || len(m.HsReqList) == 0 || len(m.HsReqList) > r.config.ExpectedClients {
 		return false
 	}
-	entries := make([]BusSyncMessage, len(m.HsReqList))
+	entries := make([]pbwire.BusSyncMessage, len(m.HsReqList))
 	for i, q := range m.HsReqList {
 		if q.StartTime != m.StartTime {
 			return false
 		}
-		entries[i] = BusSyncMessage{ClientId: q.ClientId, FirstMsgNs: q.StartTime, IntervalMs: q.IntervalMs, EndTime: m.EndTime}
+		entries[i] = pbwire.BusSyncMessage{ClientId: q.ClientId, FirstMsgNs: q.StartTime, IntervalMs: q.IntervalMs, EndTime: m.EndTime}
 	}
 	if r.validateSchedule(entries) != nil {
 		return false
@@ -263,22 +265,22 @@ func (r *Replica) acceptSchedulePrepareLocked(m *SchdPrepare) bool {
 	if len(r.schedule) > 0 && r.schedule[len(r.schedule)-1].EndTime > m.StartTime {
 		return false
 	}
-	if len(r.schedule)+len(entries) > maxScheduleHistoryLen {
+	if len(r.schedule)+len(entries) > pbwire.MaxScheduleHistoryLen {
 		return false
 	}
-	r.installScheduleLocked(append(append([]BusSyncMessage(nil), r.schedule...), entries...), m.ViewId, false)
+	r.installScheduleLocked(append(append([]pbwire.BusSyncMessage(nil), r.schedule...), entries...), m.ViewId, false)
 	r.scheduleReady = r.scheduleCommittedEnd > 0
 	return true
 }
-func (r *Replica) handleSchdPrepare(m *SchdPrepare) {
+func (r *Replica) handleSchdPrepare(m *pbwire.SchdPrepare) {
 	r.mu.Lock()
 	ok := r.acceptSchedulePrepareLocked(m)
 	r.mu.Unlock()
 	if ok {
-		r.sendSchedulePeer(int(m.ReplicaId), MsgSchdPrepareReply, &SchdPrepareReply{ReplicaId: uint32(r.idx), ViewId: m.ViewId, StartTime: m.StartTime, EndTime: m.EndTime})
+		r.sendSchedulePeer(int(m.ReplicaId), pbwire.MsgSchdPrepareReply, &pbwire.SchdPrepareReply{ReplicaId: uint32(r.idx), ViewId: m.ViewId, StartTime: m.StartTime, EndTime: m.EndTime})
 	}
 }
-func (r *Replica) handleSchdPrepareReply(m *SchdPrepareReply) {
+func (r *Replica) handleSchdPrepareReply(m *pbwire.SchdPrepareReply) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	p := r.scheduleProposal
@@ -286,7 +288,7 @@ func (r *Replica) handleSchdPrepareReply(m *SchdPrepareReply) {
 		r.schedulePrepared[m.ReplicaId] = true
 	}
 }
-func (r *Replica) handleSchdCommit(m *SchdCommit) {
+func (r *Replica) handleSchdCommit(m *pbwire.SchdCommit) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if m.ViewId != r.view() || r.status != statusNormal || int(m.ReplicaId) != r.leaderIdx() {
@@ -302,7 +304,7 @@ func (r *Replica) handleSchdCommit(m *SchdCommit) {
 		}
 	}
 }
-func (r *Replica) handleScheduleInstall(m *BusScheduleInstall) bool {
+func (r *Replica) handleScheduleInstall(m *pbwire.BusScheduleInstall) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if m.Epoch != r.view() || r.status != statusNormal || int(m.SenderIdx) != r.leaderIdx() || m.Digest != scheduleDigest(m.Schedule) || r.validateSchedule(m.Schedule) != nil {

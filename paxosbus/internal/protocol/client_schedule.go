@@ -6,6 +6,8 @@ import (
 	"math"
 	"net"
 	"time"
+
+	pbwire "github.com/imdea-software/swiftpaxos/paxosbus/internal/wire"
 )
 
 func (c *Client) SetBusInterval(intervalMs uint64) error {
@@ -22,7 +24,7 @@ func scheduleTarget(now int64, window time.Duration) uint64 {
 	return uint64((now/int64(window) + 2) * int64(window))
 }
 
-func (c *Client) acceptHandshake(m HsReply, requests map[uint64]HsRequest, replica int) bool {
+func (c *Client) acceptHandshake(m pbwire.HsReply, requests map[uint64]pbwire.HsRequest, replica int) bool {
 	request, ok := requests[m.StartTime]
 	if !ok || m.ReplicaId != uint32(replica) || replica != c.config.LeaderIndex(m.ViewId) || m.EndTime != m.StartTime+uint64(c.config.ScheduleWindow()) || m.EndTime > math.MaxInt64 {
 		return false
@@ -49,7 +51,7 @@ func (c *Client) acceptHandshake(m HsReply, requests map[uint64]HsRequest, repli
 }
 
 func (c *Client) scheduleLoop() {
-	requests := make(map[uint64]HsRequest)
+	requests := make(map[uint64]pbwire.HsRequest)
 	window := c.config.ScheduleWindow()
 	poll := window / 20
 	if poll > clientControlPoll {
@@ -72,7 +74,7 @@ func (c *Client) scheduleLoop() {
 			tcp.SetNoDelay(true)
 		}
 		lw := &lockedWriter{w: bufio.NewWriter(conn), conn: conn}
-		replies := make(chan HsReply, 16)
+		replies := make(chan pbwire.HsReply, 16)
 		done := make(chan struct{})
 		stop := make(chan struct{})
 		go func() {
@@ -80,10 +82,10 @@ func (c *Client) scheduleLoop() {
 			reader := bufio.NewReader(conn)
 			for {
 				code, err := reader.ReadByte()
-				if err != nil || code != MsgHsReply {
+				if err != nil || code != pbwire.MsgHsReply {
 					return
 				}
-				var m HsReply
+				var m pbwire.HsReply
 				if m.Unmarshal(reader) != nil {
 					return
 				}
@@ -100,7 +102,7 @@ func (c *Client) scheduleLoop() {
 			now := wallNs()
 			target := c.scheduleRequestTarget(now)
 			interval := c.scheduleInterval(target)
-			requests[target] = HsRequest{ClientId: c.clientId, StartTime: target, IntervalMs: interval}
+			requests[target] = pbwire.HsRequest{ClientId: c.clientId, StartTime: target, IntervalMs: interval}
 			for start, req := range requests {
 				if start+uint64(window) <= uint64(now) {
 					delete(requests, start)
@@ -114,7 +116,7 @@ func (c *Client) scheduleLoop() {
 				confirmed = confirmed && ready.ViewId >= view
 				c.scheduleMu.Unlock()
 				if !confirmed {
-					if lw.sendMsg(MsgHsRequest, &req) != nil {
+					if lw.sendMsg(pbwire.MsgHsRequest, &req) != nil {
 						connected = false
 						break
 					}

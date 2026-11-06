@@ -1,4 +1,4 @@
-package paxosbus
+package wire
 
 import (
 	"encoding/binary"
@@ -90,7 +90,7 @@ func (m *SchdPrepare) Unmarshal(r io.Reader) error {
 		return err
 	}
 	n := binary.LittleEndian.Uint32(b[:])
-	if n > maxScheduleLen {
+	if n > MaxScheduleLen {
 		return fmt.Errorf("schedule too long: %d", n)
 	}
 	m.HsReqList = make([]HsRequest, n)

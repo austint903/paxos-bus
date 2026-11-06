@@ -10,6 +10,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	pblog "github.com/imdea-software/swiftpaxos/paxosbus/internal/logging"
 )
 
 type durableLog struct {
@@ -218,7 +220,7 @@ func (cl *durableLog) flushForRead() {
 	select {
 	case <-ack:
 	case <-time.After(2 * time.Second):
-		Warning("durable log flush for read timed out")
+		pblog.Warning("durable log flush for read timed out")
 	}
 }
 

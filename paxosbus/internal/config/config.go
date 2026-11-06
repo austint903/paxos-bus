@@ -1,4 +1,4 @@
-package paxosbus
+package config
 
 import (
 	"bufio"
@@ -7,6 +7,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	pbwire "github.com/imdea-software/swiftpaxos/paxosbus/internal/wire"
 )
 
 const maxReplicaCount = 32
@@ -69,8 +71,8 @@ func ReadConfig(path string) (*Config, error) {
 			if c.ExpectedClients != 0 {
 				return nil, fmt.Errorf("config: duplicate clients line")
 			}
-			if v > maxScheduleLen {
-				return nil, fmt.Errorf("config: clients=%d exceeds schedule limit %d", v, maxScheduleLen)
+			if v > pbwire.MaxScheduleLen {
+				return nil, fmt.Errorf("config: clients=%d exceeds schedule limit %d", v, pbwire.MaxScheduleLen)
 			}
 			c.ExpectedClients = v
 		default:
