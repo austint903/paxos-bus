@@ -1,7 +1,25 @@
-*This project is still in progress.*
+# PaxosBus
 
-# PaxosBus: Geo-Replicated State Machines
+## Introduction
 
-This repository contains the prototype implementation of PaxosBus, a state-machine replication protocol for geo-distributed systems. PaxosBus explores how shared schedules can help replicas agree on the order of commands with less coordination. Our approach groups client requests into batches, or “buses,” and uses an agreed-upon schedule to organize their execution across replicas.
+## Paper and Presentation
 
-PaxosBus has been accepted to SOSP SysDW '26.
+## Clone Project
+
+## File Structure
+
+## Single-Machine Tests
+
+## Multi-Machine Tests
+
+## Important Configuration Parameters
+
+## Performance Benchmark
+
+## Authors and Acknowledgment
+
+## License
+
+PaxosBus is licensed under the [MIT License](LICENSE).
+
+Copyright (c) 2026 Austin Tan and Jinkun Geng.
