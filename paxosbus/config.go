@@ -116,7 +116,7 @@ func (c *Config) Port(i int) string {
 
 func (c *Config) ScheduleWindow() time.Duration {
 	if c.ScheduleWindowMs == 0 {
-		return 10 * time.Second
+		return 2 * time.Second
 	}
 	return time.Duration(c.ScheduleWindowMs) * time.Millisecond
 }
