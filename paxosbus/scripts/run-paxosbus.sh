@@ -402,7 +402,7 @@ initialize_run_dir() {
     name="gcp-run-$ts"
     main_dir="$(dirname "$(git -C "$REPO_ROOT" rev-parse --path-format=absolute --git-common-dir)")"
     [[ "$main_dir/" != */.codex/* ]] || die "experiment logs must be outside .codex"
-    RUN_LOG_DIR="$main_dir/paxosbus/logs/gcp-paxosbus/reconfig/$name"
+    RUN_LOG_DIR="$main_dir/paxosbus/logs/gcp-paxosbus/$name"
     mkdir -p "$(dirname "$RUN_LOG_DIR")"
     mkdir "$RUN_LOG_DIR"
     KILL_INFO_FILE="$RUN_LOG_DIR/kill-info.txt"
