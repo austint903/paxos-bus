@@ -12,6 +12,9 @@ import (
 	"sync/atomic"
 	"time"
 
+	pbconfig "github.com/imdea-software/swiftpaxos/paxosbus/internal/config"
+	pblog "github.com/imdea-software/swiftpaxos/paxosbus/internal/logging"
+	pbwire "github.com/imdea-software/swiftpaxos/paxosbus/internal/wire"
 	"github.com/imdea-software/swiftpaxos/state"
 )
 
@@ -34,7 +37,7 @@ const (
 )
 
 type clientLine struct {
-	windows      []BusSyncMessage
+	windows      []pbwire.BusSyncMessage
 	windowCounts []uint64
 	baseNs       int64
 	intervalNs   int64
@@ -55,7 +58,7 @@ type globalEntry struct {
 	reqId    uint64
 	state    slotState
 	op       []byte
-	requests []RequestMessage
+	requests []pbwire.RequestMessage
 	isBus    bool
 	ownerSet bool // clientId/reqId hold this slot's real owner (client id 0 is valid)
 
@@ -78,7 +81,7 @@ type writeUndo struct {
 
 const requestOverheadBytes = 48
 
-func busSizeBytes(reqs []RequestMessage) uint64 {
+func busSizeBytes(reqs []pbwire.RequestMessage) uint64 {
 	n := uint64(len(reqs)) * requestOverheadBytes
 	for i := range reqs {
 		n += uint64(len(reqs[i].Op))
@@ -158,7 +161,7 @@ type gapState struct {
 	view         uint64
 	start        int64
 	askers       map[uint32]struct{}
-	probeReplies chan *BusGapReply
+	probeReplies chan *pbwire.BusGapReply
 	commitAcks   chan uint32
 	doneCh       chan struct{}
 	abortCh      chan struct{}
@@ -170,7 +173,7 @@ func newGapState(start int64, view uint64) *gapState {
 		view:         view,
 		start:        start,
 		askers:       make(map[uint32]struct{}),
-		probeReplies: make(chan *BusGapReply, 8),
+		probeReplies: make(chan *pbwire.BusGapReply, 8),
 		commitAcks:   make(chan uint32, 8),
 		doneCh:       make(chan struct{}, 1),
 		abortCh:      make(chan struct{}),
@@ -262,12 +265,12 @@ type syncCatchup struct {
 	view       uint64
 	leader     int
 	target     uint64
-	prepare    BusSyncPrepare
+	prepare    pbwire.BusSyncPrepare
 	active     bool
 }
 
 type Replica struct {
-	config *Config
+	config *pbconfig.Config
 	idx    int
 	viewId atomic.Uint64
 	self   string
@@ -275,14 +278,14 @@ type Replica struct {
 	mu                    sync.Mutex
 	clients               map[uint64]*clientLine
 	clientControls        map[uint64]*clientControlState // guarded by r.mu
-	schedule              []BusSyncMessage
+	schedule              []pbwire.BusSyncMessage
 	scheduleEpoch         uint64
 	scheduleReady         bool
 	scheduleInstallActive bool
 	scheduleCommittedEnd  uint64
-	scheduleRequests      map[uint64]map[uint64]HsRequest
+	scheduleRequests      map[uint64]map[uint64]pbwire.HsRequest
 	scheduleWindowWaiters map[uint64]map[uint64]*lockedWriter
-	scheduleProposal      *SchdPrepare
+	scheduleProposal      *pbwire.SchdPrepare
 	schedulePrepared      map[uint32]bool
 	scheduleLastSend      time.Time
 	schedulePeers         []*lockedWriter
@@ -321,7 +324,7 @@ type Replica struct {
 	dedup        map[reqKey]uint64
 	State        *state.State
 
-	pendingBuses []*BusMessage
+	pendingBuses []*pbwire.BusMessage
 
 	cwMu           sync.Mutex
 	replySenders   map[uint64]*replySender
@@ -350,9 +353,9 @@ type Replica struct {
 	viewChangeWatchdog        *viewChangeWatchdog
 	viewChangeWatchdogGen     uint64
 	fetchQ                    chan fetchReq
-	serveQ                    chan *BusGetState
-	newStateCh                chan *BusNewState
-	startViewQ                chan *BusStartView
+	serveQ                    chan *pbwire.BusGetState
+	newStateCh                chan *pbwire.BusNewState
+	startViewQ                chan *pbwire.BusStartView
 	fetchSeq                  atomic.Uint64
 
 	logDir     string
@@ -420,7 +423,7 @@ func (o *RecoveryOptions) withDefaults() RecoveryOptions {
 	return out
 }
 
-func NewReplica(config *Config, idx int, label, logDir string, mode dropMode, every uint64,
+func NewReplica(config *pbconfig.Config, idx int, label, logDir string, mode dropMode, every uint64,
 	gapDeltaMs uint64, opts RecoveryOptions) *Replica {
 	self := "Replica " + strconv.Itoa(idx)
 	if label != "" {
@@ -465,38 +468,38 @@ func NewReplica(config *Config, idx int, label, logDir string, mode dropMode, ev
 		viewChangeFallbackTimeout: time.Duration(opts.ViewChangeFallbackTimeoutMs) * time.Millisecond,
 		gapRetryTimeout:           time.Duration(opts.GapRetryTimeoutMs) * time.Millisecond,
 		fetchQ:                    make(chan fetchReq, 64),
-		serveQ:                    make(chan *BusGetState, 64),
-		newStateCh:                make(chan *BusNewState, 8),
-		startViewQ:                make(chan *BusStartView, 8),
+		serveQ:                    make(chan *pbwire.BusGetState, 64),
+		newStateCh:                make(chan *pbwire.BusNewState, 8),
+		startViewQ:                make(chan *pbwire.BusStartView, 8),
 	}
 	if logDir != "" {
 		if err := os.MkdirAll(logDir, 0o755); err != nil {
-			Warning("[%s] cannot create durable log dir %s: %v", self, logDir, err)
+			pblog.Warning("[%s] cannot create durable log dir %s: %v", self, logDir, err)
 			r.logDir = ""
 		} else if busLog, err := openDurableLog(logDir, "replica.log"); err != nil {
-			Warning("[%s] cannot open durable bus-message log in %s: %v", self, logDir, err)
+			pblog.Warning("[%s] cannot open durable bus-message log in %s: %v", self, logDir, err)
 			r.logDir = ""
 		} else if reqLog, err := openDurableLog(logDir, "requestlist.log"); err != nil {
-			Warning("[%s] cannot open durable request-list log in %s: %v", self, logDir, err)
+			pblog.Warning("[%s] cannot open durable request-list log in %s: %v", self, logDir, err)
 			busLog.close()
 			r.logDir = ""
 		} else {
 			r.durable = busLog
 			r.reqListLog = reqLog
-			Notice("[%s] durable logs in %s: replica.log (bus-message log) + requestlist.log (request log list)", self, logDir)
+			pblog.Notice("[%s] durable logs in %s: replica.log (bus-message log) + requestlist.log (request log list)", self, logDir)
 		}
 	}
 	leader := "no"
 	if r.AmLeader() {
 		leader = "yes"
 	}
-	Notice("[%s] started (view=0, f=%d, quorum=%d, leader=%s, gap_delta=%dms)",
+	pblog.Notice("[%s] started (view=0, f=%d, quorum=%d, leader=%s, gap_delta=%dms)",
 		r.self, config.F, config.QuorumSize(), leader, r.gapDeltaNs/1e6)
-	Notice("[%s] recovery: sync=%v suspect=%v view_change_timeout=%v view_change_fallback_timeout=%v gap_retry_timeout=%v retain_slots=%d",
+	pblog.Notice("[%s] recovery: sync=%v suspect=%v view_change_timeout=%v view_change_fallback_timeout=%v gap_retry_timeout=%v retain_slots=%d",
 		r.self, r.syncInterval, r.suspectTimeout, r.viewChangeTimeout,
 		r.viewChangeFallbackTimeout, r.gapRetryTimeout, r.retainSlots)
 	if r.dropMode != dropNone && r.dropEvery > 0 {
-		Notice("[%s] artificial drop enabled: mode=%s every=%d (drop slot when reqId%%%d==0)",
+		pblog.Notice("[%s] artificial drop enabled: mode=%s every=%d (drop slot when reqId%%%d==0)",
 			r.self, r.dropMode, r.dropEvery, r.dropEvery)
 	}
 	return r
@@ -648,7 +651,7 @@ func (r *Replica) serve(l net.Listener) error {
 			if errors.Is(err, net.ErrClosed) {
 				return nil
 			}
-			Warning("[%s] accept error: %v", r.self, err)
+			pblog.Warning("[%s] accept error: %v", r.self, err)
 			continue
 		}
 		if tc, ok := conn.(*net.TCPConn); ok {
@@ -673,25 +676,25 @@ func (r *Replica) clientListener(conn net.Conn) {
 	}()
 
 	var (
-		busMsg BusMessage
+		busMsg pbwire.BusMessage
 	)
 
 	for {
 		msgType, err := reader.ReadByte()
 		if err != nil {
-			Notice("[%s] client connection %s closed: %v",
+			pblog.Notice("[%s] client connection %s closed: %v",
 				r.self, conn.RemoteAddr(), err)
 			return
 		}
 		switch msgType {
-		case MsgHsRequest:
-			var m HsRequest
+		case pbwire.MsgHsRequest:
+			var m pbwire.HsRequest
 			if m.Unmarshal(reader) != nil {
 				return
 			}
 			r.handleHsRequest(&m, lw)
-		case MsgSchdPrepare:
-			var m SchdPrepare
+		case pbwire.MsgSchdPrepare:
+			var m pbwire.SchdPrepare
 			if m.Unmarshal(reader) != nil {
 				return
 			}
@@ -699,160 +702,160 @@ func (r *Replica) clientListener(conn net.Conn) {
 				r.handleSchdPrepare(&m)
 			}
 			scheduleSnapshotOK = false
-		case MsgSchdPrepareReply:
-			var m SchdPrepareReply
+		case pbwire.MsgSchdPrepareReply:
+			var m pbwire.SchdPrepareReply
 			if m.Unmarshal(reader) != nil {
 				return
 			}
 			r.handleSchdPrepareReply(&m)
-		case MsgSchdCommit:
-			var m SchdCommit
+		case pbwire.MsgSchdCommit:
+			var m pbwire.SchdCommit
 			if m.Unmarshal(reader) != nil {
 				return
 			}
 			r.handleSchdCommit(&m)
-		case MsgClientStatusQuery:
+		case pbwire.MsgClientStatusQuery:
 			var m clientControlMessage
 			if err := m.Unmarshal(reader); err != nil {
 				return
 			}
 			r.handleClientControl(msgType, &m, lw)
 
-		case MsgBus:
+		case pbwire.MsgBus:
 			if err := busMsg.Unmarshal(reader); err != nil {
-				Warning("[%s] bad bus message: %v", r.self, err)
+				pblog.Warning("[%s] bad bus message: %v", r.self, err)
 				return
 			}
 			r.handleBus(&busMsg, lw)
 
-		case MsgBusGapRequest:
-			var m BusGapRequest
+		case pbwire.MsgBusGapRequest:
+			var m pbwire.BusGapRequest
 			if err := m.Unmarshal(reader); err != nil {
-				Warning("[%s] bad gap request: %v", r.self, err)
+				pblog.Warning("[%s] bad gap request: %v", r.self, err)
 				return
 			}
 			peerIdx = int(m.SenderIdx)
 			r.handleGapRequest(&m)
 
-		case MsgBusGapReply:
-			var m BusGapReply
+		case pbwire.MsgBusGapReply:
+			var m pbwire.BusGapReply
 			if err := m.Unmarshal(reader); err != nil {
-				Warning("[%s] bad gap reply: %v", r.self, err)
+				pblog.Warning("[%s] bad gap reply: %v", r.self, err)
 				return
 			}
 			peerIdx = int(m.SenderIdx)
 			r.handleGapReply(&m)
 
-		case MsgBusGapCommit:
-			var m BusGapCommit
+		case pbwire.MsgBusGapCommit:
+			var m pbwire.BusGapCommit
 			if err := m.Unmarshal(reader); err != nil {
-				Warning("[%s] bad gap commit: %v", r.self, err)
+				pblog.Warning("[%s] bad gap commit: %v", r.self, err)
 				return
 			}
 			peerIdx = int(m.SenderIdx)
 			r.handleGapCommit(&m)
 
-		case MsgBusGapCommitReply:
-			var m BusGapCommitReply
+		case pbwire.MsgBusGapCommitReply:
+			var m pbwire.BusGapCommitReply
 			if err := m.Unmarshal(reader); err != nil {
-				Warning("[%s] bad gap commit reply: %v", r.self, err)
+				pblog.Warning("[%s] bad gap commit reply: %v", r.self, err)
 				return
 			}
 			peerIdx = int(m.SenderIdx)
 			r.handleGapCommitReply(&m)
 
-		case MsgBusSyncPrepare:
-			var m BusSyncPrepare
+		case pbwire.MsgBusSyncPrepare:
+			var m pbwire.BusSyncPrepare
 			if err := m.Unmarshal(reader); err != nil {
-				Warning("[%s] bad sync prepare: %v", r.self, err)
+				pblog.Warning("[%s] bad sync prepare: %v", r.self, err)
 				return
 			}
 			peerIdx = int(m.SenderIdx)
 			r.handleSyncPrepare(&m)
 
-		case MsgBusSyncReply:
-			var m BusSyncReply
+		case pbwire.MsgBusSyncReply:
+			var m pbwire.BusSyncReply
 			if err := m.Unmarshal(reader); err != nil {
-				Warning("[%s] bad sync reply: %v", r.self, err)
+				pblog.Warning("[%s] bad sync reply: %v", r.self, err)
 				return
 			}
 			peerIdx = int(m.SenderIdx)
 			r.handleSyncReply(&m)
 
-		case MsgBusSyncCommit:
-			var m BusSyncCommit
+		case pbwire.MsgBusSyncCommit:
+			var m pbwire.BusSyncCommit
 			if err := m.Unmarshal(reader); err != nil {
-				Warning("[%s] bad sync commit: %v", r.self, err)
+				pblog.Warning("[%s] bad sync commit: %v", r.self, err)
 				return
 			}
 			peerIdx = int(m.SenderIdx)
 			r.handleSyncCommit(&m)
 
-		case MsgBusScheduleInstall:
-			var m BusScheduleInstall
+		case pbwire.MsgBusScheduleInstall:
+			var m pbwire.BusScheduleInstall
 			if err := m.Unmarshal(reader); err != nil {
-				Warning("[%s] bad schedule install: %v", r.self, err)
+				pblog.Warning("[%s] bad schedule install: %v", r.self, err)
 				return
 			}
 			scheduleSnapshotOK = r.handleScheduleInstall(&m)
 			scheduleSnapshotView = m.Epoch
 
-		case MsgBusViewChangeRequest:
-			var m BusViewChangeRequest
+		case pbwire.MsgBusViewChangeRequest:
+			var m pbwire.BusViewChangeRequest
 			if err := m.Unmarshal(reader); err != nil {
-				Warning("[%s] bad view change request: %v", r.self, err)
+				pblog.Warning("[%s] bad view change request: %v", r.self, err)
 				return
 			}
 			peerIdx = int(m.SenderIdx)
 			r.handleViewChangeRequest(&m)
 
-		case MsgBusViewChange:
-			var m BusViewChange
+		case pbwire.MsgBusViewChange:
+			var m pbwire.BusViewChange
 			if err := m.Unmarshal(reader); err != nil {
-				Warning("[%s] bad view change: %v", r.self, err)
+				pblog.Warning("[%s] bad view change: %v", r.self, err)
 				return
 			}
 			peerIdx = int(m.SenderIdx)
 			r.handleViewChange(&m)
 
-		case MsgBusStartView:
-			var m BusStartView
+		case pbwire.MsgBusStartView:
+			var m pbwire.BusStartView
 			if err := m.Unmarshal(reader); err != nil {
-				Warning("[%s] bad start view: %v", r.self, err)
+				pblog.Warning("[%s] bad start view: %v", r.self, err)
 				return
 			}
 			peerIdx = int(m.SenderIdx)
 			r.handleStartView(&m)
 
-		case MsgBusStateQuery:
-			var m BusStateQuery
+		case pbwire.MsgBusStateQuery:
+			var m pbwire.BusStateQuery
 			if err := m.Unmarshal(reader); err != nil {
-				Warning("[%s] bad state query: %v", r.self, err)
+				pblog.Warning("[%s] bad state query: %v", r.self, err)
 				return
 			}
 			peerIdx = int(m.SenderIdx)
 			r.handleStateQuery(&m)
 
-		case MsgBusGetState:
-			var m BusGetState
+		case pbwire.MsgBusGetState:
+			var m pbwire.BusGetState
 			if err := m.Unmarshal(reader); err != nil {
-				Warning("[%s] bad get state: %v", r.self, err)
+				pblog.Warning("[%s] bad get state: %v", r.self, err)
 				return
 			}
 			peerIdx = int(m.SenderIdx)
 			r.handleGetState(&m)
 
-		case MsgBusNewState:
-			var m BusNewState
+		case pbwire.MsgBusNewState:
+			var m pbwire.BusNewState
 			if err := m.Unmarshal(reader); err != nil {
-				Warning("[%s] bad new state: %v", r.self, err)
+				pblog.Warning("[%s] bad new state: %v", r.self, err)
 				return
 			}
 			peerIdx = int(m.SenderIdx)
 			r.handleNewState(&m)
 
 		default:
-			Warning("[%s] unknown message type %d", r.self, msgType)
+			pblog.Warning("[%s] unknown message type %d", r.self, msgType)
 			return
 		}
 	}
@@ -953,7 +956,7 @@ func (r *Replica) observeArrivalLocked(line *clientLine, seq uint64, actualNs in
 	r.winRecv++
 }
 
-func (r *Replica) handleBus(msg *BusMessage, lw *lockedWriter) {
+func (r *Replica) handleBus(msg *pbwire.BusMessage, lw *lockedWriter) {
 	actualNs := wallNs()
 	r.bindReplySender(msg.ClientId, lw)
 
@@ -961,7 +964,7 @@ func (r *Replica) handleBus(msg *BusMessage, lw *lockedWriter) {
 	switch r.admitLocked(msg.ClientId, msg.BusSeqNum, actualNs) {
 	case admitUnsynced:
 		r.mu.Unlock()
-		Warning("[%s] bus from unsynced client %d, ignoring", r.self, msg.ClientId)
+		pblog.Warning("[%s] bus from unsynced client %d, ignoring", r.self, msg.ClientId)
 		return
 	case admitFenced:
 		r.mu.Unlock()
@@ -990,7 +993,7 @@ func (r *Replica) bindReplySender(clientId uint64, lw *lockedWriter) {
 	r.replySenders[clientId] = newReplySender(r, lw)
 }
 
-func (r *Replica) applyDuringRecoveryLocked(msg *BusMessage) {
+func (r *Replica) applyDuringRecoveryLocked(msg *pbwire.BusMessage) {
 	slot := computeGlobalSlot(r.clients, msg.ClientId, msg.BusSeqNum)
 	stored := r.recordBusReceivedLocked(slot, msg.ClientId, msg.BusSeqNum, msg.Requests)
 	r.advanceNextExpectedLocked()
@@ -1044,7 +1047,7 @@ func (r *Replica) drainPendingBusesLocked() {
 	r.advanceNextExpectedLocked()
 }
 
-func (r *Replica) recordBusReceivedLocked(slot, clientId, busSeq uint64, reqs []RequestMessage) bool {
+func (r *Replica) recordBusReceivedLocked(slot, clientId, busSeq uint64, reqs []pbwire.RequestMessage) bool {
 	e := r.claimSlotLocked(slot)
 	if e == nil {
 		return false
@@ -1069,7 +1072,7 @@ func (r *Replica) slotGapPayloadLocked(slot uint64) (payload []byte, isBus bool)
 		return nil, false
 	}
 	if e.isBus {
-		return marshalRequests(e.requests), true
+		return pbwire.MarshalRequests(e.requests), true
 	}
 	return e.op, false
 }
@@ -1078,9 +1081,9 @@ func (r *Replica) storeRecoveredLocked(slot, clientId, reqId uint64, payload []b
 	if !isBus {
 		return r.recordReceivedLocked(slot, clientId, reqId, payload)
 	}
-	reqs, err := unmarshalRequests(payload)
+	reqs, err := pbwire.UnmarshalRequests(payload)
 	if err != nil {
-		Warning("[%s] cannot decode recovered bus for slot=%d: %v", r.self, slot, err)
+		pblog.Warning("[%s] cannot decode recovered bus for slot=%d: %v", r.self, slot, err)
 		return false
 	}
 	return r.recordBusReceivedLocked(slot, clientId, reqId, reqs)
@@ -1132,7 +1135,7 @@ func (r *Replica) recordReceivedLocked(slot, clientId, reqId uint64, op []byte) 
 // An agreed no-op may replace a bus only before that slot executes.
 func (r *Replica) setNoOpLocked(slot uint64) bool {
 	if r.executedLocked(slot) {
-		Warning("[%s] refusing no-op at slot=%d below executed frontier %d",
+		pblog.Warning("[%s] refusing no-op at slot=%d below executed frontier %d",
 			r.self, slot, r.nextExpected)
 		return false
 	}
@@ -1274,7 +1277,7 @@ func (r *Replica) durableRecordCursorLocked(slot uint64, e *globalEntry, logIdxs
 	r.durable.recordBus(slot, clientId, reqId, logIdxs, e.state == slotNoOp)
 }
 
-func (r *Replica) executeLocked(req *RequestMessage, logIndex uint64) {
+func (r *Replica) executeLocked(req *pbwire.RequestMessage, logIndex uint64) {
 	cmd := state.Command{Op: state.PUT, K: state.Key(req.ClientId), V: state.Value(req.Op)}
 	cmd.Execute(r.State)
 }
@@ -1429,7 +1432,7 @@ func (rs *replySender) loop() {
 			lw.mu.Lock()
 			for i := range batch {
 				pr := &batch[i]
-				msg := RequestReplyMessage{
+				msg := pbwire.RequestReplyMessage{
 					ClientId:   pr.clientId,
 					RequestId:  pr.requestId,
 					BusSlotNum: pr.busSlot,
@@ -1437,7 +1440,7 @@ func (rs *replySender) loop() {
 					ViewId:     pr.viewId,
 					ReplicaIdx: uint32(rs.r.idx),
 				}
-				lw.w.WriteByte(MsgRequestReply)
+				lw.w.WriteByte(pbwire.MsgRequestReply)
 				msg.Marshal(lw.w)
 			}
 			err := lw.w.Flush()
@@ -1448,7 +1451,7 @@ func (rs *replySender) loop() {
 				rs.errLogged = true
 				rs.mu.Unlock()
 				if logIt {
-					Warning("[%s] failed to send request replies to client %d: %v",
+					pblog.Warning("[%s] failed to send request replies to client %d: %v",
 						rs.r.self, batch[0].clientId, err)
 				}
 			}
@@ -1527,7 +1530,7 @@ func (r *Replica) statsLoop() {
 				durMax = m
 			}
 		}
-		Notice("[%s] 1s: bus_log_len=%d bus_log_high=%d entry_log_len=%d pruned_below=%d",
+		pblog.Notice("[%s] 1s: bus_log_len=%d bus_log_high=%d entry_log_len=%d pruned_below=%d",
 			r.self, executed, busLogHigh, entryLogLen, prunedBelow)
 		if recv == 0 && gaps == 0 && recovered == 0 && noops == 0 && dropped == 0 && fenced == 0 {
 			continue
@@ -1540,9 +1543,9 @@ func (r *Replica) statsLoop() {
 		if haveStable {
 			stableStr = strconv.FormatUint(stable, 10)
 		}
-		Notice("[%s] 1s: received=%d dropped=%d fenced=%d delta_avg=%+dus delta_min=%+dus delta_max=%+dus gaps=%d recovered=%d noops=%d reply_backlog_max=%d durable_backlog_max=%d",
+		pblog.Notice("[%s] 1s: received=%d dropped=%d fenced=%d delta_avg=%+dus delta_min=%+dus delta_max=%+dus gaps=%d recovered=%d noops=%d reply_backlog_max=%d durable_backlog_max=%d",
 			r.self, recv, dropped, fenced, avg, min, max, gaps, recovered, noops, replyMax, durMax)
-		Notice("[%s] 1s: view=%d status=%s executed=%d stable=%s resident_slots=%d resident_mb=%d dedup=%d",
+		pblog.Notice("[%s] 1s: view=%d status=%s executed=%d stable=%s resident_slots=%d resident_mb=%d dedup=%d",
 			r.self, r.view(), status, executed, stableStr, resident, residentMB, dedupSize)
 	}
 }
@@ -1561,7 +1564,7 @@ func (r *Replica) dialPeer(j int) {
 	for {
 		conn, err := net.DialTimeout("tcp", addr, 3*time.Second)
 		if err != nil {
-			Warning("[%s] cannot connect to peer replica %d (%s): %v, retrying",
+			pblog.Warning("[%s] cannot connect to peer replica %d (%s): %v, retrying",
 				r.self, j, addr, err)
 			time.Sleep(time.Second)
 			continue
@@ -1573,16 +1576,16 @@ func (r *Replica) dialPeer(j int) {
 		r.mu.Lock()
 		r.peerWriters[j] = lw
 		r.mu.Unlock()
-		Notice("[%s] connected to peer replica %d (%s)", r.self, j, addr)
+		pblog.Notice("[%s] connected to peer replica %d (%s)", r.self, j, addr)
 
 		<-r.peerRedial[j]
 		conn.Close()
-		Notice("[%s] peer replica %d connection retired, redialing", r.self, j)
+		pblog.Notice("[%s] peer replica %d connection retired, redialing", r.self, j)
 		time.Sleep(200 * time.Millisecond)
 	}
 }
 
-func (r *Replica) sendToPeer(j int, code uint8, msg wireMsg) {
+func (r *Replica) sendToPeer(j int, code uint8, msg pbwire.WireMsg) {
 	if j < 0 || j >= len(r.peerWriters) {
 		return
 	}
@@ -1593,7 +1596,7 @@ func (r *Replica) sendToPeer(j int, code uint8, msg wireMsg) {
 		return // dialPeer is already retrying; logging here would just spam
 	}
 	if err := lw.sendMsg(code, msg); err != nil {
-		Warning("[%s] send to peer %d failed: %v", r.self, j, err)
+		pblog.Warning("[%s] send to peer %d failed: %v", r.self, j, err)
 		r.retirePeer(j, lw)
 	}
 }
@@ -1632,11 +1635,11 @@ func (r *Replica) peerConnLost(j int) {
 	if j < 0 || j >= r.config.N || j == r.idx {
 		return
 	}
-	Notice("[%s] lost inbound connection from peer replica %d", r.self, j)
+	pblog.Notice("[%s] lost inbound connection from peer replica %d", r.self, j)
 	r.retirePeer(j, nil)
 }
 
-func (r *Replica) broadcastToPeers(code uint8, msg wireMsg) {
+func (r *Replica) broadcastToPeers(code uint8, msg pbwire.WireMsg) {
 	for j := range r.config.Replicas {
 		if j == r.idx {
 			continue
@@ -1683,7 +1686,7 @@ func (r *Replica) gapDetectLoop() {
 		}
 		r.mu.Unlock()
 		for _, s := range spawn {
-			Notice("[%s] GAP detected slot=%d client=%d req=%d", r.self, s.key.slot, s.clientId, s.reqId)
+			pblog.Notice("[%s] GAP detected slot=%d client=%d req=%d", r.self, s.key.slot, s.clientId, s.reqId)
 			go r.handleGap(s.key, s.gs)
 		}
 	}
@@ -1716,8 +1719,8 @@ func (r *Replica) ownerLog(slot uint64) (uint64, uint64) {
 
 func (r *Replica) followerRecover(key gapKey, gs *gapState) {
 	leader := r.config.LeaderIndex(key.view)
-	r.sendToPeer(leader, MsgBusGapRequest,
-		&BusGapRequest{Slot: key.slot, SenderIdx: uint32(r.idx), ViewId: key.view})
+	r.sendToPeer(leader, pbwire.MsgBusGapRequest,
+		&pbwire.BusGapRequest{Slot: key.slot, SenderIdx: uint32(r.idx), ViewId: key.view})
 
 	timer := time.NewTimer(gapRecoveryTimeout)
 	defer timer.Stop()
@@ -1735,12 +1738,12 @@ func (r *Replica) followerRecover(key gapKey, gs *gapState) {
 		clientId, reqId := r.ownerLog(key.slot)
 		switch st {
 		case slotReceived:
-			Notice("[%s] recovery_latency=%dus slot=%d client=%d req=%d", r.self, lat, key.slot, clientId, reqId)
+			pblog.Notice("[%s] recovery_latency=%dus slot=%d client=%d req=%d", r.self, lat, key.slot, clientId, reqId)
 		case slotNoOp:
-			Notice("[%s] noop_latency=%dus slot=%d client=%d req=%d", r.self, lat, key.slot, clientId, reqId)
+			pblog.Notice("[%s] noop_latency=%dus slot=%d client=%d req=%d", r.self, lat, key.slot, clientId, reqId)
 		}
 	case <-timer.C:
-		Warning("[%s] gap recovery timed out slot=%d", r.self, key.slot)
+		pblog.Warning("[%s] gap recovery timed out slot=%d", r.self, key.slot)
 		r.mu.Lock()
 		r.finishGapLocked(key, gs)
 		r.mu.Unlock()
@@ -1768,8 +1771,8 @@ func (r *Replica) leaderResolve(key gapKey, gs *gapState) {
 	}
 	r.mu.Unlock()
 
-	r.broadcastToPeers(MsgBusGapRequest,
-		&BusGapRequest{Slot: slot, SenderIdx: uint32(r.idx), ViewId: key.view})
+	r.broadcastToPeers(pbwire.MsgBusGapRequest,
+		&pbwire.BusGapRequest{Slot: slot, SenderIdx: uint32(r.idx), ViewId: key.view})
 	var recovered []byte
 	var recoveredBus bool
 	recoveredFound := false
@@ -1822,7 +1825,7 @@ probe:
 		r.finishGapLocked(key, gs)
 		r.mu.Unlock()
 		r.answerAskers(key.view, slot, askers, op, isBus)
-		Notice("[%s] recovery_latency=%dus slot=%d client=%d req=%d",
+		pblog.Notice("[%s] recovery_latency=%dus slot=%d client=%d req=%d",
 			r.self, (nowNs()-gs.start)/1000, slot, m.clientId, m.reqId)
 		return
 	}
@@ -1855,7 +1858,7 @@ probe:
 		return
 	}
 	clientId, reqId := r.ownerLog(slot)
-	Notice("[%s] noop_latency=%dus slot=%d client=%d req=%d",
+	pblog.Notice("[%s] noop_latency=%dus slot=%d client=%d req=%d",
 		r.self, (nowNs()-gs.start)/1000, slot, clientId, reqId)
 }
 
@@ -1866,8 +1869,8 @@ func (r *Replica) collectNoOpQuorum(key gapKey, gs *gapState) bool {
 	if !active {
 		return false
 	}
-	commit := &BusGapCommit{Slot: key.slot, SenderIdx: uint32(r.idx), ViewId: key.view}
-	r.broadcastToPeers(MsgBusGapCommit, commit)
+	commit := &pbwire.BusGapCommit{Slot: key.slot, SenderIdx: uint32(r.idx), ViewId: key.view}
+	r.broadcastToPeers(pbwire.MsgBusGapCommit, commit)
 
 	acked := make(map[uint32]struct{}, r.config.N)
 	timer := time.NewTimer(r.gapRetryTimeout)
@@ -1889,14 +1892,14 @@ func (r *Replica) collectNoOpQuorum(key gapKey, gs *gapState) bool {
 			active := r.leaderGapActiveLocked(key, gs)
 			r.mu.Unlock()
 			if !active {
-				Warning("[%s] abandoning noop commit slot=%d after %d rounds: no longer leading a normal view",
+				pblog.Warning("[%s] abandoning noop commit slot=%d after %d rounds: no longer leading a normal view",
 					r.self, key.slot, round)
 				return false
 			}
 			round++
-			Warning("[%s] noop commit round %d for slot=%d: %d/%d acks, retrying",
+			pblog.Warning("[%s] noop commit round %d for slot=%d: %d/%d acks, retrying",
 				r.self, round, key.slot, len(acked)+1, r.config.QuorumSize())
-			r.broadcastToPeers(MsgBusGapCommit, commit)
+			r.broadcastToPeers(pbwire.MsgBusGapCommit, commit)
 			timer.Reset(r.gapRetryTimeout)
 		case <-gs.abortCh:
 			return false
@@ -1906,12 +1909,12 @@ func (r *Replica) collectNoOpQuorum(key gapKey, gs *gapState) bool {
 
 func (r *Replica) answerAskers(view, slot uint64, askers []uint32, op []byte, isBus bool) {
 	for _, idx := range askers {
-		r.sendToPeer(int(idx), MsgBusGapReply,
-			&BusGapReply{Slot: slot, SenderIdx: uint32(r.idx), ViewId: view, Found: true, Bus: isBus, Op: op})
+		r.sendToPeer(int(idx), pbwire.MsgBusGapReply,
+			&pbwire.BusGapReply{Slot: slot, SenderIdx: uint32(r.idx), ViewId: view, Found: true, Bus: isBus, Op: op})
 	}
 }
 
-func (r *Replica) handleGapRequest(msg *BusGapRequest) {
+func (r *Replica) handleGapRequest(msg *pbwire.BusGapRequest) {
 	if !r.validReplicaIndex(msg.SenderIdx) {
 		return
 	}
@@ -1933,22 +1936,22 @@ func (r *Replica) handleGapRequest(msg *BusGapRequest) {
 	r.mu.Unlock()
 
 	if !amLeader {
-		reply := &BusGapReply{Slot: slot, SenderIdx: uint32(r.idx), ViewId: msg.ViewId, Found: st == slotReceived}
+		reply := &pbwire.BusGapReply{Slot: slot, SenderIdx: uint32(r.idx), ViewId: msg.ViewId, Found: st == slotReceived}
 		if reply.Found {
 			reply.Op = op
 			reply.Bus = isBus
 		}
-		r.sendToPeer(int(msg.SenderIdx), MsgBusGapReply, reply)
+		r.sendToPeer(int(msg.SenderIdx), pbwire.MsgBusGapReply, reply)
 		return
 	}
 
 	switch st {
 	case slotReceived:
-		r.sendToPeer(int(msg.SenderIdx), MsgBusGapReply,
-			&BusGapReply{Slot: slot, SenderIdx: uint32(r.idx), ViewId: msg.ViewId, Found: true, Bus: isBus, Op: op})
+		r.sendToPeer(int(msg.SenderIdx), pbwire.MsgBusGapReply,
+			&pbwire.BusGapReply{Slot: slot, SenderIdx: uint32(r.idx), ViewId: msg.ViewId, Found: true, Bus: isBus, Op: op})
 	case slotNoOp:
-		r.sendToPeer(int(msg.SenderIdx), MsgBusGapCommit,
-			&BusGapCommit{Slot: slot, SenderIdx: uint32(r.idx), ViewId: msg.ViewId})
+		r.sendToPeer(int(msg.SenderIdx), pbwire.MsgBusGapCommit,
+			&pbwire.BusGapCommit{Slot: slot, SenderIdx: uint32(r.idx), ViewId: msg.ViewId})
 	default:
 		if reclaimed {
 			return
@@ -1976,12 +1979,12 @@ func (r *Replica) ensureLeaderResolve(view, slot uint64, asker uint32) {
 	m := r.slotOwnerLocked(slot)
 	r.mu.Unlock()
 	if spawn {
-		Notice("[%s] GAP detected slot=%d client=%d req=%d (peer request)", r.self, slot, m.clientId, m.reqId)
+		pblog.Notice("[%s] GAP detected slot=%d client=%d req=%d (peer request)", r.self, slot, m.clientId, m.reqId)
 		go r.handleGap(key, gs)
 	}
 }
 
-func (r *Replica) handleGapReply(msg *BusGapReply) {
+func (r *Replica) handleGapReply(msg *pbwire.BusGapReply) {
 	if !r.validReplicaIndex(msg.SenderIdx) {
 		return
 	}
@@ -2023,7 +2026,7 @@ func (r *Replica) handleGapReply(msg *BusGapReply) {
 	}
 }
 
-func (r *Replica) handleGapCommit(msg *BusGapCommit) {
+func (r *Replica) handleGapCommit(msg *pbwire.BusGapCommit) {
 	if !r.validReplicaIndex(msg.SenderIdx) {
 		return
 	}
@@ -2048,8 +2051,8 @@ func (r *Replica) handleGapCommit(msg *BusGapCommit) {
 	if !ack {
 		return
 	}
-	r.sendToPeer(int(msg.SenderIdx), MsgBusGapCommitReply,
-		&BusGapCommitReply{Slot: msg.Slot, SenderIdx: uint32(r.idx), ViewId: msg.ViewId})
+	r.sendToPeer(int(msg.SenderIdx), pbwire.MsgBusGapCommitReply,
+		&pbwire.BusGapCommitReply{Slot: msg.Slot, SenderIdx: uint32(r.idx), ViewId: msg.ViewId})
 }
 
 func (r *Replica) applyGapCommitLocked(slot uint64) bool {
@@ -2057,7 +2060,7 @@ func (r *Replica) applyGapCommitLocked(slot uint64) bool {
 		return true
 	}
 	if r.executedLocked(slot) {
-		Warning("[%s] ignoring no-op commit for settled slot=%d (executed=%d)",
+		pblog.Warning("[%s] ignoring no-op commit for settled slot=%d (executed=%d)",
 			r.self, slot, r.nextExpected)
 		return false
 	}
@@ -2068,7 +2071,7 @@ func (r *Replica) applyGapCommitLocked(slot uint64) bool {
 	return true
 }
 
-func (r *Replica) handleGapCommitReply(msg *BusGapCommitReply) {
+func (r *Replica) handleGapCommitReply(msg *pbwire.BusGapCommitReply) {
 	if !r.validReplicaIndex(msg.SenderIdx) || int(msg.SenderIdx) == r.idx {
 		return
 	}

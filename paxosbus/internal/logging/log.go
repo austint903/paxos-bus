@@ -1,4 +1,4 @@
-package paxosbus
+package logging
 
 import (
 	"fmt"

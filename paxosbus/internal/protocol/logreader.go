@@ -5,6 +5,9 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"io"
+
+	pblog "github.com/imdea-software/swiftpaxos/paxosbus/internal/logging"
+	pbwire "github.com/imdea-software/swiftpaxos/paxosbus/internal/wire"
 )
 
 type diskRecord struct {
@@ -107,25 +110,25 @@ func (cl *durableLog) seekToLocked(key uint64) bool {
 	return true
 }
 
-func (r *Replica) readSlotFromDisk(slot uint64) (StateEntry, bool) {
+func (r *Replica) readSlotFromDisk(slot uint64) (pbwire.StateEntry, bool) {
 	if r.durable == nil {
-		return StateEntry{}, false
+		return pbwire.StateEntry{}, false
 	}
 	bodies := r.durable.readRecords(slot, slot)
 	body, ok := bodies[slot]
 	if !ok {
-		return StateEntry{}, false
+		return pbwire.StateEntry{}, false
 	}
 	var rec diskRecord
 	if err := json.Unmarshal(body, &rec); err != nil {
-		Warning("[%s] unreadable bus-log record for slot %d: %v", r.self, slot, err)
-		return StateEntry{}, false
+		pblog.Warning("[%s] unreadable bus-log record for slot %d: %v", r.self, slot, err)
+		return pbwire.StateEntry{}, false
 	}
 	if rec.Pending {
-		return StateEntry{}, false // a hole that was never filled in
+		return pbwire.StateEntry{}, false // a hole that was never filled in
 	}
 
-	ent := StateEntry{Slot: slot, ClientId: rec.Client, ReqId: rec.ReqId, IsNoOp: rec.NoOp}
+	ent := pbwire.StateEntry{Slot: slot, ClientId: rec.Client, ReqId: rec.ReqId, IsNoOp: rec.NoOp}
 	if rec.Bus != nil {
 		ent.ReqId = *rec.Bus
 	}
@@ -134,20 +137,20 @@ func (r *Replica) readSlotFromDisk(slot uint64) (StateEntry, bool) {
 	}
 
 	if rec.Bus == nil {
-		Warning("[%s] bus-log record for slot %d has no bus identity", r.self, slot)
-		return StateEntry{}, false
+		pblog.Warning("[%s] bus-log record for slot %d has no bus identity", r.self, slot)
+		return pbwire.StateEntry{}, false
 	}
 
 	reqs, ok := r.readRequestsFromDisk(rec.LogIndexes)
 	if !ok {
-		return StateEntry{}, false
+		return pbwire.StateEntry{}, false
 	}
 	ent.IsBus = true
-	ent.Payload = marshalRequests(reqs)
+	ent.Payload = pbwire.MarshalRequests(reqs)
 	return ent, true
 }
 
-func (r *Replica) readRequestsFromDisk(idxs []uint64) ([]RequestMessage, bool) {
+func (r *Replica) readRequestsFromDisk(idxs []uint64) ([]pbwire.RequestMessage, bool) {
 	if r.reqListLog == nil {
 		return nil, false
 	}
@@ -165,7 +168,7 @@ func (r *Replica) readRequestsFromDisk(idxs []uint64) ([]RequestMessage, bool) {
 	}
 	bodies := r.reqListLog.readRecords(lo, hi)
 
-	reqs := make([]RequestMessage, 0, len(idxs))
+	reqs := make([]pbwire.RequestMessage, 0, len(idxs))
 	for _, li := range idxs {
 		body, ok := bodies[li]
 		if !ok {
@@ -179,7 +182,7 @@ func (r *Replica) readRequestsFromDisk(idxs []uint64) ([]RequestMessage, bool) {
 		if err != nil {
 			return nil, false
 		}
-		reqs = append(reqs, RequestMessage{
+		reqs = append(reqs, pbwire.RequestMessage{
 			ClientId:  rec.Client,
 			RequestId: rec.ReqId,
 			Op:        op,

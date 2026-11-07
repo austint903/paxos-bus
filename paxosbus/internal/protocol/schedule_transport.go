@@ -6,9 +6,11 @@ import (
 	"net"
 	"sort"
 	"time"
+
+	pbwire "github.com/imdea-software/swiftpaxos/paxosbus/internal/wire"
 )
 
-func (r *Replica) sendSchedulePeer(peer int, code uint8, msg wireMsg) {
+func (r *Replica) sendSchedulePeer(peer int, code uint8, msg pbwire.WireMsg) {
 	if peer < 0 || peer >= len(r.schedulePeers) || peer == r.idx {
 		return
 	}
@@ -35,7 +37,7 @@ func (r *Replica) sendSchedulePeer(peer int, code uint8, msg wireMsg) {
 
 type scheduleEnvelope struct {
 	code uint8
-	msg  wireMsg
+	msg  pbwire.WireMsg
 }
 
 func (r *Replica) scheduleSender(peer int) {
@@ -43,7 +45,7 @@ func (r *Replica) scheduleSender(peer int) {
 		r.sendSchedulePeer(peer, m.code, m.msg)
 	}
 }
-func (r *Replica) broadcastSchedule(code uint8, msg wireMsg) {
+func (r *Replica) broadcastSchedule(code uint8, msg pbwire.WireMsg) {
 	for peer := range r.scheduleSendQueues {
 		if peer != r.idx {
 			select {
@@ -83,18 +85,18 @@ func (cl *clientLine) nextSequence(seq uint64) uint64 {
 }
 
 type scheduleBatch struct {
-	snapshot  BusScheduleInstall
-	prepare   SchdPrepare
+	snapshot  pbwire.BusScheduleInstall
+	prepare   pbwire.SchdPrepare
 	committed bool
 }
 
 func (m *scheduleBatch) Marshal(w io.Writer) {
 	m.snapshot.Marshal(w)
-	w.Write([]byte{MsgSchdPrepare})
+	w.Write([]byte{pbwire.MsgSchdPrepare})
 	m.prepare.Marshal(w)
 	if m.committed {
-		w.Write([]byte{MsgSchdCommit})
-		c := SchdCommit{ReplicaId: m.prepare.ReplicaId, ViewId: m.prepare.ViewId, StartTime: m.prepare.StartTime, EndTime: m.prepare.EndTime}
+		w.Write([]byte{pbwire.MsgSchdCommit})
+		c := pbwire.SchdCommit{ReplicaId: m.prepare.ReplicaId, ViewId: m.prepare.ViewId, StartTime: m.prepare.StartTime, EndTime: m.prepare.EndTime}
 		c.Marshal(w)
 	}
 }

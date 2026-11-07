@@ -3,6 +3,9 @@ package paxosbus
 import (
 	"sort"
 	"time"
+
+	pblog "github.com/imdea-software/swiftpaxos/paxosbus/internal/logging"
+	pbwire "github.com/imdea-software/swiftpaxos/paxosbus/internal/wire"
 )
 
 const (
@@ -36,7 +39,7 @@ type viewRecovery struct {
 }
 
 type syncRound struct {
-	prepare BusSyncPrepare
+	prepare pbwire.BusSyncPrepare
 	acks    map[uint32]struct{}
 	done    bool
 }
@@ -51,8 +54,8 @@ func (r *Replica) syncLoop() {
 
 func (r *Replica) syncOnce() {
 	var (
-		prep   BusSyncPrepare
-		commit *BusSyncCommit
+		prep   pbwire.BusSyncPrepare
+		commit *pbwire.BusSyncCommit
 	)
 	r.mu.Lock()
 	if !r.AmLeader() || r.status != statusNormal {
@@ -67,7 +70,7 @@ func (r *Replica) syncOnce() {
 	if r.sync != nil && !r.sync.done {
 		prep = r.sync.prepare
 	} else {
-		prep = BusSyncPrepare{ViewId: view, SenderIdx: uint32(r.idx)}
+		prep = pbwire.BusSyncPrepare{ViewId: view, SenderIdx: uint32(r.idx)}
 		if r.nextExpected > 0 {
 			slot := r.nextExpected - 1
 			if h, ok := r.prefixHashAtLocked(slot); ok {
@@ -85,20 +88,20 @@ func (r *Replica) syncOnce() {
 	}
 	r.mu.Unlock()
 
-	r.broadcastToPeers(MsgBusSyncPrepare, &prep)
+	r.broadcastToPeers(pbwire.MsgBusSyncPrepare, &prep)
 	if commit != nil {
-		r.broadcastToPeers(MsgBusSyncCommit, commit)
+		r.broadcastToPeers(pbwire.MsgBusSyncCommit, commit)
 	}
 }
 
-func (r *Replica) maybeCommitSyncLocked() *BusSyncCommit {
+func (r *Replica) maybeCommitSyncLocked() *pbwire.BusSyncCommit {
 	s := r.sync
 	if s == nil || s.done || len(s.acks) < r.config.QuorumSize() {
 		return nil
 	}
 	s.done = true
 	r.setStableLocked(s.prepare.SlotToSync)
-	return &BusSyncCommit{
+	return &pbwire.BusSyncCommit{
 		ViewId:     s.prepare.ViewId,
 		StableSlot: s.prepare.SlotToSync,
 		SenderIdx:  uint32(r.idx),
@@ -117,7 +120,7 @@ func (r *Replica) setStableLocked(slot uint64) {
 	}
 }
 
-func (r *Replica) handleSyncPrepare(msg *BusSyncPrepare) {
+func (r *Replica) handleSyncPrepare(msg *pbwire.BusSyncPrepare) {
 	if !r.validReplicaIndex(msg.SenderIdx) ||
 		int(msg.SenderIdx) != r.config.LeaderIndex(msg.ViewId) {
 		return
@@ -172,7 +175,7 @@ func (r *Replica) handleSyncPrepare(msg *BusSyncPrepare) {
 	r.answerSyncPrepare(*msg, h, known, stable, haveStable)
 }
 
-func (r *Replica) answerSyncPrepare(msg BusSyncPrepare, h uint64, known bool,
+func (r *Replica) answerSyncPrepare(msg pbwire.BusSyncPrepare, h uint64, known bool,
 	stable uint64, haveStable bool) {
 	r.mu.Lock()
 	current := r.status == statusNormal && msg.ViewId == r.view() &&
@@ -184,24 +187,24 @@ func (r *Replica) answerSyncPrepare(msg BusSyncPrepare, h uint64, known bool,
 
 	switch {
 	case !known:
-		Notice("[%s] sync prepare slot=%d below hash window, agreeing unverified",
+		pblog.Notice("[%s] sync prepare slot=%d below hash window, agreeing unverified",
 			r.self, msg.SlotToSync)
 	case h != msg.PrefixHash:
-		Warning("[%s] PREFIX MISMATCH at slot=%d (ours=%016x leader=%016x) — rewinding to stable and refetching",
+		pblog.Warning("[%s] PREFIX MISMATCH at slot=%d (ours=%016x leader=%016x) — rewinding to stable and refetching",
 			r.self, msg.SlotToSync, h, msg.PrefixHash)
 		r.rewindToStableAndRefetch(int(msg.SenderIdx), msg.ViewId, stable, haveStable)
 		return
 	}
 
-	r.sendToPeer(int(msg.SenderIdx), MsgBusSyncReply,
-		&BusSyncReply{ViewId: msg.ViewId, Slot: msg.SlotToSync, SenderIdx: uint32(r.idx)})
+	r.sendToPeer(int(msg.SenderIdx), pbwire.MsgBusSyncReply,
+		&pbwire.BusSyncReply{ViewId: msg.ViewId, Slot: msg.SlotToSync, SenderIdx: uint32(r.idx)})
 }
 
-func (r *Replica) handleSyncReply(msg *BusSyncReply) {
+func (r *Replica) handleSyncReply(msg *pbwire.BusSyncReply) {
 	if !r.validReplicaIndex(msg.SenderIdx) || int(msg.SenderIdx) == r.idx {
 		return
 	}
-	var commit *BusSyncCommit
+	var commit *pbwire.BusSyncCommit
 	r.mu.Lock()
 	if s := r.sync; s != nil && !s.done && s.prepare.ViewId == msg.ViewId &&
 		s.prepare.SlotToSync == msg.Slot {
@@ -210,7 +213,7 @@ func (r *Replica) handleSyncReply(msg *BusSyncReply) {
 	}
 	r.mu.Unlock()
 	if commit != nil {
-		r.broadcastToPeers(MsgBusSyncCommit, commit)
+		r.broadcastToPeers(pbwire.MsgBusSyncCommit, commit)
 	}
 }
 
@@ -219,7 +222,7 @@ func (r *Replica) clearSyncCatchupLocked() {
 	r.syncCatchup = syncCatchup{generation: generation}
 }
 
-func (r *Replica) handleSyncCommit(msg *BusSyncCommit) {
+func (r *Replica) handleSyncCommit(msg *pbwire.BusSyncCommit) {
 	if !r.validReplicaIndex(msg.SenderIdx) {
 		return
 	}
@@ -246,7 +249,7 @@ func (r *Replica) rewindToStableAndRefetch(peer int, view, stable uint64, haveSt
 	}
 	if !r.rewindToLocked(stable + 1) {
 		r.mu.Unlock()
-		Warning("[%s] cannot rewind to stable slot %d: outside the hash window", r.self, stable)
+		pblog.Warning("[%s] cannot rewind to stable slot %d: outside the hash window", r.self, stable)
 		return
 	}
 	r.clearSlotsAboveLocked(stable + 1)
@@ -289,7 +292,7 @@ func (r *Replica) suspectLeaderIfTimedOut() bool {
 	if lost {
 		sock = "socket already closed"
 	}
-	Warning("[%s] SUSPECT leader %d (heartbeat timeout, silent for %v, %s)",
+	pblog.Warning("[%s] SUSPECT leader %d (heartbeat timeout, silent for %v, %s)",
 		r.self, r.config.LeaderIndex(view), silentFor.Truncate(time.Millisecond), sock)
 	r.publishViewChange(start)
 	return true
@@ -297,7 +300,7 @@ func (r *Replica) suspectLeaderIfTimedOut() bool {
 
 type vcState struct {
 	view    uint64
-	reports chan *BusViewChange
+	reports chan *pbwire.BusViewChange
 	abort   chan struct{}
 
 	requests   map[uint32]struct{}
@@ -322,7 +325,7 @@ type viewChangeStart struct {
 func newVCState(view uint64, n int) *vcState {
 	return &vcState{
 		view:     view,
-		reports:  make(chan *BusViewChange, n),
+		reports:  make(chan *pbwire.BusViewChange, n),
 		abort:    make(chan struct{}),
 		requests: make(map[uint32]struct{}, n),
 	}
@@ -396,12 +399,12 @@ func (r *Replica) beginViewChangeLocked(newView uint64) *viewChangeStart {
 }
 
 func (r *Replica) publishViewChange(start *viewChangeStart) {
-	Notice("[%s] VIEW-CHANGE start view=%d new_leader=%d stable=%d executed=%d max_filled=%d",
+	pblog.Notice("[%s] VIEW-CHANGE start view=%d new_leader=%d stable=%d executed=%d max_filled=%d",
 		r.self, start.view, start.leader, start.stable, start.executed, start.maxFilled)
 	r.pauseClients(start.view)
 
-	r.broadcastToPeers(MsgBusViewChangeRequest,
-		&BusViewChangeRequest{ViewId: start.view, SenderIdx: uint32(r.idx)})
+	r.broadcastToPeers(pbwire.MsgBusViewChangeRequest,
+		&pbwire.BusViewChangeRequest{ViewId: start.view, SenderIdx: uint32(r.idx)})
 
 	if start.leader == r.idx {
 		go r.driveViewChange(start.vc)
@@ -430,12 +433,12 @@ func (r *Replica) expireViewChangeWatchdog(watchdog *viewChangeWatchdog) {
 	if start == nil {
 		return
 	}
-	Warning("[%s] view-change fallback expired for view %d, moving to view %d",
+	pblog.Warning("[%s] view-change fallback expired for view %d, moving to view %d",
 		r.self, watchdog.view, start.view)
 	r.publishViewChange(start)
 }
 
-func (r *Replica) handleViewChangeRequest(msg *BusViewChangeRequest) {
+func (r *Replica) handleViewChangeRequest(msg *pbwire.BusViewChangeRequest) {
 	if msg.ViewId > r.view() {
 		r.startViewChange(msg.ViewId) // sets ViewChange status, multicasts our own
 	}
@@ -460,7 +463,7 @@ func (r *Replica) handleViewChangeRequest(msg *BusViewChangeRequest) {
 	leader := r.config.LeaderIndex(msg.ViewId)
 	r.mu.Unlock()
 
-	Notice("[%s] view %d: %d view-change requests, sending report to leader %d "+
+	pblog.Notice("[%s] view %d: %d view-change requests, sending report to leader %d "+
 		"(stable=%d executed=%d max_filled=%d)",
 		r.self, msg.ViewId, nreq, leader, report.StableSlot, report.NextExpected,
 		report.MaxSlotFilled)
@@ -469,10 +472,10 @@ func (r *Replica) handleViewChangeRequest(msg *BusViewChangeRequest) {
 		r.deliverViewChange(report)
 		return
 	}
-	r.sendToPeer(leader, MsgBusViewChange, report)
+	r.sendToPeer(leader, pbwire.MsgBusViewChange, report)
 }
 
-func (r *Replica) handleViewChange(msg *BusViewChange) {
+func (r *Replica) handleViewChange(msg *pbwire.BusViewChange) {
 	if msg.ViewId < r.view() {
 		return
 	}
@@ -493,7 +496,7 @@ func (r *Replica) handleViewChange(msg *BusViewChange) {
 	}
 }
 
-func (r *Replica) deliverViewChange(msg *BusViewChange) {
+func (r *Replica) deliverViewChange(msg *pbwire.BusViewChange) {
 	r.mu.Lock()
 	vc := r.vc
 	r.mu.Unlock()
@@ -506,14 +509,14 @@ func (r *Replica) deliverViewChange(msg *BusViewChange) {
 	}
 }
 
-func (r *Replica) handleStateQuery(msg *BusStateQuery) {
+func (r *Replica) handleStateQuery(msg *pbwire.BusStateQuery) {
 	r.mu.Lock()
 	ok := r.status == statusNormal && r.lastNormalView == r.view()
 	r.mu.Unlock()
 	if !ok || !r.AmLeader() || msg.ViewId >= r.view() {
 		return
 	}
-	Notice("[%s] replica %d is in stale view %d, sending start view %d",
+	pblog.Notice("[%s] replica %d is in stale view %d, sending start view %d",
 		r.self, msg.SenderIdx, msg.ViewId, r.view())
 	r.sendStartView(int(msg.SenderIdx))
 }
@@ -523,19 +526,19 @@ func (r *Replica) requestCatchUp(higherView uint64) {
 	r.lastHeartbeatNs = nowNs()
 	r.leaderLost = false
 	r.mu.Unlock()
-	Warning("[%s] behind: saw view %d while in %d, requesting catch-up",
+	pblog.Warning("[%s] behind: saw view %d while in %d, requesting catch-up",
 		r.self, higherView, r.view())
-	r.broadcastToPeers(MsgBusStateQuery,
-		&BusStateQuery{ViewId: r.view(), SenderIdx: uint32(r.idx)})
+	r.broadcastToPeers(pbwire.MsgBusStateQuery,
+		&pbwire.BusStateQuery{ViewId: r.view(), SenderIdx: uint32(r.idx)})
 }
 
-func (r *Replica) buildViewChangeLocked(newView uint64) *BusViewChange {
-	m := &BusViewChange{
+func (r *Replica) buildViewChangeLocked(newView uint64) *pbwire.BusViewChange {
+	m := &pbwire.BusViewChange{
 		SenderIdx:      uint32(r.idx),
 		ViewId:         newView,
 		LastNormalView: r.lastNormalView,
 		NextExpected:   r.nextExpected,
-		Schedule:       append([]BusSyncMessage(nil), r.schedule...),
+		Schedule:       append([]pbwire.BusSyncMessage(nil), r.schedule...),
 	}
 	if r.haveStable {
 		m.StableSlot, m.HasStable = r.stableSlot, true
@@ -559,8 +562,8 @@ func (r *Replica) buildViewChangeLocked(newView uint64) *BusViewChange {
 		m.BitmapBase = base
 		return m
 	}
-	if span := top - base + 1; span > maxBitmapBytes*8 {
-		base = top - (maxBitmapBytes*8 - 1)
+	if span := top - base + 1; span > pbwire.MaxBitmapBytes*8 {
+		base = top - (pbwire.MaxBitmapBytes*8 - 1)
 	}
 
 	m.BitmapBase = base
@@ -614,11 +617,11 @@ type mergePlan struct {
 	selected         []uint32 // reports retained at the highest LastNormalView
 	catchUp          uint32   // who to pull the committed prefix from
 	hasCatchUp       bool
-	schedule         []BusSyncMessage
+	schedule         []pbwire.BusSyncMessage
 	scheduleConflict bool
 }
 
-func mergeSuffix(reports []*BusViewChange) mergePlan {
+func mergeSuffix(reports []*pbwire.BusViewChange) mergePlan {
 	var plan mergePlan
 	if len(reports) == 0 {
 		return plan
@@ -631,7 +634,7 @@ func mergeSuffix(reports []*BusViewChange) mergePlan {
 		}
 	}
 	plan.sourceNormalView = best
-	survivors := make([]*BusViewChange, 0, len(reports))
+	survivors := make([]*pbwire.BusViewChange, 0, len(reports))
 	for _, m := range reports {
 		if m.LastNormalView == best {
 			survivors = append(survivors, m)
@@ -643,11 +646,11 @@ func mergeSuffix(reports []*BusViewChange) mergePlan {
 			continue
 		}
 		if len(plan.schedule) == 0 {
-			plan.schedule = append([]BusSyncMessage(nil), m.Schedule...)
+			plan.schedule = append([]pbwire.BusSyncMessage(nil), m.Schedule...)
 			continue
 		}
 		if schedulePrefix(plan.schedule, m.Schedule) {
-			plan.schedule = append([]BusSyncMessage(nil), m.Schedule...)
+			plan.schedule = append([]pbwire.BusSyncMessage(nil), m.Schedule...)
 			continue
 		}
 		if !schedulePrefix(m.Schedule, plan.schedule) {
@@ -712,7 +715,7 @@ func mergeSuffix(reports []*BusViewChange) mergePlan {
 
 func (r *Replica) driveViewChange(vc *vcState) {
 	deadline := time.After(r.viewChangeTimeout)
-	reports := make(map[uint32]*BusViewChange)
+	reports := make(map[uint32]*pbwire.BusViewChange)
 	for len(reports) < r.config.QuorumSize() {
 		select {
 		case m := <-vc.reports:
@@ -722,31 +725,31 @@ func (r *Replica) driveViewChange(vc *vcState) {
 		case <-vc.abort:
 			return
 		case <-deadline:
-			Warning("[%s] view %d timed out with %d/%d reports, moving on",
+			pblog.Warning("[%s] view %d timed out with %d/%d reports, moving on",
 				r.self, vc.view, len(reports), r.config.QuorumSize())
 			r.startViewChange(vc.view + 1)
 			return
 		}
 	}
 
-	list := make([]*BusViewChange, 0, len(reports))
+	list := make([]*pbwire.BusViewChange, 0, len(reports))
 	for _, m := range reports {
 		list = append(list, m)
 	}
 	plan := mergeSuffix(list)
 	if plan.scheduleConflict {
-		Warning("[%s] view %d has conflicting client schedules; refusing to install the view", r.self, vc.view)
+		pblog.Warning("[%s] view %d has conflicting client schedules; refusing to install the view", r.self, vc.view)
 		r.startViewChange(vc.view + 1)
 		return
 	}
 	if len(plan.schedule) > 0 {
 		if err := r.validateSchedule(plan.schedule); err != nil {
-			Warning("[%s] view %d has no valid authoritative client schedule: %v", r.self, vc.view, err)
+			pblog.Warning("[%s] view %d has no valid authoritative client schedule: %v", r.self, vc.view, err)
 			r.startViewChange(vc.view + 1)
 			return
 		}
 	}
-	Notice("[%s] view %d merge: quorum=%d stable=%d max=%d noops=%d entries_needed=%d",
+	pblog.Notice("[%s] view %d merge: quorum=%d stable=%d max=%d noops=%d entries_needed=%d",
 		r.self, vc.view, len(reports), plan.stableSlot, plan.maxSlot,
 		len(plan.noops), len(plan.donors))
 
@@ -788,7 +791,7 @@ func (r *Replica) driveViewChange(vc *vcState) {
 	executed := r.nextExpected
 	r.mu.Unlock()
 
-	Notice("[%s] VIEW-CHANGE done view=%d leader=self executed=%d", r.self, vc.view, executed)
+	pblog.Notice("[%s] VIEW-CHANGE done view=%d leader=self executed=%d", r.self, vc.view, executed)
 }
 
 func mergeCanonicalBoundary(plan *mergePlan) (uint64, bool) {
@@ -887,11 +890,11 @@ func (r *Replica) fetchMergedState(vc *vcState, watchdog *viewChangeWatchdog,
 			}
 
 			if plan.hasCatchUp && int(plan.catchUp) != r.idx {
-				Notice("[%s] view %d: catching up committed prefix [%d,%d] from replica %d",
+				pblog.Notice("[%s] view %d: catching up committed prefix [%d,%d] from replica %d",
 					r.self, vc.view, from, plan.stableSlot, plan.catchUp)
 				r.fetchRangeBlocking(vc, int(plan.catchUp), from, plan.stableSlot, nil)
 			} else {
-				Warning("[%s] view %d: committed prefix [%d,%d] is missing with no remote donor",
+				pblog.Warning("[%s] view %d: committed prefix [%d,%d] is missing with no remote donor",
 					r.self, vc.view, from, plan.stableSlot)
 			}
 
@@ -955,7 +958,7 @@ func (r *Replica) fetchMergedState(vc *vcState, watchdog *viewChangeWatchdog,
 	}
 	r.mu.Unlock()
 	if len(stuck) > 0 {
-		Warning("[%s] view %d: %d merged slots could not be fetched, closing them as no-ops",
+		pblog.Warning("[%s] view %d: %d merged slots could not be fetched, closing them as no-ops",
 			r.self, vc.view, len(stuck))
 		plan.noops = append(plan.noops, stuck...)
 		sort.Slice(plan.noops, func(i, j int) bool { return plan.noops[i] < plan.noops[j] })
@@ -963,7 +966,7 @@ func (r *Replica) fetchMergedState(vc *vcState, watchdog *viewChangeWatchdog,
 	return r.mergeActive(vc, watchdog)
 }
 
-func (r *Replica) broadcastStartView(msg *BusStartView) {
+func (r *Replica) broadcastStartView(msg *pbwire.BusStartView) {
 	if msg == nil {
 		return
 	}
@@ -971,13 +974,13 @@ func (r *Replica) broadcastStartView(msg *BusStartView) {
 		if j == r.idx {
 			continue
 		}
-		r.sendToPeer(j, MsgBusStartView, msg)
+		r.sendToPeer(j, pbwire.MsgBusStartView, msg)
 	}
 }
 
 func (r *Replica) initialStartViewMsgLocked(view uint64, plan *mergePlan,
-	maxSlot uint64, hasMax bool) *BusStartView {
-	msg := &BusStartView{
+	maxSlot uint64, hasMax bool) *pbwire.BusStartView {
+	msg := &pbwire.BusStartView{
 		ViewId:           view,
 		SourceNormalView: plan.sourceNormalView,
 		SenderIdx:        uint32(r.idx),
@@ -985,7 +988,7 @@ func (r *Replica) initialStartViewMsgLocked(view uint64, plan *mergePlan,
 		HasMax:           hasMax,
 		SelectedReports:  append([]uint32(nil), plan.selected...),
 		NoOpSlots:        append([]uint64(nil), plan.noops...),
-		Schedule:         append([]BusSyncMessage(nil), plan.schedule...),
+		Schedule:         append([]pbwire.BusSyncMessage(nil), plan.schedule...),
 	}
 	if plan.hasStable {
 		msg.StableSlot, msg.HasStable = plan.stableSlot, true
@@ -998,22 +1001,22 @@ func (r *Replica) initialStartViewMsgLocked(view uint64, plan *mergePlan,
 
 func (r *Replica) sendStartView(peer int) {
 	if msg := r.startViewMsg(); msg != nil {
-		r.sendToPeer(peer, MsgBusStartView, msg)
+		r.sendToPeer(peer, pbwire.MsgBusStartView, msg)
 	}
 }
 
-func (r *Replica) startViewMsg() *BusStartView {
+func (r *Replica) startViewMsg() *pbwire.BusStartView {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.status != statusNormal {
 		return nil
 	}
-	msg := &BusStartView{
+	msg := &pbwire.BusStartView{
 		ViewId:           r.view(),
 		SourceNormalView: r.startViewSource,
 		SenderIdx:        uint32(r.idx),
 		SelectedReports:  append([]uint32(nil), r.startViewUsed...),
-		Schedule:         append([]BusSyncMessage(nil), r.schedule...),
+		Schedule:         append([]pbwire.BusSyncMessage(nil), r.schedule...),
 	}
 	if r.startViewView != msg.ViewId {
 		msg.SelectedReports = nil
@@ -1038,11 +1041,11 @@ func (r *Replica) startViewMsg() *BusStartView {
 }
 
 // Install off the reader goroutine; state transfer replies arrive on that connection.
-func (r *Replica) handleStartView(msg *BusStartView) {
+func (r *Replica) handleStartView(msg *pbwire.BusStartView) {
 	cp := *msg
 	cp.NoOpSlots = append([]uint64(nil), msg.NoOpSlots...)
 	cp.SelectedReports = append([]uint32(nil), msg.SelectedReports...)
-	cp.Schedule = append([]BusSyncMessage(nil), msg.Schedule...)
+	cp.Schedule = append([]pbwire.BusSyncMessage(nil), msg.Schedule...)
 	if !r.validStartView(&cp) {
 		return
 	}
@@ -1066,14 +1069,14 @@ func (r *Replica) handleStartView(msg *BusStartView) {
 		r.mu.Unlock()
 	default:
 		r.mu.Unlock()
-		Warning("[%s] start-view queue full, dropping view %d", r.self, msg.ViewId)
+		pblog.Warning("[%s] start-view queue full, dropping view %d", r.self, msg.ViewId)
 	}
 }
 
-func (r *Replica) validStartView(msg *BusStartView) bool {
+func (r *Replica) validStartView(msg *pbwire.BusStartView) bool {
 	if len(msg.Schedule) > 0 {
 		if err := r.validateSchedule(msg.Schedule); err != nil {
-			Warning("[%s] ignoring start view %d with invalid client schedule: %v", r.self, msg.ViewId, err)
+			pblog.Warning("[%s] ignoring start view %d with invalid client schedule: %v", r.self, msg.ViewId, err)
 			return false
 		}
 	}
@@ -1082,24 +1085,24 @@ func (r *Replica) validStartView(msg *BusStartView) bool {
 	}
 	if int(msg.SenderIdx) >= r.config.N ||
 		int(msg.SenderIdx) != r.config.LeaderIndex(msg.ViewId) {
-		Warning("[%s] ignoring start view %d from non-leader replica %d",
+		pblog.Warning("[%s] ignoring start view %d from non-leader replica %d",
 			r.self, msg.ViewId, msg.SenderIdx)
 		return false
 	}
 	if msg.HasStable && (!msg.HasMax || msg.MaxSlot < msg.StableSlot) {
-		Warning("[%s] ignoring malformed start view %d: stable=%d max=%d/%v",
+		pblog.Warning("[%s] ignoring malformed start view %d: stable=%d max=%d/%v",
 			r.self, msg.ViewId, msg.StableSlot, msg.MaxSlot, msg.HasMax)
 		return false
 	}
 	if msg.HasMax && msg.MaxSlot == ^uint64(0) {
-		Warning("[%s] ignoring malformed start view %d: max slot overflows",
+		pblog.Warning("[%s] ignoring malformed start view %d: max slot overflows",
 			r.self, msg.ViewId)
 		return false
 	}
 	base := suffixBase(msg.StableSlot, msg.HasStable)
 	for _, slot := range msg.NoOpSlots {
 		if !msg.HasMax || slot < base || slot > msg.MaxSlot {
-			Warning("[%s] ignoring malformed start view %d: no-op slot %d outside [%d,%d]",
+			pblog.Warning("[%s] ignoring malformed start view %d: no-op slot %d outside [%d,%d]",
 				r.self, msg.ViewId, slot, base, msg.MaxSlot)
 			return false
 		}
@@ -1107,12 +1110,12 @@ func (r *Replica) validStartView(msg *BusStartView) bool {
 	seen := make(map[uint32]struct{}, len(msg.SelectedReports))
 	for _, replica := range msg.SelectedReports {
 		if int(replica) >= r.config.N {
-			Warning("[%s] ignoring start view %d with invalid selected replica %d",
+			pblog.Warning("[%s] ignoring start view %d with invalid selected replica %d",
 				r.self, msg.ViewId, replica)
 			return false
 		}
 		if _, duplicate := seen[replica]; duplicate {
-			Warning("[%s] ignoring start view %d with duplicate selected replica %d",
+			pblog.Warning("[%s] ignoring start view %d with duplicate selected replica %d",
 				r.self, msg.ViewId, replica)
 			return false
 		}
@@ -1127,7 +1130,7 @@ func (r *Replica) viewInstallLoop() {
 	}
 }
 
-func (r *Replica) installStartView(msg *BusStartView) {
+func (r *Replica) installStartView(msg *pbwire.BusStartView) {
 	r.mu.Lock()
 	view := r.view()
 	if msg.ViewId < view || msg.ViewId < r.startViewSeen ||
@@ -1142,7 +1145,7 @@ func (r *Replica) installStartView(msg *BusStartView) {
 	retain := r.lastNormalView == msg.SourceNormalView
 	if retain && msg.HasStable && r.nextExpected > msg.StableSlot {
 		if h, ok := r.prefixHashAtLocked(msg.StableSlot); !ok || h != msg.PrefixHash {
-			Warning("[%s] PREFIX MISMATCH installing view %d at slot=%d (ours=%016x leader=%016x)",
+			pblog.Warning("[%s] PREFIX MISMATCH installing view %d at slot=%d (ours=%016x leader=%016x)",
 				r.self, msg.ViewId, msg.StableSlot, h, msg.PrefixHash)
 			retain = false
 		}
@@ -1180,7 +1183,7 @@ func (r *Replica) installStartView(msg *BusStartView) {
 	r.mu.Unlock()
 
 	if didRewind {
-		Notice("[%s] view %d: rewound cursor to slot %d", r.self, msg.ViewId, rewound)
+		pblog.Notice("[%s] view %d: rewound cursor to slot %d", r.self, msg.ViewId, rewound)
 	}
 	if !prepared {
 		return
@@ -1218,7 +1221,7 @@ func (r *Replica) installStartView(msg *BusStartView) {
 	}
 }
 
-func (r *Replica) prepareRecoveryLocked(rec *viewRecovery, msg *BusStartView,
+func (r *Replica) prepareRecoveryLocked(rec *viewRecovery, msg *pbwire.BusStartView,
 	retain bool) (rewound uint64, didRewind, ok bool) {
 
 	replayFrom := suffixBase(r.stableSlot, r.haveStable)
@@ -1235,14 +1238,14 @@ func (r *Replica) prepareRecoveryLocked(rec *viewRecovery, msg *BusStartView,
 	rec.prefixHash = msg.PrefixHash
 	rec.repairFrom = localStableEnd
 	if r.haveStable && (!msg.HasMax || canonicalEnd < localStableEnd) {
-		Warning("[%s] cannot prepare recovery for view %d: merged end %d is below local stable frontier %d",
+		pblog.Warning("[%s] cannot prepare recovery for view %d: merged end %d is below local stable frontier %d",
 			r.self, rec.view, canonicalEnd, localStableEnd)
 		return 0, false, false
 	}
 	noop := make(map[uint64]struct{}, len(msg.NoOpSlots))
 	for _, slot := range msg.NoOpSlots {
 		if r.haveStable && slot < localStableEnd && r.slotStateLocked(slot) != slotNoOp {
-			Warning("[%s] cannot prepare recovery for view %d: merged no-op at stable slot %d conflicts with local history",
+			pblog.Warning("[%s] cannot prepare recovery for view %d: merged no-op at stable slot %d conflicts with local history",
 				r.self, rec.view, slot)
 			return 0, false, false
 		}
@@ -1274,7 +1277,7 @@ func (r *Replica) prepareRecoveryLocked(rec *viewRecovery, msg *BusStartView,
 
 	if target < r.nextExpected {
 		if !r.rewindToLocked(target) {
-			Warning("[%s] cannot prepare recovery for view %d: rewind to slot %d is outside the hash window",
+			pblog.Warning("[%s] cannot prepare recovery for view %d: rewind to slot %d is outside the hash window",
 				r.self, rec.view, target)
 			return 0, false, false
 		}
@@ -1401,7 +1404,7 @@ func (r *Replica) finishRecoveryIfComplete(rec *viewRecovery) bool {
 			r.clearSlotRangeLocked(rec.repairFrom, rec.stable, true)
 			r.recomputeMaxSlotLocked()
 			rec.replayTo = r.nextExpected
-			Warning("[%s] view %d: retained prefix mismatch, refetching [%d,%d]",
+			pblog.Warning("[%s] view %d: retained prefix mismatch, refetching [%d,%d]",
 				r.self, rec.view, rec.repairFrom, rec.stable)
 			return false
 		}
@@ -1425,7 +1428,7 @@ func (r *Replica) finishRecoveryIfComplete(rec *viewRecovery) bool {
 	r.leaderLost = false
 	r.recovery = nil
 	r.advanceNextExpectedLocked()
-	Notice("[%s] VIEW-CHANGE done view=%d leader=%d executed=%d",
+	pblog.Notice("[%s] VIEW-CHANGE done view=%d leader=%d executed=%d",
 		r.self, rec.view, rec.leader, r.nextExpected)
 	return true
 }
@@ -1479,7 +1482,7 @@ func (r *Replica) installCanonicalViewLocked(view, stable uint64, hasStable bool
 				r.clearSlotsAboveLocked(target)
 			}
 		} else {
-			Warning("[%s] cannot rewind to slot %d: outside the hash window", r.self, target)
+			pblog.Warning("[%s] cannot rewind to slot %d: outside the hash window", r.self, target)
 		}
 	}
 	if !conservative {
@@ -1551,7 +1554,7 @@ func (r *Replica) replayRepliesLocked(from, to uint64) {
 		}
 	}
 	if n > 0 {
-		Notice("[%s] view %d: replayed %d replies for executed slots [%d,%d)",
+		pblog.Notice("[%s] view %d: replayed %d replies for executed slots [%d,%d)",
 			r.self, r.view(), n, from, to)
 	}
 }
@@ -1634,7 +1637,7 @@ func (r *Replica) enqueueSyncFetch(req fetchReq) {
 		r.clearSyncCatchupLocked()
 	}
 	r.mu.Unlock()
-	Warning("[%s] state-fetch queue full, dropping sync request [%d,%d]",
+	pblog.Warning("[%s] state-fetch queue full, dropping sync request [%d,%d]",
 		r.self, req.from, req.to)
 }
 
@@ -1656,7 +1659,7 @@ func (r *Replica) enqueueFetch(peer int, from, to uint64, done chan bool) {
 	select {
 	case r.fetchQ <- req:
 	default:
-		Warning("[%s] state-fetch queue full, dropping request [%d,%d]", r.self, from, to)
+		pblog.Warning("[%s] state-fetch queue full, dropping request [%d,%d]", r.self, from, to)
 		if done != nil {
 			done <- false
 		}
@@ -1684,7 +1687,7 @@ func (r *Replica) fetchRangeBlocking(vc *vcState, peer int, from, to uint64, slo
 		return false
 	case r.fetchQ <- req:
 	default:
-		Warning("[%s] state-fetch queue full, dropping view-change request [%d,%d]",
+		pblog.Warning("[%s] state-fetch queue full, dropping view-change request [%d,%d]",
 			r.self, from, to)
 		return false
 	}
@@ -1716,7 +1719,7 @@ func (r *Replica) fetchRecoveryRange(rec *viewRecovery, from, to uint64) bool {
 	case <-rec.abort:
 		return false
 	default:
-		Warning("[%s] state-fetch queue full, dropping recovery request [%d,%d]",
+		pblog.Warning("[%s] state-fetch queue full, dropping recovery request [%d,%d]",
 			r.self, from, to)
 		return false
 	}
@@ -1742,7 +1745,7 @@ func (r *Replica) stateFetchLoop() {
 
 func (r *Replica) finishSyncFetch(req fetchReq, ok bool) {
 	var (
-		prepare    BusSyncPrepare
+		prepare    pbwire.BusSyncPrepare
 		hash       uint64
 		known      bool
 		stable     uint64
@@ -1857,7 +1860,7 @@ func (r *Replica) runFetch(req fetchReq) bool {
 			}
 			next, to = slots[0], slots[len(slots)-1]
 		}
-		r.sendToPeer(req.peer, MsgBusGetState, &BusGetState{
+		r.sendToPeer(req.peer, pbwire.MsgBusGetState, &pbwire.BusGetState{
 			ViewId:    req.view,
 			FromSlot:  next,
 			ToSlot:    to,
@@ -1900,7 +1903,7 @@ func (r *Replica) runFetch(req fetchReq) bool {
 					return false
 				}
 				if !r.peerConnected(req.peer) {
-					Warning("[%s] state fetch [%d,%d] from replica %d abandoned at slot %d: "+
+					pblog.Warning("[%s] state fetch [%d,%d] from replica %d abandoned at slot %d: "+
 						"peer connection lost", r.self, req.from, req.to, req.peer, next)
 					if !deadline.Stop() {
 						<-deadline.C
@@ -1908,7 +1911,7 @@ func (r *Replica) runFetch(req fetchReq) bool {
 					return false
 				}
 			case <-deadline.C:
-				Warning("[%s] state fetch [%d,%d] from replica %d timed out at slot %d",
+				pblog.Warning("[%s] state fetch [%d,%d] from replica %d timed out at slot %d",
 					r.self, req.from, req.to, req.peer, next)
 				return false
 			}
@@ -1923,19 +1926,19 @@ func (r *Replica) runFetch(req fetchReq) bool {
 	return true
 }
 
-func (r *Replica) handleNewState(msg *BusNewState) {
+func (r *Replica) handleNewState(msg *pbwire.BusNewState) {
 	if int(msg.SenderIdx) >= r.config.N {
 		return
 	}
 	select {
 	case r.newStateCh <- msg:
 	default:
-		Warning("[%s] dropping unsolicited state transfer [%d,%d]",
+		pblog.Warning("[%s] dropping unsolicited state transfer [%d,%d]",
 			r.self, msg.FromSlot, msg.ToSlot)
 	}
 }
 
-func (r *Replica) applyStateEntries(m *BusNewState, req fetchReq) bool {
+func (r *Replica) applyStateEntries(m *pbwire.BusNewState, req fetchReq) bool {
 	if m.ViewId != req.view || int(m.SenderIdx) != req.peer ||
 		m.FetchId != req.fetchID || m.FromSlot < req.from ||
 		m.ToSlot < m.FromSlot || m.ToSlot > req.to {
@@ -2008,7 +2011,7 @@ func (r *Replica) syncCatchupActiveLocked(req fetchReq) bool {
 		r.view() == req.view && r.config.LeaderIndex(req.view) == req.peer
 }
 
-func (r *Replica) handleGetState(msg *BusGetState) {
+func (r *Replica) handleGetState(msg *pbwire.BusGetState) {
 	if int(msg.SenderIdx) >= r.config.N || msg.FromSlot > msg.ToSlot || msg.ViewId != r.view() {
 		return
 	}
@@ -2024,7 +2027,7 @@ func (r *Replica) handleGetState(msg *BusGetState) {
 	select {
 	case r.serveQ <- &cp:
 	default:
-		Warning("[%s] state-serve queue full, dropping request from replica %d",
+		pblog.Warning("[%s] state-serve queue full, dropping request from replica %d",
 			r.self, msg.SenderIdx)
 	}
 }
@@ -2035,11 +2038,11 @@ func (r *Replica) stateServeLoop() {
 	}
 }
 
-func (r *Replica) serveState(req *BusGetState) {
+func (r *Replica) serveState(req *pbwire.BusGetState) {
 	if req.ViewId != r.view() || int(req.SenderIdx) >= r.config.N {
 		return
 	}
-	reply := &BusNewState{
+	reply := &pbwire.BusNewState{
 		ViewId:    req.ViewId,
 		FromSlot:  req.FromSlot,
 		FetchId:   req.FetchId,
@@ -2060,7 +2063,7 @@ func (r *Replica) serveState(req *BusGetState) {
 			size += len(ent.Payload) + stateEntryOverhead
 		}
 		last = slot
-		if size >= stateChunkBytes || len(reply.Entries) >= maxStateEntries || slot == req.ToSlot {
+		if size >= stateChunkBytes || len(reply.Entries) >= pbwire.MaxStateEntries || slot == req.ToSlot {
 			break
 		}
 	}
@@ -2068,14 +2071,14 @@ func (r *Replica) serveState(req *BusGetState) {
 	if req.ViewId != r.view() {
 		return
 	}
-	r.sendToPeer(int(req.SenderIdx), MsgBusNewState, reply)
+	r.sendToPeer(int(req.SenderIdx), pbwire.MsgBusNewState, reply)
 }
 
 // Disk is authoritative only at or below the commit point.
-func (r *Replica) readSlot(slot uint64) (StateEntry, bool) {
+func (r *Replica) readSlot(slot uint64) (pbwire.StateEntry, bool) {
 	r.mu.Lock()
 	if e := r.globalLog[slot]; e != nil && e.state != slotEmpty {
-		ent := StateEntry{
+		ent := pbwire.StateEntry{
 			Slot:     slot,
 			ClientId: e.clientId,
 			ReqId:    e.reqId,
@@ -2096,7 +2099,7 @@ func (r *Replica) readSlot(slot uint64) (StateEntry, bool) {
 	r.mu.Unlock()
 
 	if !reclaimed || !settled {
-		return StateEntry{}, false
+		return pbwire.StateEntry{}, false
 	}
 	return r.readSlotFromDisk(slot)
 }

@@ -9,6 +9,10 @@ import (
 	"strconv"
 	"sync"
 	"time"
+
+	pbconfig "github.com/imdea-software/swiftpaxos/paxosbus/internal/config"
+	pblog "github.com/imdea-software/swiftpaxos/paxosbus/internal/logging"
+	pbwire "github.com/imdea-software/swiftpaxos/paxosbus/internal/wire"
 )
 
 const (
@@ -39,7 +43,7 @@ type lockedWriter struct {
 	conn net.Conn // control and peer writes use a bounded write deadline
 }
 
-func (lw *lockedWriter) sendMsg(code uint8, msg wireMsg) error {
+func (lw *lockedWriter) sendMsg(code uint8, msg pbwire.WireMsg) error {
 	lw.mu.Lock()
 	defer lw.mu.Unlock()
 	if lw.conn != nil {
@@ -106,7 +110,7 @@ func (s *connSender) loop() {
 				break
 			}
 			if err := s.lw.sendRawBatch(batch); err != nil {
-				Warning("[%s] send bus to replica %d failed: %v (dropping further buses on this conn)",
+				pblog.Warning("[%s] send bus to replica %d failed: %v (dropping further buses on this conn)",
 					s.self, s.idx, err)
 				s.mu.Lock()
 				s.dead = true
@@ -119,7 +123,7 @@ func (s *connSender) loop() {
 }
 
 type Client struct {
-	config     *Config
+	config     *pbconfig.Config
 	clientId   uint64
 	intervalMs uint64
 	resendMs   uint64
@@ -136,9 +140,9 @@ type Client struct {
 	firstSchedule    uint64
 	scheduleStart    uint64
 	pauseWindowAfter time.Duration
-	windows          map[uint64]HsReply
+	windows          map[uint64]pbwire.HsReply
 	submitted        map[uint64]map[uint64]bool
-	handshakeReplies chan HsReply
+	handshakeReplies chan pbwire.HsReply
 	arrivalNs        uint64
 
 	// maxOwdNs is the worst measured one-way delay to a replica.
@@ -153,10 +157,10 @@ type Client struct {
 	mu sync.Mutex
 
 	pendingMu sync.Mutex
-	pending   []RequestMessage
+	pending   []pbwire.RequestMessage
 
 	retryMu sync.Mutex
-	retry   []RequestMessage
+	retry   []pbwire.RequestMessage
 
 	busSeqNum uint64
 	rInflight map[uint64]*reqInflight
@@ -179,7 +183,7 @@ type Client struct {
 	startupComplete bool
 }
 
-func NewClient(config *Config, clientId, intervalMs, resendMs uint64, label string,
+func NewClient(config *pbconfig.Config, clientId, intervalMs, resendMs uint64, label string,
 	genIntervalUs uint64, verbose bool, startDelayMs uint64,
 	maxOwdMs float64, commandSize int) *Client {
 	self := "Client " + strconv.FormatUint(clientId, 10)
@@ -201,9 +205,9 @@ func NewClient(config *Config, clientId, intervalMs, resendMs uint64, label stri
 		clientId:         clientId,
 		intervalMs:       intervalMs,
 		desiredInterval:  intervalMs,
-		windows:          make(map[uint64]HsReply),
+		windows:          make(map[uint64]pbwire.HsReply),
 		submitted:        make(map[uint64]map[uint64]bool),
-		handshakeReplies: make(chan HsReply, 64),
+		handshakeReplies: make(chan pbwire.HsReply, 64),
 		resendMs:         resendMs,
 		self:             self,
 		genIntervalUs:    genIntervalUs,
@@ -224,11 +228,11 @@ func NewClient(config *Config, clientId, intervalMs, resendMs uint64, label stri
 	if resendMs > 0 {
 		resend = "  resend=on"
 	}
-	Notice("[%s] started  request-gen  gen=%dus  bus=%dms  replicas=%d  f=%d  quorum=%d (f+1, must include leader)%s",
+	pblog.Notice("[%s] started  request-gen  gen=%dus  bus=%dms  replicas=%d  f=%d  quorum=%d (f+1, must include leader)%s",
 		c.self, genIntervalUs, intervalMs, config.N, config.F, config.QuorumSize(), resend)
-	Notice("[%s] workload writes=100 command-size=%d key=%d", c.self, commandSize, clientId)
+	pblog.Notice("[%s] workload writes=100 command-size=%d key=%d", c.self, commandSize, clientId)
 	if resendMs > 0 {
-		Notice("[%s] req-timeout=%dms", c.self, resendMs)
+		pblog.Notice("[%s] req-timeout=%dms", c.self, resendMs)
 	}
 	return c
 }
@@ -245,7 +249,7 @@ func (c *Client) Connect() error {
 				c.conns[i] = conn
 				break
 			}
-			Warning("[%s] cannot connect to replica %d (%s): %v, retrying",
+			pblog.Warning("[%s] cannot connect to replica %d (%s): %v, retrying",
 				c.self, i, addr, err)
 			time.Sleep(time.Second)
 		}
@@ -258,7 +262,7 @@ func (c *Client) Connect() error {
 		c.readers[i] = bufio.NewReader(c.conns[i])
 		c.writers[i] = &lockedWriter{w: bufio.NewWriter(c.conns[i])}
 		c.busSenders[i] = newConnSender(c.writers[i], c.self, i)
-		Notice("[%s] connected to replica %d (%s)  dial_rtt=%.2fms",
+		pblog.Notice("[%s] connected to replica %d (%s)  dial_rtt=%.2fms",
 			c.self, i, addr, float64(dialRtt)/1e6)
 	}
 	if c.owdAuto {
@@ -268,7 +272,7 @@ func (c *Client) Connect() error {
 	if c.owdAuto {
 		src = "max dial RTT / 2"
 	}
-	Notice("[%s] max one-way delay %.2fms (%s): buses depart that far ahead of the announced arrival schedule",
+	pblog.Notice("[%s] max one-way delay %.2fms (%s): buses depart that far ahead of the announced arrival schedule",
 		c.self, float64(c.maxOwdNs)/1e6, src)
 	return nil
 }
@@ -284,7 +288,7 @@ func (c *Client) Run() {
 		time.Sleep(time.Duration(sleep))
 	}
 
-	Notice("[%s] sync wait done, starting request-gen data phase (gen=%dus bus=%dms)",
+	pblog.Notice("[%s] sync wait done, starting request-gen data phase (gen=%dus bus=%dms)",
 		c.self, c.genIntervalUs, c.intervalMs)
 	if c.reqTimeoutNs > 0 {
 		go c.reqTimeoutLoop()
@@ -314,7 +318,7 @@ func (c *Client) genLoop() {
 			}
 			rid++
 			c.pendingMu.Lock()
-			c.pending = append(c.pending, RequestMessage{
+			c.pending = append(c.pending, pbwire.RequestMessage{
 				ClientId:   c.clientId,
 				RequestId:  rid,
 				SendTimeNs: uint64(now), // generation time; per-request latency clock starts here
@@ -375,7 +379,7 @@ func (c *Client) sendBus() {
 	c.retryMu.Unlock()
 
 	now := nowNs()
-	reqs := make([]RequestMessage, 0, len(retry)+len(batch))
+	reqs := make([]pbwire.RequestMessage, 0, len(retry)+len(batch))
 	reqs = append(reqs, retry...)
 	reqs = append(reqs, batch...)
 
@@ -399,14 +403,14 @@ func (c *Client) sendBus() {
 	c.winSent += uint64(len(reqs))
 	c.mu.Unlock()
 
-	msg := BusMessage{
+	msg := pbwire.BusMessage{
 		ClientId:   c.clientId,
 		BusSeqNum:  seq,
 		SendTimeNs: uint64(now),
 		Requests:   reqs,
 	}
 	var wire bytes.Buffer
-	wire.WriteByte(MsgBus)
+	wire.WriteByte(pbwire.MsgBus)
 	msg.Marshal(&wire)
 	b := wire.Bytes()
 	for i := range c.busSenders {
@@ -425,7 +429,7 @@ func (c *Client) reqTimeoutLoop() {
 			continue
 		}
 		now := nowNs()
-		var reboard []RequestMessage
+		var reboard []pbwire.RequestMessage
 		c.mu.Lock()
 		for rid, e := range c.rInflight {
 			if e.committed || now-e.sendTimeNs < c.reqTimeoutNs {
@@ -434,7 +438,7 @@ func (c *Client) reqTimeoutLoop() {
 			e.sendTimeNs = now
 			c.resendCount++
 			c.winResends++
-			reboard = append(reboard, RequestMessage{
+			reboard = append(reboard, pbwire.RequestMessage{
 				ClientId: c.clientId, RequestId: rid, Op: e.op,
 			})
 		}
@@ -443,29 +447,29 @@ func (c *Client) reqTimeoutLoop() {
 			c.retryMu.Lock()
 			c.retry = append(c.retry, reboard...)
 			c.retryMu.Unlock()
-			Notice("[%s] REQ-TIMEOUT reboarding=%d requests", c.self, len(reboard))
+			pblog.Notice("[%s] REQ-TIMEOUT reboarding=%d requests", c.self, len(reboard))
 		}
 	}
 }
 
 func (c *Client) receiveLoop(rid int) {
 	reader := c.readers[rid]
-	var reqReply RequestReplyMessage
+	var reqReply pbwire.RequestReplyMessage
 	for {
 		msgType, err := reader.ReadByte()
 		if err != nil {
-			Warning("[%s] connection to replica %d lost: %v", c.self, rid, err)
+			pblog.Warning("[%s] connection to replica %d lost: %v", c.self, rid, err)
 			return
 		}
 		switch msgType {
-		case MsgRequestReply:
+		case pbwire.MsgRequestReply:
 			if err := reqReply.Unmarshal(reader); err != nil {
-				Warning("[%s] bad request reply from replica %d: %v", c.self, rid, err)
+				pblog.Warning("[%s] bad request reply from replica %d: %v", c.self, rid, err)
 				return
 			}
 			c.handleRequestReply(&reqReply)
 		default:
-			Warning("[%s] unknown message type %d from replica %d",
+			pblog.Warning("[%s] unknown message type %d from replica %d",
 				c.self, msgType, rid)
 			return
 		}
@@ -484,7 +488,7 @@ func (c *Client) recordCommitLocked(latencyUs int64) {
 	c.winRttSumUs += uint64(latencyUs)
 }
 
-func (c *Client) handleRequestReply(msg *RequestReplyMessage) {
+func (c *Client) handleRequestReply(msg *pbwire.RequestReplyMessage) {
 	now := nowNs()
 
 	c.mu.Lock()
@@ -515,11 +519,11 @@ func (c *Client) handleRequestReply(msg *RequestReplyMessage) {
 	c.mu.Unlock()
 
 	if c.verbose {
-		Notice("[%s] REPLY from replica=%d  rtt=%dus  req=%d  bus_slot=%d  log_index=%d",
+		pblog.Notice("[%s] REPLY from replica=%d  rtt=%dus  req=%d  bus_slot=%d  log_index=%d",
 			c.self, msg.ReplicaIdx, replyRttUs, msg.RequestId, msg.BusSlotNum, msg.LogIndex)
 	}
 	if justCommitted {
-		Notice("[%s] COMMITTED req=%d log_index=%d rtt=%dus total=%dus",
+		pblog.Notice("[%s] COMMITTED req=%d log_index=%d rtt=%dus total=%dus",
 			c.self, msg.RequestId, msg.LogIndex, rttUs, totalUs)
 	}
 }
@@ -557,6 +561,6 @@ func (c *Client) emitStats() {
 	if cumCommitted > 0 {
 		cumAvgUs = cumRttSum / cumCommitted
 	}
-	Notice("[%s] 1s: sent=%d committed=%d resends=%d inflight=%d lat_avg=%dus  cumulative: committed=%d lat_avg=%dus",
+	pblog.Notice("[%s] 1s: sent=%d committed=%d resends=%d inflight=%d lat_avg=%dus  cumulative: committed=%d lat_avg=%dus",
 		c.self, sent, committed, resends, inflight, winAvgUs, cumCommitted, cumAvgUs)
 }

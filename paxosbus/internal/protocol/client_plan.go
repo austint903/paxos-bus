@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"math"
 	"time"
+
+	pblog "github.com/imdea-software/swiftpaxos/paxosbus/internal/logging"
 )
 
 func (c *Client) SetScheduleStart(start uint64) error {
@@ -46,7 +48,7 @@ func (c *Client) scheduleInterval(target uint64) uint64 {
 			start = target + uint64(c.pauseWindowAfter)
 			end = start + uint64(c.config.ScheduleWindow())
 		}
-		Notice("[%s] schedule-plan first-start=%d pause-start=%d pause-end=%d", c.self, target, start, end)
+		pblog.Notice("[%s] schedule-plan first-start=%d pause-start=%d pause-end=%d", c.self, target, start, end)
 	}
 	if c.pauseWindowAfter > 0 && target == c.firstSchedule+uint64(c.pauseWindowAfter) {
 		return 0

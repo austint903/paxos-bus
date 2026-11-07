@@ -8,7 +8,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/imdea-software/swiftpaxos/paxosbus"
+	pbconfig "github.com/imdea-software/swiftpaxos/paxosbus/internal/config"
+	"github.com/imdea-software/swiftpaxos/paxosbus/internal/protocol"
 )
 
 func main() {
@@ -45,7 +46,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	config, err := paxosbus.ReadConfig(*configPath)
+	config, err := pbconfig.ReadConfig(*configPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "cannot read config: %v\n", err)
 		os.Exit(1)
