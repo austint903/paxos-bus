@@ -162,7 +162,7 @@ for idx in "${!NODE_VMS[@]}"; do
         NODE_KEYS+=("replica$idx")
         REPLICA_INDICES+=("$idx")
     else
-        NODE_KEYS+=("client$((idx - REPLICA_COUNT + 1))")
+        NODE_KEYS+=("client$((idx - REPLICA_COUNT))")
         CLIENT_INDICES+=("$idx")
     fi
     if [[ "$SINGLE_MACHINE" == 0 ]]; then
@@ -198,7 +198,7 @@ discover_instances() {
 }
 
 client_ids_for_node() {
-    if (($1 >= REPLICA_COUNT)); then echo $(($1 - REPLICA_COUNT + 1)); fi
+    if (($1 >= REPLICA_COUNT)); then echo $(($1 - REPLICA_COUNT)); fi
 }
 
 replica_index_for_node() {
@@ -520,7 +520,7 @@ launch_clients() {
     echo "schedule_start_ns=$SCHEDULE_START_NS" >> "$RUN_LOG_DIR/run-meta.txt"
     for node_idx in "${launch_indices[@]}"; do
         ids="$(client_ids_for_node "$node_idx")"
-        if [[ "$SINGLE_MACHINE" == 1 ]]; then ids="\$(seq 1 $CLIENT_COUNT)"; fi
+        if [[ "$SINGLE_MACHINE" == 1 ]]; then ids="\$(seq 0 $((CLIENT_COUNT - 1)))"; fi
         ssh_to "${NODE_VMS[$node_idx]}" "${NODE_ZONES[$node_idx]}" "
             for id in $ids; do
                 rm -f /tmp/paxosbus-client-\$id.log
