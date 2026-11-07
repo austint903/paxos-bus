@@ -2,7 +2,7 @@
 
 This repository includes the implementation of PaxosBus, a research prototype for a novel wide area network consensus protocol that batches client requests into periodic buses and uses a shared schedule to establish their order, reducing the coordination needed to order individual requests and allowing requests to complete in nearly one round-trip time (RTT) during normal processing.
 
-## Paper and Presentation
+## Paper
 
 ## Clone Project
 
@@ -22,7 +22,7 @@ git clone https://github.com/New-Consensus-Concurrency-Control/PaxosBus.git
 
 ## Launching Experiments
 
-Please refer to the [experiment instructions](paxosbus/docs/experiments.md) to see how to run PaxosBus
+Please refer to the [experiment instructions](paxosbus/docs/experiments.md) to see how to run PaxosBus. After the tests have completed and logs are collected, use the [analyzer](paxosbus/scripts/analyzer.py) to analyze the results and generate performance numbers. 
 
 ## Important Configuration Parameters
 
