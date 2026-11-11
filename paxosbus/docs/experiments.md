@@ -4,6 +4,8 @@ This guide provides step-by-step instructions for running PaxosBus experiments u
 
 These scripts require prior authentication to Google Cloud Platform (GCP), a configured GCP project, and existing VMs in that project. Both the single-machine and multi-machine scripts run experiments on GCP VMs.
 
+- VMs do not need to be started manually; the scripts start them automatically and stop when runs are complete (it will not automatically shut down if there is an error)
+
 Create a `.env` file in the **repository root** and fill it out using [`.env.example`](../../.env.example) as a reference. Replace the placeholder project ID, VM names, and zones with your own values. The order of entries in `GCP_REPLICAS` and `GCP_CLIENTS` determines their IDs; both start at 0. Replica 0 is the initial leader.
 
 For the majority of our PaxosBus experiments, we used the three-replica, eight-client regional setup described in [`.env.example.paxosbus`](../../.env.example.paxosbus).
@@ -39,6 +41,59 @@ Replace any placeholders in settings you keep with actual values. Omit optional 
 
 </details>
 
-## Single-Machine Tests
+## Single and Multi-Machine Tests
 
-## Multi-Machine Tests
+Single-machine and multi-machine tests use the same underlying script; only the entry script and `.env` settings differ, as described in [Prerequisites](#prerequisites). (The script parameters used are the defaults; feel free to override with your own.)
+
+Single-machine tests:
+
+```bash
+paxosbus/scripts/run-paxosbus-single-machine.sh \
+  --normal \
+  --request-interval-us 500 \
+  --bus-interval-ms 1 \
+  --command-size 512 \
+  --schedule-window-ms 2000 \
+  --duration-s 60
+```
+
+Multi-machine tests:
+
+```bash
+paxosbus/scripts/run-paxosbus.sh \
+  --normal \
+  --request-interval-us 500 \
+  --bus-interval-ms 1 \
+  --command-size 512 \
+  --schedule-window-ms 2000 \
+  --duration-s 60
+```
+
+Each run saves its logs in the main checkout under `paxosbus/logs/gcp-paxosbus/gcp-run-YYYYMMDD-HHMMSS/`. The script prints the absolute directory path after `Done. VMs stopped. Logs:`.
+```bash
+RUN_DIR="paxosbus/logs/gcp-paxosbus/gcp-run-YYYYMMDD-HHMMSS"
+ls "$RUN_DIR"
+```
+
+Run the log analyzer.
+
+```bash
+python3 paxosbus/scripts/analyzer.py "$RUN_DIR"
+```
+The analyzer will print committed request counts, committed requests per second, and mean, p50, p95, and p99 latency in milliseconds for each client and all clients combined. It will first print metrics for each client then all clients at the end
+
+<details>
+<summary>Example use</summary>
+
+```bash
+python3 paxosbus/scripts/analyzer.py "$RUN_DIR"
+```
+
+```text
+paxosbus-client-<id-1>: committed=<count> committed/s=<throughput> mean=<mean>ms p50=<p50>ms p95=<p95>ms p99=<p99>ms
+paxosbus-client-<id-2>: committed=<count> committed/s=<throughput> mean=<mean>ms p50=<p50>ms p95=<p95>ms p99=<p99>ms
+...
+all-clients: committed=<total-count> committed/s=<total-throughput> mean=<mean>ms p50=<p50>ms p95=<p95>ms p99=<p99>ms
+```
+
+</details>
