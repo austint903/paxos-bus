@@ -83,15 +83,27 @@ python3 paxosbus/scripts/analyzer.py "$RUN_DIR"
 The analyzer will print committed request counts, committed requests per second, and mean, p50, p95, and p99 latency in milliseconds for each client and all clients combined. It will first print metrics for each client then all clients at the end
 
 <details>
-<summary>Example use</summary>
+<summary>Sample use</summary>
+
+Experiment command, logs, and completion:
 
 ```bash
-python3 paxosbus/scripts/analyzer.py "$RUN_DIR"
+$ paxosbus/scripts/run-paxosbus.sh --normal
+...
+[r<id>] <timestamp> <thread-id> * statsLoop (replica.go:<line>): [Replica <id> <region>] 1s: bus_log_len=<length> bus_log_high=<high> entry_log_len=<entries> pruned_below=<slot>
+[r<id>] <timestamp> <thread-id> * statsLoop (replica.go:<line>): [Replica <id> <region>] 1s: bus_log_len=<length> bus_log_high=<high> entry_log_len=<entries> pruned_below=<slot>
+...
+  all experiment VMs stopped
+==> Done. VMs stopped. Logs: /path/to/paxos-bus/paxosbus/logs/gcp-paxosbus/gcp-run-<YYYYMMDD-HHMMSS>
 ```
 
-```text
-paxosbus-client-<id-1>: committed=<count> committed/s=<throughput> mean=<mean>ms p50=<p50>ms p95=<p95>ms p99=<p99>ms
-paxosbus-client-<id-2>: committed=<count> committed/s=<throughput> mean=<mean>ms p50=<p50>ms p95=<p95>ms p99=<p99>ms
+Analyzer command and output:
+
+```bash
+$ python3 paxosbus/scripts/analyzer.py "$RUN_DIR"
+...
+paxosbus-client-<id>: committed=<count> committed/s=<throughput> mean=<mean>ms p50=<p50>ms p95=<p95>ms p99=<p99>ms
+paxosbus-client-<id>: committed=<count> committed/s=<throughput> mean=<mean>ms p50=<p50>ms p95=<p95>ms p99=<p99>ms
 ...
 all-clients: committed=<total-count> committed/s=<total-throughput> mean=<mean>ms p50=<p50>ms p95=<p95>ms p99=<p99>ms
 ```
